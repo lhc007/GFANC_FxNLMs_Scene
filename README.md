@@ -48,8 +48,10 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/wasapi_io.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -lole32 -o gfanc_realtime.exe
+gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -o gfanc_realtime.exe
 ```
+
+需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
 
 也可以用 `make`：
 ```bash
@@ -63,7 +65,7 @@ make clean    # 清理
 
 **离线版** — 处理一段噪声录音：
 ```bash
-./main.exe "path/to/noise.wav"
+./main.exe "Noise Examples/mixed_7types_56s.wav"
 ```
 
 运行后会生成两个文件：
@@ -75,7 +77,7 @@ make clean    # 清理
 ./gfanc_realtime.exe
 ```
 
-运行后会开始实时降噪。按 `Ctrl+C` 停止。
+运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `22` 和 `18`），然后开始实时降噪。按 `Ctrl+C` 停止。
 
 ## 运行示例
 
