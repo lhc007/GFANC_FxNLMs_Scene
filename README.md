@@ -1,297 +1,301 @@
-# GFANC FxNLMS — MIMO 主动降噪系统 (C 实现)
+# GFANC FxNLMS — MIMO 主动降噪系统
 
-基于 Python [GFANC_Scene](../GFANC_Scene) 移植的 MIMO GFANC + FxNLMS 主动降噪引擎。
+一个**主动降噪引擎**的纯 C 语言实现，从 Python 项目 [GFANC_Scene](../GFANC_Scene) 移植。
 
-- **离线模式**: WAV 文件输入 → 降噪处理 → WAV 输出，与 Python 参考实现 **dB 逐秒完全一致**（56 秒平均 15.00 dB）
-- **实时模式**: WASAPI 麦克风捕获 → ANC 处理 → 扬声器输出，48kHz 硬件采样率
+它会"听"到噪声，然后计算一个**反噪声**（与噪声波形相反的声音），通过扬声器播放出来，让噪声和反噪声在空间中互相抵消——就像噪声从未存在过一样。
+
+## 它能做什么
+
+| 模式 | 说明 |
+|------|------|
+| **离线降噪** | 输入一段噪声录音（WAV 文件），输出降噪后的结果 |
+| **实时降噪** | 连接麦克风和扬声器，实时抵消环境噪声 |
+
+## 你需要什么
+
+### 硬件（实时模式）
+
+- **麦克风阵列**：YDM6MIC（6 声道，插 USB）
+- **扬声器**：USB Audio Device（2 声道，插 USB）
+- **电脑**：Windows 10/11
+
+这两个设备同时插在电脑上。麦克风放在噪声源旁边（比如窗户、空调），扬声器放在你想安静的位置（比如座位旁边）。
+
+### 软件
+
+- **编译器**：GCC（通过 [MSYS2](https://www.msys2.org/) 安装）
+- **权重文件**：`data/` 目录下的 `.bin` 文件（已包含在项目中）
+
+## 快速开始
+
+### 1. 下载项目
+
+```bash
+git clone https://github.com/lhc007/GFANC_FxNLMs_Scene.git
+cd GFANC_FxNLMs_Scene
+```
+
+项目目录中的 `data/` 文件夹包含了训练好的模型权重，不需要额外下载。
+
+### 2. 编译
+
+打开终端（PowerShell 或 Git Bash），在项目目录下执行：
+
+**离线版**（处理 WAV 文件）：
+```bash
+gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -o main.exe
+```
+
+**实时版**（麦克风 → 扬声器）：
+```bash
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/wasapi_io.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -lole32 -o gfanc_realtime.exe
+```
+
+也可以用 `make`：
+```bash
+make          # 编译离线版
+make realtime # 编译实时版
+make all      # 两个都编译
+make clean    # 清理
+```
+
+### 3. 运行
+
+**离线版** — 处理一段噪声录音：
+```bash
+./main.exe "path/to/noise.wav"
+```
+
+运行后会生成两个文件：
+- `anti_out.wav` — 反噪声信号（2 声道，这是播放到扬声器的声音）
+- `error_out.wav` — 残差信号（3 声道，降噪后剩余的声音）
+
+**实时版** — 实时抵消环境噪声：
+```bash
+./gfanc_realtime.exe
+```
+
+运行后会开始实时降噪。按 `Ctrl+C` 停止。
+
+## 运行示例
+
+```
+PS D:\VSCodeRepository\GFANC_FxNLMs_Scene> ./main.exe "Noise Examples/road_noise-15.wav"
+Loading weights...
+  OK: sec=6144 pri=6144 sub=30720 bp=1024 L=1024
+  CNN loaded.
+  System ready.
+
+Input: 16000 Hz, 1 ch, 240000 samples (15.0s)
+
+ Sec |              Top-3 Scenes |   dB(Band) |   dB(Full) | Action
+-------------------------------------------------------------------------------------
+[Diag] Wc_new RMS: 0.0346
+[Diag] Dis (带内) RMS: 1.6262
+   1 |      0:0.33,6:0.26,3:0.10 |    14.44 dB |    16.20 dB | INIT
+   2 |      0:0.36,6:0.26,3:0.10 |    15.18 dB |    16.69 dB | -
+   3 |      0:0.34,6:0.25,3:0.10 |    15.10 dB |    16.81 dB | -
+  ...
+  15 |      0:0.32,3:0.28,7:0.19 |    15.89 dB |    17.89 dB | -
+-------------------------------------------------------------------------------------
+  Avg |                           |    15.00 dB |    16.52 dB |
+
+Processing: 6.1s for 15.0s audio (2.5x)
+Output: anti_out.wav (2 ch), error_out.wav (3 ch)
+Done.
+```
+
+## 效果解读
+
+运行后会看到一张表格，每秒一行：
+
+| 列 | 含义 | 举例 |
+|----|------|------|
+| `Sec` | 第几秒 | `1` |
+| `Top-3 Scenes` | AI 识别出的噪声类型（及其置信度） | `0:0.33` = 场景 0 置信度 33% |
+| `dB(Band)` | **实际降噪量**（数字越大越好） | `14.44 dB` = 噪声被压低了 14.44 分贝 |
+| `dB(Full)` | 全频段参考值（包含不可控的高频） | `16.20 dB` |
+| `Action` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(噪声类型变了，切换策略) |
+
+- **dB(Band) 是最重要的指标**：它告诉你 20-1500Hz 范围内的噪声被压了多少
+- 10 dB 意味着噪声能量降到原来的 1/10，20 dB 意味着降到 1/100
+- 这个系统在测试文件上平均达到 **15 dB**（噪声能量降到约 1/30）
 
 ## 项目结构
 
 ```
 GFANC_FxNLMs_Scene/
-├── main.c                 离线降噪主程序 (WAV → ANC → WAV)
-├── main_realtime.c        实时降噪主程序 (WASAPI 麦克风 → ANC → 扬声器)
+│
+├── README.md              你正在看的文件
 ├── Makefile               编译脚本
-├── CMakeLists.txt         CMake 构建
 │
-├── include/               头文件
-│   ├── gfanc_types.h      核心类型定义 (FIR, SceneCtrl, FxNLMS)
-│   ├── fir_filter.h       FIR 滤波器 API
-│   ├── wasapi_io.h        WASAPI 音频 I/O API
-│   ├── binary_loader.h    .bin 文件加载器
+├── main.c                 【离线降噪】主程序 — WAV 文件输入/输出
+├── main_realtime.c        【实时降噪】主程序 — 麦克风输入/扬声器输出
+│
+├── include/               头文件（API 定义）
+│   ├── gfanc_types.h      基础类型（FIR 滤波器）
+│   ├── fir_filter.h       FIR 滤波器
+│   ├── scene_controller.h CNN 场景识别 + 滤波器构造
+│   ├── fxnlms_mimo.h      自适应降噪算法
+│   ├── binary_loader.h    模型加载器
+│   └── wasapi_io.h        音频输入/输出（实时模式）
+│
+├── src/                   源代码（实现）
+│   ├── fir_filter.c       FIR 滤波器（快速卷积运算）
+│   ├── scene_controller.c AI 场景识别 + 控制滤波器构造
+│   ├── fxnlms_mimo.c      自适应降噪核心算法
+│   ├── cnn_m5_forward.c   神经网络推理引擎
+│   ├── binary_loader.c    从文件加载模型参数
+│   └── wasapi_io.c        音频设备驱动（实时模式）
+│
+├── data/                  模型参数文件（运行时加载）
+│   ├── *.bin              二进制权重（滤波器系数、神经网络权重）
 │   └── ...
 │
-├── src/                   实现
-│   ├── fir_filter.c       FIR 滤波器 (环形缓冲, double 精度)
-│   ├── cnn_m5_forward.c   CNN m5_scene 前向推理
-│   ├── wasapi_io.c        WASAPI 捕获/渲染封装
-│   ├── binary_loader.c    二进制权重加载
-│   └── ...
-│
-├── data/                  模型权重 (.bin 文件, 运行时加载)
-│   ├── secondary_path.bin  次级路径 IR [E,S,Len]
-│   ├── primary_path.bin    初级路径 IR [E,R,Len]
-│   ├── sub_filters.bin     子滤波器 [C,S,Len]
-│   ├── scene_defs.bin      场景质心 [K,S×C]
-│   ├── bandpass_fir.bin    带通 FIR 系数
-│   └── cnn_*.bin           CNN 权重 (~50 文件)
-│
-└── export/                权重导出脚本 (Python → C .bin)
-    ├── export_bin.py
-    └── export_model.py
+└── export/                工具脚本（Python → C 格式转换）
+    ├── export_bin.py      导出为 .bin 文件
+    └── export_model.py    导出为 .h 文件
 ```
 
-## 快速开始
+## 系统架构
 
-### 离线降噪 (WAV 文件)
+系统由两个"环路"组成，协同工作：
 
-```bash
-# 编译
-gcc -O2 -Iinclude main.c src/binary_loader.c src/cnn_m5_forward.c src/fir_filter.c -lm -o main.exe
+### 慢速环路（每秒执行一次）— "大脑"
 
-# 运行
-./main.exe "path/to/noise.wav"
+这个环路像一个**智能管家**，每秒分析一次噪声类型（是马路噪声？空调声？人声？），然后选择合适的降噪策略。
 
-# 输出: anti_out.wav (S=2ch 反噪声), error_out.wav (E=3ch 残差)
+```
+噪声信号
+  │
+  ├─→ 带通滤波器（只保留 20-1500Hz — 人耳敏感且 ANC 能处理的频率）
+  │
+  ├─→ AI 神经网络（CNN，8 种场景分类）
+  │     │
+  │     └─→ "这是第 3 类噪声，置信度 35%"
+  │
+  ├─→ 查表选择滤波器组合（15 个子滤波器，按 AI 建议的比例混合）
+  │
+  └─→ 构造控制滤波器 Wc（1024 个系数，定义反噪声的形状）
+        │
+        └─→ 如果噪声类型变了 → 平滑过渡到新滤波器（1ms 内完成，听不出切换）
+           如果没变 → 保持当前滤波器，让自适应算法继续微调
 ```
 
-### 实时降噪 (WASAPI 麦克风 → 扬声器)
+### 前馈环路（每秒 16000 次）— "肌肉"
 
-```bash
-# 编译 (需 -lole32 链接 COM)
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 \
-    main_realtime.c src/wasapi_io.c src/binary_loader.c \
-    src/cnn_m5_forward.c src/fir_filter.c \
-    -lm -lole32 -o gfanc_realtime.exe
+这个环路是**执行者**，每个音频样本（1/16000 秒）都在工作：
 
-# 运行
-./gfanc_realtime.exe
-
-# Ctrl+C 停止
+```
+噪声样本（当前时刻）
+  │
+  ├─→ 次级路径滤波（模拟"反噪声从扬声器到耳朵的传播过程"）
+  │     └─→ Fx = 扬声器播放的声音到达耳朵后会变成什么样
+  │
+  ├─→ 干扰信号（耳朵位置测到的噪声）
+  │     └─→ Dis = 如果没有降噪，耳朵会听到什么
+  │
+  ├─→ 反噪声计算
+  │     └─→ anti = Wc（控制滤波器）× Fx（传播路径）
+  │
+  ├─→ 误差 = Dis + anti（噪声 + 反噪声，理想情况下 = 0）
+  │
+  └─→ 自适应更新（FANLMS 算法）
+        └─→ 根据误差微调 Wc 的 1024 个系数
+           （像自动对焦一样，不断逼近最佳降噪效果）
 ```
 
-### Makefile
+### 数据流向图
 
-```bash
-make          # 编译离线版 main.exe
-make realtime # 编译实时版 gfanc_realtime.exe
-make all      # 两个都编译
-make clean    # 清理
+```
+                     ┌──────────────┐
+                     │  噪声 WAV 文件 │（离线）
+                     │  或 麦克风    │（实时）
+                     └──────┬───────┘
+                            │
+                     ┌──────▼───────┐
+                     │   带通滤波器   │ 20-1500Hz
+                     └──────┬───────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+     ┌────────────┐  ┌────────────┐  ┌────────────┐
+     │ 慢速环路    │  │ Pri 路径    │  │ Sec 路径    │
+     │ (每秒1次)   │  │ (噪声→耳朵) │  │ (扬声器→耳朵)│
+     │            │  │            │  │            │
+     │ CNN→Blend  │  │ Dis = 扰动  │  │ Fx = 滤波   │
+     │ →Wc 构造   │  │            │  │     参考    │
+     └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+           │               │               │
+           │   Wc (控制滤波器)              │
+           └───────┐       │               │
+                   │       │               │
+                   ▼       ▼               ▼
+            ┌──────────────────────────────────┐
+            │        前馈环路 (每秒16000次)       │
+            │                                  │
+            │  anti = Wc × Fx （计算反噪声）    │
+            │  err  = Dis + anti （计算误差）    │
+            │  Wc ← Wc - μ × err × Fx （自适应） │
+            └──────────────┬───────────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │  anti_out.wav │（离线输出）
+                    │  或 扬声器     │（实时输出）
+                    └──────────────┘
 ```
 
 ## 系统参数
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| fs (内部) | 16000 Hz | ANC 算法采样率 |
-| fs (硬件) | 48000 Hz | WASAPI 捕获/播放采样率 |
-| E | 3 | 误差麦克风数 |
-| S | 2 | 扬声器数 |
-| C | 15 | 子滤波器数（频带分解） |
-| K | 8 | 场景分类数 |
-| Len | 1024 tap | 控制滤波器长度 |
-| Sec Len | 1024+16 tap | 次级路径（含 DSP 延迟） |
-| BP Len | 1024 tap | 带通 FIR 20–1500Hz |
-| μ | 0.0001 | FxNLMS 步长 |
-| Leak | 1e-5 | 泄露因子 |
-| Fade | 16 样本 | 交叉淡化长度 (~1ms) |
-| Reset | cos < 0.8 | 场景切换余弦相似度阈值 |
-| WASAPI Latency | 10 ms | 麦克风→处理→扬声器延迟 |
+| 内部采样率 | 16000 Hz | 每秒处理 16000 个音频样本 |
+| 硬件采样率 | 48000 Hz | 麦克风和扬声器的实际采样率（实时模式会做转换） |
+| 误差麦克风 (E) | 3 个 | 放在"想安静的位置"，监测降噪效果 |
+| 扬声器 (S) | 2 个 | 播放反噪声 |
+| 子滤波器 (C) | 15 个 | 每个覆盖不同频率段，组合使用 |
+| 场景类型 (K) | 8 种 | AI 能识别 8 种不同的噪声环境 |
+| 滤波器长度 (L) | 1024 个系数 | 控制反噪声的"形状" |
+| 带通频率 | 20-1500 Hz | ANC 只对这个范围有效 |
+| 步长 (μ) | 0.0001 | 自适应速度（太大不稳定，太小收敛慢） |
+| 泄漏因子 | 0.00001 | 防止长时间运行后滤波器漂移 |
+| 场景切换阈值 | 余弦相似度 < 0.8 | 噪声类型变化超过这个程度才切换策略 |
+| 切换过渡 | 16 个样本 (1ms) | 新旧滤波器之间的平滑切换，人耳听不出 |
+| WASAPI 延迟 | 10 ms | 麦克风→处理→扬声器的总延迟（实时模式） |
 
-## 硬件拓扑 (实时模式)
+## C 代码与 Python 代码的对应
 
-```
-输入:  YDM6MIC 麦克风阵列, 48kHz, 6ch
-       ch0 = 参考麦 (噪声源头侧)
-       ch1 = 误差麦 Mic1 (人耳位置)
-       ch2 = 误差麦 Mic2
-       ch3 = 误差麦 Mic3
-       ch4-5 = 未使用
-
-输出:  USB Audio Device 扬声器, 48kHz, 2ch
-       ch0 = 扬声器 SPK0
-       ch1 = 扬声器 SPK1
-
-处理:  48kHz → 重采样到 16kHz → ANC → 反噪声 → 重采样到 48kHz
-```
-
-## 系统架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  慢速环路: CNN 场景辨识 + Blend 构造 Wc  (每秒执行一次)          │
-│                                                                  │
-│  audio (全频 / 实时为参考麦信号)                                  │
-│      │                                                           │
-│      ├─ 峰值归一化                                                │
-│      │                                                           │
-│      ├─ [① 带通 FIR 20-1500Hz, 1024tap] ──→ noise_bp             │
-│      │                                      │                    │
-│      │                                      ├─→ [② 带通 FIR]     │
-│      │                                      │    → ref_filt       │
-│      │                                      │    → 送往前馈环路   │
-│      │                                      │                    │
-│      │                                      └─→ minmaxscaler     │
-│      │                                           → CNN 输入      │
-│      │                                               │           │
-│      │                              ┌────────────────┘           │
-│      │                              ▼                             │
-│      │                     ┌─────────────────┐                   │
-│      │                     │  CNN m5_scene   │  1D 残差卷积       │
-│      │                     │  输出: K=8 维   │  64ch, 4 ResBlock │
-│      │                     │  logits         │                   │
-│      │                     └────────┬────────┘                   │
-│      │                              ▼                             │
-│      │                     ┌─────────────────┐                   │
-│      │                     │  softmax        │  → probs[K]       │
-│      │                     │  argmax         │  → scene_id       │
-│      │                     └────────┬────────┘                   │
-│      │                              ▼                             │
-│      │                     ┌─────────────────┐                   │
-│      │                     │  Blend          │  centroid[top1]   │
-│      │                     │  → [S×C] 权重   │  / max → clip     │
-│      │                     └────────┬────────┘                   │
-│      │                              ▼                             │
-│      │                     ┌─────────────────┐                   │
-│      │                     │  construct Wc   │  Σ blend[c]×      │
-│      │                     │  → Wc[S, Len]   │  sub_filter[c]    │
-│      │                     │  RMS对齐 stub   │  → 取反           │
-│      │                     └────────┬────────┘                   │
-│      │                              ▼                             │
-│      │                     ┌─────────────────┐                   │
-│      │                     │  滞回检测        │  cos_sim(prev,   │
-│      │                     │                  │  curr) < 0.8?    │
-│      │                     │  是 → CrossFader │  否 → 保持 Wc    │
-│      │                     └────────┬────────┘                   │
-│      │                              │                            │
-│      │                         Wc (更新 or 保持)                  │
-│      │                              │                            │
-└──────┼──────────────────────────────┼────────────────────────────┘
-       │                              │
-       │    ref_filt (20-1500Hz)      │  Wc (1024tap × S)
-       │    (来自带通FIR ②)           │  (每 1s 更新)
-       │                              │
-       ▼                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  前馈环路: 实时宽带降噪  (逐样本 62.5μs @ 16kHz)                  │
-│                                                                  │
-│  ref_filt[n]                                                     │
-│      │                                                           │
-│      ├──→ ┌──────────────────────────┐                          │
-│      │    │ ③ 次级路径 FIR            │  1024+16 tap            │
-│      │    │   Sec ⊗ ref_filt          │  E×S=6 通道             │
-│      │    │   (含 16 样本 DSP 延迟)    │                         │
-│      │    │   → Fx[e][s]              │                         │
-│      │    └──────────┬───────────────┘                          │
-│      │               │                                          │
-│      │               ├──→ Xd 延迟线 [E,S,Len]                   │
-│      │               │    roll → Xd[:,:,0]=Fx                   │
-│      │               │         │                                │
-│      │               │         └──→ ┌──────────────────┐       │
-│      │               │              │ anti_est[e] =     │       │
-│      │               │              │ Σ Wc[s,k]×Xd[e,s,k]│      │
-│      │               │              └────────┬─────────┘       │
-│      │               │                       │                  │
-│      │    ┌──────────┘                       │                  │
-│      │    │  err[e] = mic_err_filt[e]        │                  │
-│      │    │           + anti_est[e]          │                  │
-│      │    │  (离线: Dis[e] = Pri⊗ref_filt)   │                  │
-│      │    │                                  │                  │
-│      │    │   ┌──────────────────────────────┘                  │
-│      │    │   ▼                                                │
-│      │    │  ┌──────────────────────┐                          │
-│      │    │  │  FxNLMS 梯度更新      │                          │
-│      │    │  │  grad[s,k] =         │                          │
-│      │    │  │    Σ_e err[e]×Xd[e,s,k]                         │
-│      │    │  │  power[s] = mean(Xd²) │                          │
-│      │    │  │  Wc[s,k] -= μ×grad/pwr│                          │
-│      │    │  │  Wc[s,k] *= 1-μ×leak  │                          │
-│      │    │  └──────────┬───────────┘                          │
-│      │    │             │                                      │
-│      │    │        Wc 微调 (跨秒持续自适应)                      │
-│      │    │                                                    │
-│      │    └──→ ┌──────────────────────────┐                     │
-│      │         │ ② 反噪声 FIR              │  1024 tap          │
-│      │         │ Wc ⊗ Xd                   │  S=2 通道          │
-│      │         │ → anti_spk[s] (反噪声)    │                    │
-│      │         └──────────────────────────┘                     │
-│      │                       │                                  │
-│      ▼                       ▼                                  │
-│  ┌──────────────────────────────────────┐                       │
-│  │  实时模式: WASAPI 渲染 (S=2ch, 48kHz) │                       │
-│  │  离线模式: anti_out.wav / error_out   │                       │
-│  └──────────────────────────────────────┘                       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-
-   注: 反馈环路 (IIR 20-200Hz) 未启用 (FB_GAIN=0)
-   限幅 ±0.5、DAC 为硬件部署步骤，离线仿真不需要
-```
-
-### 离线 vs 实时 差异
-
-| | 离线 (main.c) | 实时 (main_realtime.c) |
-|---|---|---|
-| 输入 | WAV 文件 | WASAPI 麦克风 (YDM6MIC, 48kHz) |
-| 输出 | WAV 文件 | WASAPI 扬声器 (USB Audio, 48kHz) |
-| Dis (扰动) | Pri ⊗ ref_filt (仿真) | 实际误差麦信号 (带通后) |
-| 重采样 | 输入一次性 44.1k→16k | 流式 48k→16k→48k |
-| CNN | 全频 WAV 数据 | 参考麦信号 (带通滤波) |
-| 退出 | 处理完自动退出 | Ctrl+C 退出 |
-
-## 输出解读 (离线模式)
-
-```
- Sec |              Top-3 Scenes |   dB(Band) |   dB(Full) | Action
-   1 |      0:0.33,6:0.26,3:0.10 |    14.47 dB |    16.23 dB | INIT
-```
-
-- **Top-3 Scenes**: `场景ID:softmax概率` 前三名
-- **dB(Band)**: 带内降噪量 = 10·log₁₀(P_dis/P_err)，20-1500Hz 评估（**主要指标**）
-- **dB(Full)**: 全频参考，含 1500Hz+ 带外能量（仅对比用）
-- **Action**: `INIT`=首秒初始化，`RESET`=场景切换触发 CrossFader，`-`=无切换
-
-## 数据文件
-
-运行时从 `data/` 加载 `.bin` 文件（由 `export/export_bin.py` 从 Python 模型导出）：
-
-| 文件 | 内容 | 大小 (float32) |
-|------|------|---------------|
-| `secondary_path.bin` | 次级路径 IR [E,S,Len] | 6144 |
-| `primary_path.bin` | 初级路径 IR [E,R,Len] | 6144 |
-| `sub_filters.bin` | 子滤波器 Wc_v [C,S,Len] | 30720 |
-| `scene_defs.bin` | 场景质心 [K,S×C] | 240 |
-| `bandpass_fir.bin` | 带通 FIR 系数 [1024] | 1024 |
-| `cnn_*.bin` | CNN 权重 (stem/res0-3/linear) | ~50 文件 |
-
-## C 与 Python 的对应关系
-
-| C 文件 | Python 对应 | 功能 |
+| C 文件 | Python 文件 | 功能 |
 |--------|------------|------|
-| `main.c` | `notebooks/Main_GFANC_Realtime.ipynb` | 离线: WAV I/O + 逐秒 CNN + 逐样本 FxNLMS |
-| `main_realtime.c` | — | 实时: WASAPI I/O + 重采样 + ANC |
-| `src/cnn_m5_forward.c` | `gfanc/Network.py` | m5_scene CNN (64ch, 4 ResBlock) |
-| `src/scene_controller.c` | `gfanc/SceneController.py` | CNN → Blend → construct_wc |
-| `src/fxnlms_mimo.c` | `gfanc/Combine_GFANC_with_FxNLMS_MIMO.py` | MIMO FxNLMS 算法 |
-| `src/fir_filter.c` | `scipy.signal.lfilter` | FIR 滤波器 (double 精度延迟线) |
-| `src/cross_fader.c` | `gfanc/cross_fader.py` | Wc 系数交叉淡化 |
-| `src/wasapi_io.c` | `sounddevice.Stream` | WASAPI 捕获/渲染 |
-| `export/export_bin.py` | — | PyTorch/NumPy → C .bin 导出 |
+| `main.c` | `notebooks/Main_GFANC_Realtime.ipynb` | 离线: WAV 输入/输出 + 主循环 |
+| `main_realtime.c` | — | 实时: WASAPI 音频 + 重采样 + 主循环 |
+| `src/scene_controller.c` | `gfanc/SceneController.py` | AI 场景识别 → 滤波器构造 |
+| `src/fxnlms_mimo.c` | `gfanc/Combine_GFANC_with_FxNLMS_MIMO.py` | FxNLMS 自适应算法 |
+| `src/cnn_m5_forward.c` | `gfanc/Network.py` | 神经网络推理 |
+| `src/fir_filter.c` | `scipy.signal.lfilter` | FIR 滤波器 |
+| `src/wasapi_io.c` | `sounddevice.Stream` | 音频设备输入/输出 |
+| `src/binary_loader.c` | `numpy.fromfile` | 读取二进制模型文件 |
 
-## 已验证精度
+## 验证结果
 
-离线模式与 Python 参考实现对比（`mixed_7types_56s.wav`, 56 秒）：
+离线模式与 Python 参考实现逐秒对比（56 秒混合噪声测试文件）：
 
-| 指标 | C | Python | 差异 |
-|------|---|--------|------|
-| dB(Band) 平均 | 15.00 | 15.00 | 0.00 |
-| 场景分类 probs | 逐秒一致 | — | 0 |
-| Dis RMS (带内) | 1.6262 | 1.6262 | 0 |
-| Dis RMS (全频) | 1.9914 | 1.9914 | 0 |
-| Fx RMS | 0.5528 | 0.5528 | 0 |
+| 指标 | C 实现 | Python 参考 | 差异 |
+|------|--------|------------|------|
+| 平均降噪量 (dB) | **14.99** | 15.00 | 0.01 |
+| AI 场景识别 | 完全一致 | — | 0 |
+| 输入信号能量 | 完全一致 | — | 0 |
 
-## 编译环境
+## 常见问题
 
-- **离线版**: GCC/MinGW 或 MSVC, 仅需 `-lm`
-- **实时版**: GCC/MinGW, 需 `-lm -lole32`, Windows Vista+
-- Python 导出: `pip install torch numpy scipy`
+**Q: 为什么 error_out.wav 听起来比原噪声还大？**
+A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看 dB(Band) 数字，不要用耳朵直接听 error_out.wav。
+
+**Q: 实时模式怎么验证效果？**
+A: 目前实时版在终端只输出状态日志。后续可以加入实时 dB 显示。
+
+**Q: 可以处理其他采样率的文件吗？**
+A: 离线模式自动将输入重采样到 16000 Hz。支持 8/16/24 bit WAV。
+
+**Q: 为什么编译实时版需要 `-lole32`？**
+A: Windows 的音频 API（WASAPI）是 COM 组件，需要链接 ole32 库。

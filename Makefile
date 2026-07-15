@@ -1,40 +1,30 @@
-# MIMO GFANC C — offline + realtime builds
+# GFANC FxNLMS — offline + realtime builds
 #
-#   make             → 编译离线版 main.exe
-#   make realtime    → 编译实时版 gfanc_realtime.exe (需 WASAPI)
-#   make all         → 两个都编译
-#
-#   ./main.exe <noise.wav>              # 离线降噪
-#   ./gfanc_realtime.exe                # 实时降噪 (Ctrl+C 退出)
+#   make          → 编译离线版 main.exe
+#   make realtime → 编译实时版 gfanc_realtime.exe
+#   make all      → 两个都编译
+#   make clean    → 清理编译产物
 
-CC      = gcc
-CFLAGS  = -Wall -O2 -march=native -ffast-math -Iinclude
-LDFLAGS = -lm
+CC       = gcc
+CFLAGS   = -O2 -Iinclude
+CFLAGS_RT = -O2 -Iinclude -D_WIN32_WINNT=0x0601
+LDFLAGS  = -lm
 LDFLAGS_RT = -lm -lole32
 
-SRCS = src/binary_loader.c
-OBJS = $(SRCS:src/%.c=build/%.o)
+MODULES = src/scene_controller.c src/fxnlms_mimo.c \
+          src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c
 
-.PHONY: all clean export realtime
+.PHONY: all realtime clean
 
-all: export build/main.exe
+all: main.exe
 
-realtime: export build/gfanc_realtime.exe
+realtime: gfanc_realtime.exe
 
-build:
-	mkdir -p build
+main.exe: main.c $(MODULES)
+	$(CC) $(CFLAGS) main.c $(MODULES) $(LDFLAGS) -o $@
 
-build/%.o: src/%.c | build
-	$(CC) $(CFLAGS) -c $< -o $@
-
-build/main.exe: main.c $(OBJS) | build
-	$(CC) $(CFLAGS) main.c $(OBJS) $(LDFLAGS) -o $@
-
-build/gfanc_realtime.exe: main_realtime.c src/wasapi_io.c $(OBJS) | build
-	$(CC) $(CFLAGS) main_realtime.c src/wasapi_io.c $(OBJS) $(LDFLAGS_RT) -o $@
-
-export:
-	python export/export_bin.py
+gfanc_realtime.exe: main_realtime.c src/wasapi_io.c $(MODULES)
+	$(CC) $(CFLAGS_RT) main_realtime.c src/wasapi_io.c $(MODULES) $(LDFLAGS_RT) -o $@
 
 clean:
-	rm -rf build main.exe gfanc_realtime.exe anti_out.wav error_out.wav
+	rm -f main.exe gfanc_realtime.exe anti_out.wav error_out.wav
