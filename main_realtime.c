@@ -48,9 +48,10 @@ typedef struct {
     int    dec_phase;
 
     /* 统计 */
-    volatile float db_reduction;
-    volatile float acc_dist, acc_err;
-    volatile float dist_rms;  /* 扰动 RMS, 用于静音检测 */
+    volatile float nr_level;     /* 降噪指标: ref功率/err功率 (dB) */
+    volatile float ref_rms;      /* 参考信号 RMS */
+    volatile float err_rms;      /* 误差信号 RMS */
+    volatile float acc_ref, acc_err;
     volatile int   acc_cnt;
     volatile int   running;
     volatile int   callback_count;
@@ -152,16 +153,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         else
             fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
 
-        /* 累积功率用于 dB */
-        for (int e = 0; e < E; e++) {
-            ctx->acc_dist += dist[e] * dist[e];
-            ctx->acc_err  += err_sig[e] * err_sig[e];
-        }
+        /* 累积功率: ref(参考麦) vs err(误差麦), 业内标准实时指标 */
+        ctx->acc_ref += ref_filt * ref_filt;
+        for (int e = 0; e < E; e++)
+            ctx->acc_err += err_sig[e] * err_sig[e];
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
-            float pd = ctx->acc_dist, pe = ctx->acc_err;
-            ctx->db_reduction = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
-            ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
-            ctx->acc_dist = ctx->acc_err = 0; ctx->acc_cnt = 0;
+            float pr = ctx->acc_ref, pe = ctx->acc_err;
+            ctx->nr_level = 10.0f * log10f((pr + 1e-12f) / (pe / E + 1e-12f));
+            ctx->ref_rms = sqrtf(pr / FS_ANC);
+            ctx->err_rms = sqrtf(pe / (FS_ANC * E));
+            ctx->acc_ref = ctx->acc_err = 0; ctx->acc_cnt = 0;
         }
 
         ctx->anti_48k[n] = anti_spk[0];
@@ -310,13 +311,9 @@ int main(void) {
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
                 /* 计算反噪声 RMS */
-                /* 信号太弱时 dB 不可靠 */
-                float db_show = ctx.db_reduction;
-                if (ctx.dist_rms < 0.0005f) db_show = 0;
-
-                printf("[CNN] scene=%d max=%.2f cos=%.2f dB=%.1f rms=%.4f cb=%d\n",
+                printf("[CNN] scene=%d max=%.2f cos=%.2f NR=%.1fdB ref=%.4f err=%.4f cb=%d\n",
                        ctx.sc.cur_scene, probs[ctx.sc.cur_scene], cos_sim,
-                       db_show, ctx.dist_rms, ctx.callback_count);
+                       ctx.nr_level, ctx.ref_rms, ctx.err_rms, ctx.callback_count);
                 if (cos_sim < 0.8f) {
                     memcpy(ctx.wc_old, ctx.fx.wc, S*L*sizeof(float));
                     ctx.fade_cnt = FADE_LEN;
