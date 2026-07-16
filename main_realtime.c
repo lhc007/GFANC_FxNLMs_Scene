@@ -26,7 +26,7 @@
 #define SEC_LEN  1024
 #define DSP_DELAY 16
 #define FADE_LEN 16
-#define MIC_PRE_GAIN  10.0f   /* 输入数字预增益 (>6x 声反馈环路启动, 待反馈抵消后提升) */
+#define MIC_PRE_GAIN  10.0f    /* 输入数字预增益 (噪声源良好耦合时 8-10x 足够) */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */
 #define COLDSTART_MS  400     /* 冷启动 ramp 时长 ms (anti_out 0→1) */
 #define RAMP_SAMPLES   ((FS_ANC * COLDSTART_MS) / 1000)
