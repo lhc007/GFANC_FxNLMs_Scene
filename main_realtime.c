@@ -53,6 +53,7 @@ typedef struct {
     volatile float err_rms;      /* 误差信号 RMS */
     volatile float acc_ref, acc_err;
     volatile int   acc_cnt;
+    volatile int   safety_mute;  /* 安全静音: err > ref 时关闭输出 */
     volatile int   running;
     volatile int   callback_count;
 } rt_ctx_t;
@@ -162,8 +163,13 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->nr_level = 10.0f * log10f((pr + 1e-12f) / (pe / E + 1e-12f));
             ctx->ref_rms = sqrtf(pr / FS_ANC);
             ctx->err_rms = sqrtf(pe / (FS_ANC * E));
+            /* 安全静音: err > ref 时 ANC 在帮倒忙, 关闭输出 */
+            ctx->safety_mute = (ctx->err_rms > ctx->ref_rms && ctx->ref_rms > 0.0001f);
             ctx->acc_ref = ctx->acc_err = 0; ctx->acc_cnt = 0;
         }
+
+        /* 安全静音时输出零 */
+        if (ctx->safety_mute) { anti_spk[0] = 0; anti_spk[1] = 0; }
 
         ctx->anti_48k[n] = anti_spk[0];
         ctx->anti_48k[n + c16k] = anti_spk[1];
@@ -311,9 +317,10 @@ int main(void) {
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
                 /* 计算反噪声 RMS */
-                printf("[CNN] scene=%d max=%.2f cos=%.2f NR=%.1fdB ref=%.4f err=%.4f cb=%d\n",
+                printf("[CNN] scene=%d max=%.2f cos=%.2f NR=%.1fdB ref=%.4f err=%.4f%s cb=%d\n",
                        ctx.sc.cur_scene, probs[ctx.sc.cur_scene], cos_sim,
-                       ctx.nr_level, ctx.ref_rms, ctx.err_rms, ctx.callback_count);
+                       ctx.nr_level, ctx.ref_rms, ctx.err_rms,
+                       ctx.safety_mute ? " [MUTE]" : "", ctx.callback_count);
                 if (cos_sim < 0.8f) {
                     memcpy(ctx.wc_old, ctx.fx.wc, S*L*sizeof(float));
                     ctx.fade_cnt = FADE_LEN;
