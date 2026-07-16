@@ -17,6 +17,7 @@
 | 抗饱和钳位 | ✅ 完成 | anti_spk 在 RMS 统计前钳位到 ±1.0 |
 | 冷启动静音 | ✅ 完成 | ramp 400ms + mute_hold 1500ms 双重保护 |
 | 场景记忆切换 | ✅ 完成 | 每场景保存已收敛 Wc，切回时直接恢复 |
+| 反馈抵消 | ✅ 完成 | 离线 NLMS 辨识 + 运行时 FIR 减法，10x 增益稳定 |
 | 在线降噪实测 | ✅ 完成 | NR 6-15dB (安静室), err 底噪 ~0.0003 |
 
 ---
@@ -96,7 +97,7 @@ LMS 无法抵消不相关的噪声分量。这是前馈 ANC 在开放空间的�
 
 | 功能 | 商业 ANC | 本系统 | 优先级 |
 |------|---------|--------|--------|
-| **反馈抵消** | 扬声器→参考麦路径自适应建模 | 无（增益上限 5x 的原因） | 🔴 P0 |
+| **反馈抵消** | 扬声器→参考麦路径自适应建模 | ✅ NLMS 离线辨识 + 实时 FIR 减法 | 🔴 P0 |
 | **增益标定** | 自动测量 + 配置文件 | 部分：MIC_PRE_GAIN 可调，缺自动测量 | 🟡 P1 |
 | **子带处理** | 分频段独立收敛 | 全频带统一 | 🟡 P1 |
 | **啸叫检测** | 频谱峰值检测 + 陷波滤波器 | 无（仅 RMS 检测） | 🟡 P1 |
@@ -114,23 +115,21 @@ LMS 无法抵消不相关的噪声分量。这是前馈 ANC 在开放空间的�
 
 ### 详解
 
-#### P0: 反馈抵消（当前最高优先级）
+#### P0: 反馈抵消 ✅ 已完成
 
-**问题**：参考麦收到扬声器反噪声 → 形成正反馈环路。实测 MIC_PRE_GAIN>6x 开始出现
-反馈振荡（ref_rms 无故增大、anti 暴涨、NR 转负），5x 是当前稳定上限。
-反馈抵消的优先级高于增益标定——因为增益瓶颈不是"不知道设多少"，而是"设大了就啸叫"。
+**实现**：`src/calibrate_feedback.c` + `main_realtime.c`
 
-**方案**：
-1. 离线测量反馈路径（扬声器→参考麦）的冲激响应 `Fb_path`
-2. 运行时：`ref_corrected = ref_raw - Fb_path ⊗ anti_output`
-3. CrossFader 平稳过渡修正/未修正模式
+1. **校准程序** (`calibrate_feedback.exe`)：扬声器播放 4 秒白噪声，参考麦录制，
+   NLMS 辨识 256 tap FIR → 存入 `data/feedback_path.bin`
+2. **运行时**：每样本 `ref_corrected = ref_raw - Fb_path ⊗ anti_output`，
+   反馈 FIR 的输出抵消扬声器漏回参考麦的分量
+3. **自动降级**：若 `feedback_path.bin` 不存在，自动禁用，不影响正常 ANC
 
-**实现要点**：
-- 反馈路径通常很短（几厘米），512 tap 足够
-- 离线测量：播放白噪声，录制参考麦响应，LMS 辨识传递函数
-- 抵消后参考信号中不再包含扬声器分量，可安全将 MIC_PRE_GAIN 从 5x 提升到 20-50x
-
-**预期收益**：增益翻 4-10 倍，解决音量不足问题。这是当前软件层面性价比最高的升级。
+**实测效果**：
+- 反馈路径：peak @ tap 7 (0.44ms ≈ 15cm)，衰减约 -34dB
+- 10x 增益可稳定运行（之前 6x 即反馈振荡），全程无发散
+- 反馈抵消量 RMS ~0.0001-0.0003（5x 增益时更小）
+- 当前瓶颈已从"反馈限制增益"转移到"开放空间声学解相关"(见 1.3 节)
 
 #### P1: 增益标定
 
@@ -258,9 +257,9 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
 
 ```
 第一阶段 (本周)
-├── 🔴 反馈抵消 (P0) —— 离线测量 + 在线减法 → 增益可提升到 10-20x
+├── 🔴 反馈抵消 (P0) ✅ 已完成 —— NLMS 离线辨识 + 实时 FIR 减法
 ├── 🟡 窗户 ANC 实验 —— 参考麦伸窗外，验证高相关路径 NR 提升
-└── 预期: 增益安全翻倍，窗户场景 NR 10-15dB
+└── 预期: 窗户场景 NR 10-15dB
 
 第二阶段 (1-2 周)
 ├── 啸叫检测 (P1) —— FFT + 陷波
@@ -292,21 +291,24 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
 ## 五、软件架构升级建议
 
 ```
-当前:  main_realtime.c (单片, ~400 行)
+当前:  main_realtime.c (单片, ~500 行)
              │
-             ├── scene_controller (CNN + Wc)
-             ├── fxnlms_mimo     (自适应)
-             ├── fir_filter      (FIR)
-             └── PortAudio DLL   (音频 I/O)
+             ├── scene_controller  (CNN + Wc)
+             ├── fxnlms_mimo       (自适应)
+             ├── fir_filter        (FIR)
+             ├── feedback_cancel   (反馈抵消) ✅
+             └── PortAudio DLL     (音频 I/O)
+
+校准:  calibrate_feedback.c (独立程序, NLMS 辨识反馈路径)
+             │
+             └── 输出: data/feedback_path.bin → 运行时自动加载
 
 建议:  模块化 + 可配置
              │
              ├── config.json        ← 所有可调参数
              ├── calibration.c      ← 自动增益标定
-             ├── feedback_cancel.c  ← 反馈路径抵消
              ├── howling_detect.c   ← 啸叫检测 + 陷波
              ├── divergence_guard.c ← Wc 发散检测 + 自动回退
-             ├── coldstart_mute.c   ← 冷启动静音
              └── subband_fxlms.c    ← 子带自适应 (可选)
 ```
 
@@ -335,9 +337,9 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
     "coldstart_mute_ms": 500
   },
   "feedback": {
-    "enabled": false,
-    "filter_length": 512,
-    "adaptation_rate": 0.001
+    "enabled": true,
+    "filter_length": 256,
+    "calibrate_once": true
   },
   "howling": {
     "enabled": false,
