@@ -123,6 +123,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define PRI_LEN 1024
 #define SEC_LEN 1024
 #define DSP_DELAY 16
+#define MIC_PRE_GAIN  1.0f    /* 输入预增益 (离线已做峰值归一化, 默认1.0; >1.0模拟硬件前放) */
 #define FADE_LEN  16
 
 /* ══════════════════════════════════════════════════════════
@@ -240,10 +241,10 @@ int main(int argc, char **argv)
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
 
-        /* 4a. ref_filt = bandpass(noise_bp) — 第二遍带通 */
+        /* 4a. ref_filt = bandpass(noise_bp) × pre_gain */
         float *ref_filt = (float *)malloc(chunk * sizeof(float));
         for (int i = 0; i < len; i++)
-            ref_filt[i] = fir_tick(&bp_fir, noise_bp[start + i]);
+            ref_filt[i] = fir_tick(&bp_fir, noise_bp[start + i]) * MIC_PRE_GAIN;
 
         /* 4b. Dis_band = Pri(ref_filt), Dis_full = Pri(noise_bp) */
         float *dis_buf  = (float *)calloc(E * len, sizeof(float));
