@@ -35,6 +35,7 @@
 #define FB_LEN       256     /* 反馈路径 FIR 长度 */
 #define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
 #define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
+#define REF_RING     8192    /* 参考延迟环大小 (2 的幂, 覆盖 bulk 延迟 ≤512ms) */
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
@@ -59,6 +60,7 @@ typedef struct {
     int    fade_cnt;
     int    ramp_cnt;        /* 输出渐变: RAMP_SAMPLES → 0, anti_out 0→1 */
     int    mute_hold;       /* safety_mute 抑制: MUTE_HOLD_SAMPLES → 0, 覆盖首次 RMS */
+    int    clip_run;        /* 连续满幅样本计数 (削波瞬时保护) */
     float  cnn_buf[FS_ANC];
     int    cnn_cnt;
     int    first_sec;
@@ -70,7 +72,10 @@ typedef struct {
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
 
     /* 48k 重采样缓冲 */
-    float *ref_48k, *anti_48k, *err_48k; /* 在回调内部分配? 用固定大小 */
+    float *ref_48k, *anti_48k, *err_48k; /* 固定大小, 启动时分配 */
+    float  ref_ring[REF_RING]; /* 参考延迟环形缓冲 (Ŝ bulk 延迟补偿) */
+    unsigned ref_ring_wr;      /* 环形缓冲写指针 (unsigned: 回绕安全) */
+    int    ref_bulk;           /* 实测 bulk 延迟样本数 (0=仿真版/无延迟) */
     int    dec_phase;
 
     /* 统计 */
@@ -176,27 +181,34 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             if (ctx->fade_cnt == 0) memcpy(ctx->fx.wc, ctx->wc_cur, S*L*sizeof(float));
         }
 
-        /* Fx = Sec ⊗ ref_filt */
+        /* Fx = Sec ⊗ ref(延迟 bulk 样本): 实测 Ŝ 已对齐去除 I/O bulk 延迟,
+           此处用环形缓冲把延迟补回, 使 xd 与实测误差在时间上对齐 */
+        ctx->ref_ring[ctx->ref_ring_wr & (REF_RING - 1)] = ref_filt;
+        float ref_for_fx = ctx->ref_ring[(ctx->ref_ring_wr - ctx->ref_bulk) & (REF_RING - 1)];
+        ctx->ref_ring_wr++;
+
         float Fx_arr[E*S];
         for (int e = 0; e < E; e++)
             for (int s = 0; s < S; s++)
-                Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_filt);
+                Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_for_fx);
 
-        /* 扰动 = bp(mic) × 预增益 (含软限幅) */
-        float dist[E];
+        /* 误差麦实测信号 = bp(mic × 预增益) (含软限幅).
+           物理上已含 扰动 d + 真实反噪声, 直接作为 FxNLMS 的 e(n) */
+        float err_meas[E];
         for (int e = 0; e < E; e++) {
             float es = ctx->err_48k[n*3+e] * MIC_PRE_GAIN;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
-            dist[e] = fir_tick(&ctx->bp_err[e], es);
+            err_meas[e] = fir_tick(&ctx->bp_err[e], es);
         }
 
-        /* FxNLMS */
-        float err_sig[E];  /* anti_spk 在循环外声明 (反馈抵消需跨迭代) */
+        /* FxNLMS (F-A 修复): 扬声器输出 = Wc ⊗ ref_filt (不经 Ŝ 二次滤波),
+           自适应直接用实测误差, 不再合成 err = dist + anti_est */
+        float anti_est[E];  /* Ŝ 模型预测的误差麦处反噪声 (仅供 NR 统计) */
         if (ctx->fade_cnt == 0)
-            fxnlms_tick(&ctx->fx, Fx_arr, dist, anti_spk, err_sig);
+            fxnlms_tick_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk, anti_est);
         else
-            fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
+            fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, anti_spk, anti_est);
 
         /* 输出钳位 (防止 FxNLMS 计算值远超 ±1.0 导致硬截断失真) */
         for (int s = 0; s < S; s++) {
@@ -207,7 +219,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 啸叫检测 + 陷波 (钳位后, 统计前) */
         {
             float err_avg = 0;
-            for (int e = 0; e < E; e++) err_avg += err_sig[e];
+            for (int e = 0; e < E; e++) err_avg += err_meas[e];
             err_avg /= (float)E;
             howling_tick(&ctx->hw, err_avg, anti_spk, S);
         }
@@ -219,13 +231,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         ctx->acc_ref += ref_filt * ref_filt;
         ctx->acc_fb  += fb_est * fb_est;                   /* 反馈抵消量 */
         for (int e = 0; e < E; e++) {
-            ctx->acc_err  += err_sig[e] * err_sig[e];
-            ctx->acc_dist += dist[e]    * dist[e];       /* 扰动 = 误差麦处原始噪声 */
+            float dist_est = err_meas[e] - anti_est[e];  /* d̂ = e − ŷ_anti: 无 ANC 时的扰动估计 */
+            ctx->acc_err  += err_meas[e] * err_meas[e];
+            ctx->acc_dist += dist_est    * dist_est;
         }
         ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
             float pd = ctx->acc_dist, pe = ctx->acc_err;
-            /* NR = 误差麦处噪声(dist) vs 误差麦处残差(err) — 正确的降噪量定义 */
+            /* NR = 扰动估计(d̂ = e−anti_est) vs 实测残差(e) */
             ctx->nr_level = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
             ctx->ref_rms  = sqrtf(ctx->acc_ref  / FS_ANC);
             ctx->err_rms  = sqrtf(pe / (FS_ANC * E));
@@ -243,6 +256,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
         /* 安全静音时输出零 (冷启动抑制期内不触发) */
         if (ctx->safety_mute) { anti_spk[0] = 0; anti_spk[1] = 0; }
+
+        /* 削波瞬时保护: 连续 >50ms 满幅 → 立即静音输出.
+           (acc_anti 已在上方累积削波值, 1s 刹车仍会触发并回退 Wc;
+            本保护只是把发散期间的啸叫从秒级压到 50ms) */
+        if (fabsf(anti_spk[0]) > 0.98f || fabsf(anti_spk[1]) > 0.98f)
+            ctx->clip_run++;
+        else
+            ctx->clip_run = 0;
+        if (ctx->clip_run > FS_ANC / 20)   /* 800 样本 = 50ms */
+            { anti_spk[0] = 0; anti_spk[1] = 0; }
 
         /* 冷启动 ramp: INIT/RESET 后 anti_out 从 0 平滑渐入 */
         if (ctx->ramp_cnt > 0) {
@@ -322,8 +345,32 @@ int main(void) {
 
     /* 加载权重 */
     printf("Loading weights...\n");
-    float *sec_path, *sub_filters, *centroids, *bp_coeff;
-    bin_load_float("data/secondary_path.bin", &sec_path);
+    float *sec_path = NULL, *sub_filters, *centroids, *bp_coeff;
+    /* 次级路径: 优先实测版 (calibrate_secondary.exe, IR 已对齐, 延迟单独存).
+       实测文件必须与 sec_bulk_delay.bin 成对存在才有效 (排除旧版残留垃圾).
+       缺失时回退仿真版 + DSP_DELAY 猜测值 (F-B: 仿真 Ŝ 相位失配会导致发散) */
+    int sec_measured = 0, sec_bulk = 0;
+    {
+        int sec_n = bin_load_float("data/secondary_path_measured.bin", &sec_path);
+        float *dly_ptr = NULL;
+        int dn = bin_load_float("data/sec_bulk_delay.bin", &dly_ptr);
+        if (sec_n == E*S*SEC_LEN && dn == 1 && dly_ptr) {
+            sec_measured = 1;
+            sec_bulk = (int)(dly_ptr[0] + 0.5f);
+            if (sec_bulk < 0) sec_bulk = 0;
+            printf("  Secondary path: MEASURED (实测, bulk=%d 样本 = %.1fms)\n",
+                   sec_bulk, sec_bulk * 1000.0f / FS_ANC);
+        } else {
+            if (sec_n > 0 && dn != 1)
+                printf("  !! secondary_path_measured.bin 缺配套 sec_bulk_delay.bin\n"
+                       "     (旧版校准残留, 已忽略 — 请重新运行 calibrate_secondary.exe)\n");
+            if (sec_path) { bin_free(sec_path); sec_path = NULL; }
+            bin_load_float("data/secondary_path.bin", &sec_path);
+            printf("  Secondary path: !! 仿真数据 + DSP_DELAY=%d (未实测, 自适应可能发散,\n"
+                   "                  强烈建议先运行 calibrate_secondary.exe)\n", DSP_DELAY);
+        }
+        if (dly_ptr) bin_free(dly_ptr);
+    }
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
     bin_load_float("data/scene_defs.bin", &centroids);
     bin_load_float("data/bandpass_fir.bin", &bp_coeff);
@@ -343,13 +390,21 @@ int main(void) {
         ctx.bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
     }
 
-    int sp = SEC_LEN + DSP_DELAY;
+    /* 次级路径 FIR: 实测版延迟已内嵌 IR → 不加偏移;
+       仿真版用 DSP_DELAY 右移近似 I/O 延迟 (粗糙, 见 CODE_REVIEW F-B) */
+    int shift = sec_measured ? 0 : DSP_DELAY;
+    int sp = SEC_LEN + shift;
     ctx.sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
     ctx.sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
     for (int e = 0; e < E; e++)
         for (int s = 0; s < S; s++) {
             int idx = e*S+s;
-            memcpy(ctx.sec_coeffs + idx*sp + DSP_DELAY, sec_path + idx*SEC_LEN, SEC_LEN*sizeof(float));
+            memcpy(ctx.sec_coeffs + idx*sp + shift, sec_path + idx*SEC_LEN, SEC_LEN*sizeof(float));
+            /* 实测 IR 是原始麦电平; 运行时 err/ref 均带 MIC_PRE_GAIN,
+               模型同步放大, 使 Ŝ 与数字环路增益一致 */
+            if (sec_measured)
+                for (int k = 0; k < sp; k++)
+                    ctx.sec_coeffs[idx*sp + k] *= MIC_PRE_GAIN;
             ctx.sec_firs[idx].coeffs = ctx.sec_coeffs + idx*sp;
             ctx.sec_firs[idx].n_taps = sp;
             ctx.sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
@@ -388,13 +443,25 @@ int main(void) {
     ctx.ref_48k = (float *)malloc(FS_HW * sizeof(float));
     ctx.anti_48k = (float *)malloc(FS_HW * S * sizeof(float));
     ctx.err_48k = (float *)malloc(FS_HW * E * sizeof(float));
-    printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
-    /* 打开 PortAudio 流 */
-    PaStreamParams in_p = { in_dev, 6, 0x00000001, 0.01, NULL };  /* paFloat32 */
-    PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.01, NULL };
+    /* bulk 延迟补偿 (实测 IR 已对齐去除该延迟, 运行时用环形缓冲补回) */
+    ctx.ref_bulk = sec_bulk;
+    if (ctx.ref_bulk > REF_RING - 1) ctx.ref_bulk = REF_RING - 1;
+    if (ctx.ref_bulk > 48)  /* >3ms: 超过典型窗口场景的声传播裕度 */
+        printf("  !! bulk 延迟 %.1fms > 声学因果裕度(~3ms): 宽带随机噪声无法前馈抵消,\n"
+               "     周期性/窄带噪声仍可 (根治需低延迟共时钟声卡)\n",
+               ctx.ref_bulk * 1000.0f / FS_ANC);
+    printf("  ANC ready: E=%d S=%d L=%d bulk=%d (%.2fms)\n",
+           E, S, L, ctx.ref_bulk, ctx.ref_bulk * 1000.0f / FS_ANC);
+
+    /* 打开 PortAudio 流.
+       流参数与 calibrate_secondary.exe 完全一致 (实测 bulk 延迟才能对应):
+       960 帧 (20ms, 可被 3 整除) + 0.2s latency — WASAPI 共享模式下
+       小缓冲 (96帧/2ms) 会持续欠载导致信号成块滑移, 自适应无法对齐 */
+    PaStreamParams in_p = { in_dev, 6, 0x00000001, 0.2, NULL };  /* paFloat32 */
+    PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.2, NULL };
     PaStream *stream = NULL;
-    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, &ctx);
+    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 960, 0, (void*)audio_cb, &ctx);
     if (err != 0) {
         fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err));
         return 1;
@@ -445,7 +512,7 @@ int main(void) {
                 printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f)\n",
                        ctx.ch_rms[0], ctx.ch_rms[1], ctx.ch_rms[2], ctx.ch_rms[3],
                        ctx.ref_rms);
-                printf("       ANC: dist=%.4f err=%.4f  (dist=误差麦噪声, err=残差)\n",
+                printf("       ANC: dist=%.4f err=%.4f  (dist=扰动估计 e−ŷ, err=实测残差)\n",
                        ctx.dist_rms, ctx.err_rms);
                 if (ctx.fb_active)
                     printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx.fb_rms);
@@ -455,8 +522,24 @@ int main(void) {
                            ctx.hw.active_count,
                            ctx.hw.active_count > 0 ? " [NOTCH]" : "");
 
-                /* 收敛检测: 连续 3 帧 NR>3dB → 保存当前场景的已收敛 Wc */
-                if (ctx.nr_level > 3.0f && !ctx.safety_mute) {
+                /* 发散刹车 (F-B 保护): 输出持续逼近满幅 → Wc 已发散.
+                   回退本帧 CNN 预设 (wc_cur 刚由 scene_ctrl_process 构造),
+                   作废可能被污染的场景记忆, 重新静音渐入 */
+                if (ctx.anti_rms > 0.90f) {
+                    printf("  !! DIVERGE anti=%.2f → 回退 CNN 预设 Wc, 场景记忆作废"
+                           " (若反复出现请运行 calibrate_secondary.exe)\n", ctx.anti_rms);
+                    fxnlms_set_wc(&ctx.fx, ctx.wc_cur);
+                    ctx.scene_wc_valid[ctx.cur_scene_id] = 0;
+                    ctx.scene_wc_valid[new_scene] = 0;
+                    ctx.cur_scene_id = new_scene;
+                    ctx.fade_cnt  = 0;
+                    ctx.ramp_cnt  = RAMP_SAMPLES;
+                    ctx.mute_hold = MUTE_HOLD_SAMPLES;
+                    ctx.converged_frames = 0;
+                } else {
+
+                /* 收敛检测: 连续 3 帧 NR>3dB 且输出未逼近削波 → 保存已收敛 Wc */
+                if (ctx.nr_level > 3.0f && !ctx.safety_mute && ctx.anti_rms < 0.7f) {
                     ctx.converged_frames++;
                     if (ctx.converged_frames >= 3) {
                         memcpy(ctx.scene_wc[ctx.cur_scene_id], ctx.fx.wc, S*L*sizeof(float));
@@ -492,6 +575,7 @@ int main(void) {
                     ctx.cur_scene_id = new_scene;
                     ctx.converged_frames = 0;
                 }
+                } /* end if (!anti_rms_diverge) */
             }
             memcpy(ctx.sc.prev_probs, probs, 8*sizeof(float));
             ctx.cnn_cnt = 0;
