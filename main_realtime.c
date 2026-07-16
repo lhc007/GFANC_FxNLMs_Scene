@@ -14,6 +14,7 @@
 #include "binary_loader.h"
 #include "scene_controller.h"
 #include "fxnlms_mimo.h"
+#include "howling_detect.h"
 
 /* ══════════════════════════════════════════════════════════ */
 #define FS_HW    48000
@@ -25,12 +26,15 @@
 #define SEC_LEN  1024
 #define DSP_DELAY 16
 #define FADE_LEN 16
-#define MIC_PRE_GAIN  5.0f   /* 输入数字预增益 (>6x 声反馈环路启动, 待反馈抵消后提升) */
+#define MIC_PRE_GAIN  10.0f   /* 输入数字预增益 (>6x 声反馈环路启动, 待反馈抵消后提升) */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */
 #define COLDSTART_MS  400     /* 冷启动 ramp 时长 ms (anti_out 0→1) */
 #define RAMP_SAMPLES   ((FS_ANC * COLDSTART_MS) / 1000)
 #define MUTE_HOLD_MS  1500    /* safety_mute 抑制时长 ms (需 >1s 覆盖下一次 RMS 评估) */
 #define MUTE_HOLD_SAMPLES ((FS_ANC * MUTE_HOLD_MS) / 1000)
+#define FB_LEN       256     /* 反馈路径 FIR 长度 */
+#define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
+#define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
@@ -41,6 +45,14 @@ typedef struct {
     fir_filter_t  bp_err[E];     /* err 带通 */
     fir_filter_t *sec_firs;      /* [E*S] 次级路径 */
     float        *sec_coeffs;
+
+    /* 反馈抵消 */
+    fir_filter_t     fb_fir;        /* 扬声器→参考麦反馈路径 FIR */
+    float           *fb_coeffs_buf;
+    int              fb_active;     /* 1=反馈抵消已加载 */
+
+    /* 啸叫检测 */
+    howling_detect_t hw;           /* DFT 频谱检测 + IIR 陷波 */
 
     /* 跨回调状态 */
     float  wc_old[S*L], wc_cur[S*L];
@@ -65,8 +77,9 @@ typedef struct {
     volatile float nr_level, ref_rms, err_rms, dist_rms;
     volatile float ch_rms[4];    /* 原始声道 RMS: ch0=ref, ch1-3=err */
     volatile float anti_rms;     /* 反噪声 RMS */
-    volatile float acc_ref, acc_err, acc_dist;
+    volatile float acc_ref, acc_err, acc_dist, acc_fb;
     volatile float acc_ch[4], acc_anti;
+    volatile float fb_rms;       /* 反馈抵消量 RMS */
     volatile int   acc_cnt;
     volatile int   safety_mute;
     volatile int   running;
@@ -133,9 +146,17 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     }
 
     /* ── ANC @ 16kHz ── */
+    float anti_spk[S] = {0, 0};   /* 反馈抵消需要上一轮的 anti 值 */
     for (int n = 0; n < c16k; n++) {
         float ref_raw     = ctx->ref_48k[n];             /* 原始电平 (用于 RMS 显示) */
-        float ref_sample  = ref_raw * MIC_PRE_GAIN;
+
+        /* 反馈抵消: 估计扬声器→参考麦的反馈分量并减去 */
+        float fb_est = 0;
+        if (ctx->fb_active) {
+            float anti_mix = (anti_spk[0] + anti_spk[1]) * 0.5f;
+            fb_est = fir_tick(&ctx->fb_fir, anti_mix);
+        }
+        float ref_sample  = (ref_raw - fb_est) * MIC_PRE_GAIN;
         /* 输入软限幅: tanh 防止吹气/冲击导致 FIR 饱和 → 非线性失真 → 发散 */
         if      (ref_sample >  MIC_CLIP_MAX) ref_sample =  tanhf(ref_sample);
         else if (ref_sample < -MIC_CLIP_MAX) ref_sample = -tanhf(-ref_sample);
@@ -171,7 +192,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         }
 
         /* FxNLMS */
-        float anti_spk[S], err_sig[E];
+        float err_sig[E];  /* anti_spk 在循环外声明 (反馈抵消需跨迭代) */
         if (ctx->fade_cnt == 0)
             fxnlms_tick(&ctx->fx, Fx_arr, dist, anti_spk, err_sig);
         else
@@ -183,11 +204,20 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
         }
 
+        /* 啸叫检测 + 陷波 (钳位后, 统计前) */
+        {
+            float err_avg = 0;
+            for (int e = 0; e < E; e++) err_avg += err_sig[e];
+            err_avg /= (float)E;
+            howling_tick(&ctx->hw, err_avg, anti_spk, S);
+        }
+
         /* 累积功率: 原始声道 + 滤波参考 + 误差 + 反噪声 */
         ctx->acc_ch[0] += ref_raw * ref_raw;             /* 原始 mic 电平 (不含预增益) */
         for (int e = 0; e < E; e++)
             ctx->acc_ch[1+e] += ctx->err_48k[n*3+e] * ctx->err_48k[n*3+e];
         ctx->acc_ref += ref_filt * ref_filt;
+        ctx->acc_fb  += fb_est * fb_est;                   /* 反馈抵消量 */
         for (int e = 0; e < E; e++) {
             ctx->acc_err  += err_sig[e] * err_sig[e];
             ctx->acc_dist += dist[e]    * dist[e];       /* 扰动 = 误差麦处原始噪声 */
@@ -200,12 +230,13 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->ref_rms  = sqrtf(ctx->acc_ref  / FS_ANC);
             ctx->err_rms  = sqrtf(pe / (FS_ANC * E));
             ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
+            ctx->fb_rms   = sqrtf(ctx->acc_fb   / FS_ANC);
             for (int c = 0; c < 4; c++)
                 ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
             ctx->anti_rms = sqrtf(ctx->acc_anti / (FS_ANC * 2));
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms && ctx->ref_rms > 0.0001f
                                 && ctx->mute_hold == 0);  /* 冷启动期间抑制, 由 ramp 接管 */
-            ctx->acc_ref = ctx->acc_err = ctx->acc_dist = 0; ctx->acc_cnt = 0;
+            ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0; ctx->acc_cnt = 0;
             ctx->acc_anti = 0;
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
@@ -324,7 +355,33 @@ int main(void) {
             ctx.sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
         }
 
+    /* 反馈抵消: 加载反馈路径 FIR (需先运行 calibrate_feedback.exe) */
+#if FB_ENABLED
+    {
+        float *fb_coeffs_raw = NULL;
+        int fb_loaded = bin_load_float("data/feedback_path.bin", &fb_coeffs_raw);
+        if (fb_loaded > 0 && fb_coeffs_raw) {
+            ctx.fb_coeffs_buf = (float *)calloc(FB_LEN, sizeof(float));
+            int copy_len = fb_loaded < FB_LEN ? fb_loaded : FB_LEN;
+            memcpy(ctx.fb_coeffs_buf, fb_coeffs_raw, copy_len * sizeof(float));
+            ctx.fb_fir.coeffs = ctx.fb_coeffs_buf;
+            ctx.fb_fir.n_taps = FB_LEN;
+            ctx.fb_fir.delay_line = (double *)calloc(FB_LEN, sizeof(double));
+            ctx.fb_fir.ptr = 0;
+            ctx.fb_active = 1;
+            float fb_rms = 0;
+            for (int i = 0; i < FB_LEN; i++) fb_rms += ctx.fb_coeffs_buf[i] * ctx.fb_coeffs_buf[i];
+            printf("  Feedback cancel: %d taps loaded, RMS=%.4f\n", FB_LEN, sqrtf(fb_rms / FB_LEN));
+            bin_free(fb_coeffs_raw);
+        } else {
+            ctx.fb_active = 0;
+            printf("  Feedback cancel: disabled (run calibrate_feedback.exe first)\n");
+        }
+    }
+#endif
+
     scene_ctrl_init(&ctx.sc, centroids, sub_filters, L);
+    howling_init(&ctx.hw, HOWLING_ENABLED);
     fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-5f);
 
     /* 缓冲 */
@@ -390,6 +447,13 @@ int main(void) {
                        ctx.ref_rms);
                 printf("       ANC: dist=%.4f err=%.4f  (dist=误差麦噪声, err=残差)\n",
                        ctx.dist_rms, ctx.err_rms);
+                if (ctx.fb_active)
+                    printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx.fb_rms);
+                if (ctx.hw.active_count > 0 || ctx.hw.dominant_db > HW_THRESH_DB * 0.7f)
+                    printf("       HW:  f=%.0fHz peak=%.1fdB notches=%d%s\n",
+                           ctx.hw.dominant_freq, ctx.hw.dominant_db,
+                           ctx.hw.active_count,
+                           ctx.hw.active_count > 0 ? " [NOTCH]" : "");
 
                 /* 收敛检测: 连续 3 帧 NR>3dB → 保存当前场景的已收敛 Wc */
                 if (ctx.nr_level > 3.0f && !ctx.safety_mute) {

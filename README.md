@@ -48,7 +48,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -o gfanc_realtime.exe
+gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c -lm -o gfanc_realtime.exe
 ```
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
@@ -245,6 +245,51 @@ GFANC_FxNLMs_Scene/
                     │  anti_out.wav │（离线输出）
                     │  或 扬声器     │（实时输出）
                     └──────────────┘
+```
+
+## 反馈路径校准
+
+反馈抵消功能需要先校准一次扬声器→参考麦的声学路径。**只需在麦克风或扬声器位置发生变化时重新校准**（日常使用无需重复）。
+
+### 什么时候需要校准
+
+| 情况 | 需要校准？ |
+|------|-----------|
+| 首次使用 | ✅ 需要 |
+| 重新启动程序 | ❌ 不需要 |
+| 挪了扬声器或参考麦位置 | ✅ 需要 |
+| 更换麦克风/扬声器硬件 | ✅ 需要 |
+| 仅改代码/重新编译 | ❌ 不需要 |
+
+### 校准步骤
+
+```bash
+# 编译校准程序（只需一次）
+gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c -lm -o calibrate_feedback.exe
+
+# 运行校准
+./calibrate_feedback.exe
+```
+
+1. 选择 YDM6MIC 输入设备（如 `22`）
+2. 选择 USB 扬声器输出设备（如 `18`）
+3. 保持安静 4 秒，自动完成
+4. 生成 `data/feedback_path.bin`
+
+校准完成后直接运行 `./gfanc_realtime.exe`，启动日志会显示：
+```
+Feedback cancel: 256 taps loaded, RMS=0.0005
+```
+
+如果文件缺失，反馈抵消自动禁用，不影响正常降噪。
+
+## 啸叫检测
+
+系统内置 DFT 频谱检测 + IIR 陷波滤波器。当检测到持续窄带峰值（啸叫特征）时，
+自动在输出端施加陷波器，打断反馈环路。运行时状态行会显示啸叫检测信息：
+
+```
+HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷波
 ```
 
 ## 系统参数
