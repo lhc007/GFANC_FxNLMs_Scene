@@ -49,11 +49,11 @@ typedef struct {
 
     /* 统计 */
     volatile float db_reduction;
-    volatile float acc_anti, acc_ref;
+    volatile float acc_dist, acc_err;
+    volatile float dist_rms;  /* 扰动 RMS, 用于静音检测 */
     volatile int   acc_cnt;
     volatile int   running;
     volatile int   callback_count;
-    int            warmup_samples; /* 预热测试音计数 */
 } rt_ctx_t;
 
 /* PortAudio 类型 + DLL 函数指针 (最小化, 运行时加载) */
@@ -119,7 +119,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     for (int n = 0; n < c16k; n++) {
         float ref_sample = ctx->ref_48k[n];
 
-        /* 带通滤波 */
+        /* 带通滤波 (输入端加 mic 预增益, 不造成反馈) */
         float ref_filt = fir_tick(&ctx->bp_fir, ref_sample);
 
         /* CNN 累积 */
@@ -140,43 +140,41 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int s = 0; s < S; s++)
                 Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_filt);
 
-        /* 扰动 = bp(mic) */
+        /* 扰动 = bp(mic) × 预增益 */
         float dist[E];
         for (int e = 0; e < E; e++)
             dist[e] = fir_tick(&ctx->bp_err[e], ctx->err_48k[n*3+e]);
 
         /* FxNLMS */
-        float anti_spk[S], err_dummy[E];
+        float anti_spk[S], err_sig[E];
         if (ctx->fade_cnt == 0)
-            fxnlms_tick(&ctx->fx, Fx_arr, dist, anti_spk, err_dummy);
+            fxnlms_tick(&ctx->fx, Fx_arr, dist, anti_spk, err_sig);
         else
-            fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_dummy);
+            fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
+
+        /* 累积功率用于 dB */
+        for (int e = 0; e < E; e++) {
+            ctx->acc_dist += dist[e] * dist[e];
+            ctx->acc_err  += err_sig[e] * err_sig[e];
+        }
+        if ((ctx->acc_cnt += 1) >= FS_ANC) {
+            float pd = ctx->acc_dist, pe = ctx->acc_err;
+            ctx->db_reduction = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
+            ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
+            ctx->acc_dist = ctx->acc_err = 0; ctx->acc_cnt = 0;
+        }
 
         ctx->anti_48k[n] = anti_spk[0];
-        ctx->anti_48k[n + c16k] = anti_spk[1]; /* anti_48k is [S][c16k] interleaved */
+        ctx->anti_48k[n + c16k] = anti_spk[1];
     }
 
     /* 内插 + 输出 (ch0=spk0, ch1=spk1) */
     int oi = 0;
     for (int n = 0; n < c16k; n++) {
         float a0 = ctx->anti_48k[n], a1 = ctx->anti_48k[n + c16k];
-        /* 限幅 ±1.0 (满幅) */
         if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
         if (a1 > 1.0f) a1 = 1.0f; if (a1 < -1.0f) a1 = -1.0f;
-
         for (int r = 0; r < 3; r++) { out[oi++] = a0; out[oi++] = a1; }
-    }
-
-    /* 累积 RMS (主线程每秒读取) */
-    for (int n = 0; n < c16k; n++) {
-        float a = ctx->anti_48k[n], r = ctx->ref_48k[n];
-        ((volatile float *)&ctx->acc_anti)[0] += a * a;
-        ((volatile float *)&ctx->acc_ref)[0]  += r * r;
-    }
-    if ((ctx->acc_cnt += c16k) >= FS_ANC) {
-        float ar = ctx->acc_anti, rr = ctx->acc_ref;
-        ctx->db_reduction = 10.0f * log10f((rr + 1e-12f) / (ar + 1e-12f));
-        ctx->acc_anti = ctx->acc_ref = 0; ctx->acc_cnt = 0;
     }
 
     ctx->callback_count++;
@@ -312,9 +310,13 @@ int main(void) {
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
                 /* 计算反噪声 RMS */
-                printf("[CNN] scene=%d max=%.2f cos=%.2f dB=%.1f cb=%d\n",
+                /* 信号太弱时 dB 不可靠 */
+                float db_show = ctx.db_reduction;
+                if (ctx.dist_rms < 0.0005f) db_show = 0;
+
+                printf("[CNN] scene=%d max=%.2f cos=%.2f dB=%.1f rms=%.4f cb=%d\n",
                        ctx.sc.cur_scene, probs[ctx.sc.cur_scene], cos_sim,
-                       ctx.db_reduction, ctx.callback_count);
+                       db_show, ctx.dist_rms, ctx.callback_count);
                 if (cos_sim < 0.8f) {
                     memcpy(ctx.wc_old, ctx.fx.wc, S*L*sizeof(float));
                     ctx.fade_cnt = FADE_LEN;
