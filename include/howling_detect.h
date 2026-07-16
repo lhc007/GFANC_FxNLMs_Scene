@@ -16,9 +16,9 @@
 #define HOWLING_DETECT_H
 
 #define HW_FFT_N        256      /* DFT 窗口 (16ms @ 16kHz) */
-#define HW_MIN_BIN      1        /* 最低检测 bin (62.5 Hz, 跳过 DC) */
+#define HW_MIN_BIN      2        /* 最低检测 bin (125Hz, 跳过 DC+工频) */
 #define HW_MAX_BIN      24       /* 最高检测 bin (~1500 Hz, 匹配带通上限) */
-#define HW_THRESH_DB    12.0f    /* 峰值需高于均值此 dB 数才算候选 */
+#define HW_THRESH_DB    15.0f    /* 峰值需高于均值此 dB 数才算候选 (避开宽带噪声伪峰) */
 #define HW_PERSIST       4       /* 连续帧数确认啸叫 (4帧≈64ms) */
 #define HW_RELEASE       8       /* 啸叫消失后延迟释放帧数 */
 #define HW_NOTCH_R       0.96f   /* 陷波器带宽 (越接近1越窄, 0.9-0.99) */
