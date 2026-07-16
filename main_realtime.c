@@ -24,11 +24,7 @@
 #define BP_LEN   1024
 #define SEC_LEN  1024
 #define DSP_DELAY 16
-#define FADE_LEN    256   /* Wc 淡化 16ms */
-#define MUTE_DOWN   800   /* 静音: 50ms 快衰减 */
-#define MUTE_UP     3200  /* 解静音: 200ms 慢恢复 */
-#define SOFT_START  48000 /* 首次启动: 3s 渐变 */
-#define MIC_GAIN    10.0f /* 麦克风预增益 (补偿 -26dBFS 灵敏度) */
+#define FADE_LEN 16
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
@@ -52,16 +48,12 @@ typedef struct {
     int    dec_phase;
 
     /* 统计 */
-    volatile float nr_level;
-    volatile float ref_rms, err_rms;
-    volatile float ch_rms[4];    /* 4ch 原始 RMS: ch0=ref, ch1-3=err */
-    volatile float anti_rms;     /* 反噪声 RMS */
+    volatile float nr_level;     /* 降噪指标: ref功率/err功率 (dB) */
+    volatile float ref_rms;      /* 参考信号 RMS */
+    volatile float err_rms;      /* 误差信号 RMS */
     volatile float acc_ref, acc_err;
-    volatile float acc_ch[4], acc_anti;
     volatile int   acc_cnt;
     volatile int   safety_mute;  /* 安全静音: err > ref 时关闭输出 */
-    int            unmute_ramp;  /* 解除静音渐变计数器 */
-    float          output_gain;  /* 输出增益 (渐变, 0→1) */
     volatile int   running;
     volatile int   callback_count;
 } rt_ctx_t;
@@ -117,22 +109,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     if (!ctx->running) { memset(out, 0, fcount * 2 * sizeof(float)); return 1; }
 
-    /* 反馈检测: 所有声道相近 → 扬声器声均匀充满房间 → 反馈 */
-    float ch_max = ctx->ch_rms[0], ch_min = ctx->ch_rms[0];
-    for (int c = 1; c < 4; c++) {
-        if (ctx->ch_rms[c] > ch_max) ch_max = ctx->ch_rms[c];
-        if (ctx->ch_rms[c] < ch_min) ch_min = ctx->ch_rms[c];
-    }
-    float fb_gain = MIC_GAIN;
-    if (ch_max > 0.01f && ch_min > ch_max * 0.3f)
-        fb_gain = MIC_GAIN * 0.2f;  /* 疑似反馈: 降到 1/5 */
-
-    /* 声道拆分 + 抽取 + 预增益 */
+    /* 声道拆分 + 抽取 (ch0=ref, ch1-3=err) */
     for (int n = 0; n < c16k; n++) {
-        ctx->ref_48k[n]    = in[(n*3)*6 + 0] * fb_gain;
-        ctx->err_48k[n*3+0] = in[(n*3)*6 + 1] * fb_gain;
-        ctx->err_48k[n*3+1] = in[(n*3)*6 + 2] * fb_gain;
-        ctx->err_48k[n*3+2] = in[(n*3)*6 + 3] * fb_gain;
+        ctx->ref_48k[n] = in[(n*3)*6 + 0];  /* 最近邻抽取: 每3个取1个 */
+        ctx->err_48k[n*3+0] = in[(n*3)*6 + 1];
+        ctx->err_48k[n*3+1] = in[(n*3)*6 + 2];
+        ctx->err_48k[n*3+2] = in[(n*3)*6 + 3];
     }
 
     /* ── ANC @ 16kHz ── */
@@ -172,48 +154,22 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         else
             fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
 
-        /* 累积功率: 原始声道 + 滤波参考 + 误差 + 反噪声 */
-        ctx->acc_ch[0] += ref_sample * ref_sample;
-        for (int e = 0; e < E; e++)
-            ctx->acc_ch[1+e] += ctx->err_48k[n*3+e] * ctx->err_48k[n*3+e];
+        /* 累积功率: ref(参考麦) vs err(误差麦), 业内标准实时指标 */
         ctx->acc_ref += ref_filt * ref_filt;
         for (int e = 0; e < E; e++)
             ctx->acc_err += err_sig[e] * err_sig[e];
-        ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
             float pr = ctx->acc_ref, pe = ctx->acc_err;
             ctx->nr_level = 10.0f * log10f((pr + 1e-12f) / (pe / E + 1e-12f));
             ctx->ref_rms = sqrtf(pr / FS_ANC);
             ctx->err_rms = sqrtf(pe / (FS_ANC * E));
-            for (int c = 0; c < 4; c++)
-                ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
-            ctx->anti_rms = sqrtf(ctx->acc_anti / (FS_ANC * 2));
+            /* 安全静音: err > ref 时 ANC 在帮倒忙, 关闭输出 */
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms && ctx->ref_rms > 0.0001f);
             ctx->acc_ref = ctx->acc_err = 0; ctx->acc_cnt = 0;
-            ctx->acc_anti = 0;
-            for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
-        /* 安全静音 + 渐变: 不突然切换, 用 output_gain 平滑过渡 */
-        if (ctx->safety_mute) {
-            /* err > ref: 快速衰减输出 (10ms) */
-            if (ctx->unmute_ramp > -MUTE_DOWN) ctx->unmute_ramp--;
-        } else {
-            /* 恢复正常: 慢速恢复输出 (100ms) */
-            if (ctx->unmute_ramp < MUTE_UP) ctx->unmute_ramp++;
-        }
-        ctx->output_gain = (ctx->unmute_ramp > 0)
-            ? (float)ctx->unmute_ramp / MUTE_UP : 0.0f;
-        if (ctx->output_gain > 1.0f) ctx->output_gain = 1.0f;
-
-        anti_spk[0] *= ctx->output_gain;
-        anti_spk[1] *= ctx->output_gain;
-
-        /* 输出限幅 ±0.5 (防大信号啸叫, 行业标准) */
-        if (anti_spk[0] >  0.5f) anti_spk[0] =  0.5f;
-        if (anti_spk[0] < -0.5f) anti_spk[0] = -0.5f;
-        if (anti_spk[1] >  0.5f) anti_spk[1] =  0.5f;
-        if (anti_spk[1] < -0.5f) anti_spk[1] = -0.5f;
+        /* 安全静音时输出零 */
+        if (ctx->safety_mute) { anti_spk[0] = 0; anti_spk[1] = 0; }
 
         ctx->anti_48k[n] = anti_spk[0];
         ctx->anti_48k[n + c16k] = anti_spk[1];
@@ -294,7 +250,6 @@ int main(void) {
     rt_ctx_t ctx; memset(&ctx, 0, sizeof(ctx));
     g_ctx = &ctx;
     ctx.running = 1; ctx.first_sec = 1;
-    ctx.unmute_ramp = 0;  /* 软启动: 从静音渐入 */
 
     ctx.bp_fir.coeffs = bp_coeff; ctx.bp_fir.n_taps = BP_LEN;
     ctx.bp_fir.delay_line = (double *)calloc(BP_LEN, sizeof(double));
@@ -316,7 +271,7 @@ int main(void) {
         }
 
     scene_ctrl_init(&ctx.sc, centroids, sub_filters, L);
-    fxnlms_init(&ctx.fx, E, S, L, 0.0005f, 1e-5f); /* 5x 步长补偿低信号电平 */
+    fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-5f);
 
     /* 缓冲 */
     ctx.ref_48k = (float *)malloc(FS_HW * sizeof(float));
@@ -349,7 +304,6 @@ int main(void) {
         if (ctx.cnn_cnt >= FS_ANC) {
             float probs[8];
             scene_ctrl_process(&ctx.sc, ctx.cnn_buf, ctx.wc_cur, probs);
-            for (int i = 0; i < S*L; i++) ctx.wc_cur[i] *= 10.0f;  /* 硬件校准: 匹配 -26dBFS 麦克风 */
             if (ctx.first_sec) {
                 fxnlms_set_wc(&ctx.fx, ctx.wc_cur);
                 printf("[CNN] INIT scene=%d max=%.2f\n", ctx.sc.cur_scene, probs[ctx.sc.cur_scene]);
@@ -363,13 +317,10 @@ int main(void) {
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
                 /* 计算反噪声 RMS */
-                printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1f anti=%.4f%s cb=%d\n",
+                printf("[CNN] scene=%d max=%.2f cos=%.2f NR=%.1fdB ref=%.4f err=%.4f%s cb=%d\n",
                        ctx.sc.cur_scene, probs[ctx.sc.cur_scene], cos_sim,
-                       ctx.nr_level, ctx.anti_rms,
+                       ctx.nr_level, ctx.ref_rms, ctx.err_rms,
                        ctx.safety_mute ? " [MUTE]" : "", ctx.callback_count);
-                printf("       ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f err=%.4f)\n",
-                       ctx.ch_rms[0], ctx.ch_rms[1], ctx.ch_rms[2], ctx.ch_rms[3],
-                       ctx.ref_rms, ctx.err_rms);
                 if (cos_sim < 0.8f) {
                     memcpy(ctx.wc_old, ctx.fx.wc, S*L*sizeof(float));
                     ctx.fade_cnt = FADE_LEN;
