@@ -48,7 +48,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c -lm -o gfanc_realtime.exe
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c -lm -lole32 -o gfanc_realtime.exe
 ```
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
