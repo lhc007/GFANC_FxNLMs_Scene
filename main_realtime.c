@@ -301,24 +301,32 @@ int main(void) {
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 
-    /* 列出设备 */
+    /* 查找 WASAPI host API (Windows 系统->声音 显示的设备) */
+    int wasapi_api = -1;
+    for (int i = 0; ; i++) {
+        const PaHostApiInfo2 *info = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(i);
+        if (!info) break;
+        if (strstr(info->name, "WASAPI")) { wasapi_api = i; break; }
+    }
+    if (wasapi_api < 0) wasapi_api = p_Pa_GetDefaultHostApi();  /* fallback */
+    const PaHostApiInfo2 *api = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(wasapi_api);
+
+    /* 列出设备 (仅 WASAPI 端点, 对应 Windows 系统->声音 中显示的设备) */
     int nd = p_Pa_GetDeviceCount();
-    printf("\n=== Audio Devices ===\n");
+    printf("\n=== Audio Devices (WASAPI) ===\n");
     for (int i = 0; i < nd; i++) {
         const PaDeviceInfo2 *info = (const PaDeviceInfo2 *)p_Pa_GetDeviceInfo(i);
-        if (info) printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
-            i, info->name, info->maxInputChannels, info->maxOutputChannels, info->defaultSampleRate);
+        if (info && info->hostApi == wasapi_api)
+            printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
+                i, info->name, info->maxInputChannels, info->maxOutputChannels, info->defaultSampleRate);
     }
+    printf("Host API: %s\n", api ? api->name : "default");
 
     int in_dev, out_dev;
     printf("\nInput device ID: "); fflush(stdout); scanf("%d", &in_dev);
     printf("Output device ID: "); fflush(stdout); scanf("%d", &out_dev);
 
-    /* 查找 WASAPI host API */
-    int wasapi_api = p_Pa_HostApiTypeIdToHostApiIndex(6); /* paWASAPI=6 */
-    if (wasapi_api < 0) wasapi_api = p_Pa_GetDefaultHostApi();
-    const PaHostApiInfo2 *api = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(wasapi_api);
-    printf("Using host API: %s\n\n", api ? api->name : "default");
+    printf("\n");
 
     /* 加载权重 */
     printf("Loading weights...\n");
