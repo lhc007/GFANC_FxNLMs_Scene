@@ -22,10 +22,15 @@
 - **与描述的"17ms 异步"不符**：实际为 **1000ms 帧 + 最高 100ms 轮询抖动**。论文的 "Delayless" 指 CNN 决策不阻塞控制滤波（这点满足），但决策频率是 1Hz，不是 17ms。
 - 数据交接机制：~~旧版"填满即停→主线程清零"~~ **✅ 已修复 (2026-07-22)**。改为 `cnn_buf[2][FS_ANC]` 双缓冲：回调填满一块后 `InterlockedExchange` 原子标记就绪、立即切到另一块继续填充，主线程 `InterlockedExchange` 原子消费就绪块。`cnn_cnt`/`cnn_fill_idx` 仅回调访问，`cnn_buf_ready` 原子交换——消除数据竞争、零样本丢失。
 
-### 2.2 实时前馈 FxNLMS 环路 — ⚠️ 存在，但信号结构是离线仿真的错误移植
+### 2.2 实时前馈 FxNLMS 环路 — ✅ 已修复 (2026-07-22, F-A)
 
-- 实现位置：PortAudio 回调 `main_realtime.c:129-273`，逐样本 @16kHz（62.5μs）✅。
-- **核心问题**：`fxnlms_tick` 的误差构造 `err = disturbance + anti_est`（`fxnlms_mimo.c:66-68`）是为**离线仿真**设计的——离线版 `dist` 来自初级路径卷积、不含反噪声（见 `main.c:354-361`）。实时版把**误差麦实测信号**（已经包含真实声学反噪声）当作 `dist` 传入（`main_realtime.c:185-197`），再叠加一次模型估计的 `anti_est` —— **反噪声被计入两次**。详见 §5.2-A。
+- 实现位置：PortAudio 回调，逐样本 @16kHz（62.5μs）✅。
+- ~~**核心问题**~~：~~`fxnlms_tick` 的 `err = disturbance + anti_est` 是为离线仿真设计的。实时版把误差麦实测信号（已含真实反噪声）作为 `disturbance` 传入，再叠加 `anti_est` → 反噪声被计入两次~~ **✅ 已修复**。
+- 修复方案：新增 `fxnlms_tick_rt` / `fxnlms_forward_rt`（`fxnlms_mimo.c`），实时路径独立于离线仿真：
+  - 输出：`anti[s] = Σ_k Wc[s,k] × x_ref[n-k]`（直接卷积带通参考，不经 Ŝ 模型）
+  - 梯度：实测误差麦信号 `err_meas` 直接驱动，不合成 `err = dist + anti_est`
+  - NR：模型估计反噪声 vs 实测残差 `(err² + anti_est²) / err²`
+- 离线 `fxnlms_tick` / `fxnlms_forward_only` 保留不动，两套路径互不影响。
 
 ### 2.3 固定反馈 IIR 环路 — ❌ 不存在
 
@@ -287,7 +292,7 @@ gfanc_float_t fir_tick(fir_filter_t *f, gfanc_float_t x)
 
 | 等级 | 编号 | 一句话 |
 |---|---|---|
-| ~~高~~ | ~~F-A~~ | ~~误差双重计入 + Ŝ 二次滤波~~ ❌ 已回退, ASIO硬件就绪可恢复 (`git revert 162d357`) |
+| ~~高~~ | ~~F-A~~ | ~~误差双重计入 + Ŝ 二次滤波~~ ✅ 已修复 (2026-07-22, fxnlms_tick_rt 独立实时路径) |
 | ~~高~~ | ~~F-B~~ | ~~次级路径延迟/校准~~ ❌ 已回退, ASIO硬件就绪可重新校准 (`git revert 162d357`) |
 | 高 | §6.2 | 主线程/回调对 Wc、fade_cnt 等无同步的数据竞争 |
 | 高 | §6.1 | fir_tick 取模 + xd 全量搬移，回调 CPU 逼近 2ms 预算 |

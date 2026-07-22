@@ -5,8 +5,9 @@
 #include "fir_filter.h"
 
 typedef struct {
-    float       *wc;         /* [S * L] */
-    float       *xd;         /* [E * S * L] */
+    float       *wc;         /* [S * L] 控制滤波器系数 */
+    float       *xd;         /* [E * S * L] 滤波参考 (梯度用) */
+    float       *x_hist;     /* [L] 原始带通参考历史 (实时输出用) */
     int          E, S, L;
     float        step_size;
     float        leak;
@@ -16,18 +17,27 @@ void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak);
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc);
 
-/** 逐样本完整处理.
- * @param Fx      [E*S] 滤波参考
- * @param disturbance [E] 扰动 (离线=Dis, 实时=bp(mic))
- * @param anti_out [S]  反噪声输出
- * @param err_out  [E]  误差信号 (=disturbance + anti_est, 梯度更新前的值)
+/* ── 离线仿真 (保留, 互不影响) ── */
+/** @param Fx      [E*S] 滤波参考
+ *  @param disturbance [E] 扰动 (离线=Pri(ref), 不含反噪声)
+ *  @param anti_out [S]  反噪声输出 (Ŝ模型域, 仅用于写WAV)
+ *  @param err_out  [E]  误差信号 (=disturbance + anti_est)
  */
 void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
                  float *anti_out, float *err_out);
-
-/** 仅前向 (淡化期间使用). 不更新 Wc. */
 void fxnlms_forward_only(fxnlms_mimo_t *fx, const float *Fx,
                          float *anti_out, float *err_out);
+
+/* ── 实时 ANC (独立路径, 不与离线仿真共用) ── */
+/** @param x_ref     原始带通参考样本 (输出用, Wc ⊗ x_ref → anti_spk)
+ *  @param Fx        [E*S] 滤波参考 (梯度用)
+ *  @param err_meas  [E] 实测误差麦信号 (带通, 驱动梯度)
+ *  @param anti_out  [S] 反噪声输出 (物理扬声器信号)
+ */
+void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
+                    const float *err_meas, float *anti_out);
+void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
+                       const float *err_meas, float *anti_out);
 
 void fxnlms_free(fxnlms_mimo_t *fx);
 

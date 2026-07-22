@@ -81,8 +81,9 @@ typedef struct {
     volatile float ch_rms[4];    /* 原始声道 RMS: ch0=ref, ch1-3=err */
     volatile float anti_rms;     /* 反噪声 RMS */
     volatile float acc_ref, acc_err, acc_dist, acc_fb;
-    volatile float acc_ch[4], acc_anti;
+    volatile float acc_ch[4], acc_anti, acc_anti_est;
     volatile float fb_rms;       /* 反馈抵消量 RMS */
+    volatile float anti_est_rms; /* 模型估计反噪声 RMS (NR计算用) */
     volatile int   acc_cnt;
     volatile int   safety_mute;
     volatile int   running;
@@ -158,21 +159,20 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int s = 0; s < S; s++)
                 Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_filt);
 
-        /* 扰动 = bp(mic) × 预增益 (含软限幅) */
-        float dist[E];
+        /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
+        float err_meas[E];
         for (int e = 0; e < E; e++) {
             float es = ctx->err_buf[n*3+e] * MIC_PRE_GAIN;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
-            dist[e] = fir_tick(&ctx->bp_err[e], es);
+            err_meas[e] = fir_tick(&ctx->bp_err[e], es);
         }
 
-        /* FxNLMS */
-        float err_sig[E];  /* anti_spk 在循环外声明 (反馈抵消需跨迭代) */
+        /* FxNLMS 实时路径: anti=Wc⊗ref, 梯度用err_meas直接驱动 (不合成err) */
         if (ctx->fade_cnt == 0)
-            fxnlms_tick(&ctx->fx, Fx_arr, dist, anti_spk, err_sig);
+            fxnlms_tick_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
         else
-            fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
+            fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
 
         /* NaN/Inf 保护 + 输出钳位 (防止 FxNLMS 计算值远超 ±1.0 导致硬截断失真) */
         for (int s = 0; s < S; s++) {
@@ -184,37 +184,48 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 啸叫检测 + 陷波 (钳位后, 统计前) */
         {
             float err_avg = 0;
-            for (int e = 0; e < E; e++) err_avg += err_sig[e];
+            for (int e = 0; e < E; e++) err_avg += err_meas[e];
             err_avg /= (float)E;
             howling_tick(&ctx->hw, err_avg, anti_spk, S);
         }
 
         /* 累积功率: 原始声道 + 滤波参考 + 误差 + 反噪声 */
-        ctx->acc_ch[0] += ref_raw * ref_raw;             /* 原始 mic 电平 (不含预增益) */
+        ctx->acc_ch[0] += ref_raw * ref_raw;
         for (int e = 0; e < E; e++)
             ctx->acc_ch[1+e] += ctx->err_buf[n*3+e] * ctx->err_buf[n*3+e];
         ctx->acc_ref += ref_filt * ref_filt;
-        ctx->acc_fb  += fb_est * fb_est;                   /* 反馈抵消量 */
+        ctx->acc_fb  += fb_est * fb_est;
         for (int e = 0; e < E; e++) {
-            ctx->acc_err  += err_sig[e] * err_sig[e];
-            ctx->acc_dist += dist[e]    * dist[e];       /* 扰动 = 误差麦处原始噪声 */
+            ctx->acc_err  += err_meas[e] * err_meas[e];
+            ctx->acc_dist += err_meas[e] * err_meas[e];  /* 实测误差功率 (用于NR参考) */
+        }
+        /* anti_est[e] = Σ_s,k Wc[s,k] * Xd[e,s,k] (模型估计反噪声, 用于NR) */
+        {   float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
+            for (int e = 0; e < E; e++)
+                for (int s = 0; s < S; s++)
+                    for (int k = 0; k < L; k++)
+                        anti_est[e] += ctx->fx.wc[s*L+k]
+                                     * ctx->fx.xd[(e*S+s)*L+k];
+            for (int e = 0; e < E; e++)
+                ctx->acc_anti_est += anti_est[e] * anti_est[e];
         }
         ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
-            float pd = ctx->acc_dist, pe = ctx->acc_err;
-            /* NR = 误差麦处噪声(dist) vs 误差麦处残差(err) — 正确的降噪量定义 */
-            ctx->nr_level = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
+            float pe = ctx->acc_err, pa = ctx->acc_anti_est;
+            /* NR: 模型估计反噪声 vs 实测残差 (proxy for acoustic NR) */
+            ctx->nr_level = 10.0f * log10f((pe + pa + 1e-12f) / (pe + 1e-12f));
+            ctx->anti_est_rms = sqrtf(pa / (FS_ANC * E));
             ctx->ref_rms  = sqrtf(ctx->acc_ref  / FS_ANC);
             ctx->err_rms  = sqrtf(pe / (FS_ANC * E));
-            ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
+            ctx->dist_rms = sqrtf((pe + pa) / (FS_ANC * E)); /* 估计噪声RMS(err+anti_est) */
             ctx->fb_rms   = sqrtf(ctx->acc_fb   / FS_ANC);
             for (int c = 0; c < 4; c++)
                 ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
             ctx->anti_rms = sqrtf(ctx->acc_anti / (FS_ANC * 2));
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms && ctx->ref_rms > 0.0001f
                                 && ctx->mute_hold == 0);  /* 冷启动期间抑制, 由 ramp 接管 */
-            ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0; ctx->acc_cnt = 0;
-            ctx->acc_anti = 0;
+            ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0;
+            ctx->acc_anti = ctx->acc_anti_est = 0; ctx->acc_cnt = 0;
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
@@ -425,8 +436,8 @@ int main(void) {
                 printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f)\n",
                        ctx.ch_rms[0], ctx.ch_rms[1], ctx.ch_rms[2], ctx.ch_rms[3],
                        ctx.ref_rms);
-                printf("       ANC: dist=%.4f err=%.4f  (dist=误差麦噪声, err=残差)\n",
-                       ctx.dist_rms, ctx.err_rms);
+                printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
+                       ctx.err_rms, ctx.anti_est_rms);
                 if (ctx.fb_active)
                     printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx.fb_rms);
                 if (ctx.hw.active_count > 0 || ctx.hw.dominant_db > HW_THRESH_DB * 0.7f)
