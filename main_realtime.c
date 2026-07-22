@@ -2,7 +2,7 @@
  *
  * 编译: gcc -O2 -Iinclude main_realtime.c src/scene_controller.c
  *       src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c
- *       src/cnn_m5_forward.c -lm -o gfanc_realtime.exe
+ *       src/cnn_m5_forward.c src/pa_loader.c -lm -o gfanc_realtime.exe
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,7 +70,7 @@ typedef struct {
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
 
     /* 48k 重采样缓冲 */
-    float *ref_48k, *anti_48k, *err_48k; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
+    float *ref_buf, *anti_buf, *err_buf; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
     int    dec_phase;
 
     /* 统计 */
@@ -86,42 +86,7 @@ typedef struct {
     volatile int   callback_count;
 } rt_ctx_t;
 
-/* PortAudio 类型 + DLL 函数指针 (最小化, 运行时加载) */
-typedef int PaError;
-typedef void PaStream;
-#define paFloat32 0x00000001
-#define paNoFlag  0
-#define paNoError 0
-
-static HMODULE pa_dll;
-static PaError (*p_Pa_Initialize)(void);
-static PaError (*p_Pa_Terminate)(void);
-static PaError (*p_Pa_OpenStream)(PaStream **, const void *, const void *, double, unsigned long, unsigned long, void *, void *);
-static PaError (*p_Pa_StartStream)(PaStream *);
-static PaError (*p_Pa_StopStream)(PaStream *);
-static PaError (*p_Pa_CloseStream)(PaStream *);
-static int    (*p_Pa_GetDeviceCount)(void);
-static const void *(*p_Pa_GetDeviceInfo)(int);
-static const void *(*p_Pa_GetHostApiInfo)(int);
-static int    (*p_Pa_GetDefaultHostApi)(void);
-static int    (*p_Pa_HostApiTypeIdToHostApiIndex)(int);
-static const char *(*p_Pa_GetErrorText)(int);
-
-typedef struct { int device, channelCount, sampleFormat; double suggestedLatency; void *hostApiSpecificStreamInfo; } PaStreamParams;
-typedef struct { double inputBufferAdcTime, currentTime, outputBufferDacTime; } PaCbTimeInfo;
-typedef struct { int structVersion; const char *name; int type, deviceCount, defaultInputDevice, defaultOutputDevice; } PaHostApiInfo2;
-typedef struct { int structVersion; const char *name; int hostApi, maxInputChannels, maxOutputChannels; double defLowInLat, defLowOutLat, defHighInLat, defHighOutLat, defaultSampleRate; } PaDeviceInfo2;
-
-#define PA_LOAD(fn) p_##fn = (void*)GetProcAddress(pa_dll, #fn)
-
-/* 3:1 抽取/内插 — 预留工具函数, 后续反馈环路扩展时使用 */
-static void decimate_3to1(const float *in, int in_len, float *out) {
-    for (int i = 0; i < in_len / 3; i++) out[i] = in[i*3];
-}
-static void interpolate_1to3(const float *in, int in_len, float *out) {
-    for (int i = 0; i < in_len; i++)
-        out[i*3] = out[i*3+1] = out[i*3+2] = in[i];
-}
+#include "pa_loader.h"
 
 /* ══════════════════════════════════════════════════════════
    音频回调 (PortAudio 线程)
@@ -139,16 +104,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     /* 声道拆分 + 抽取 (ch0=ref, ch1-3=err) */
     for (int n = 0; n < c16k; n++) {
-        ctx->ref_48k[n] = in[(n*3)*6 + 0];  /* 最近邻抽取: 每3个取1个 */
-        ctx->err_48k[n*3+0] = in[(n*3)*6 + 1];
-        ctx->err_48k[n*3+1] = in[(n*3)*6 + 2];
-        ctx->err_48k[n*3+2] = in[(n*3)*6 + 3];
+        ctx->ref_buf[n] = in[(n*3)*6 + 0];  /* 最近邻抽取: 每3个取1个 */
+        ctx->err_buf[n*3+0] = in[(n*3)*6 + 1];
+        ctx->err_buf[n*3+1] = in[(n*3)*6 + 2];
+        ctx->err_buf[n*3+2] = in[(n*3)*6 + 3];
     }
 
     /* ── ANC @ 16kHz ── */
     float anti_spk[S] = {0, 0};   /* 反馈抵消需要上一轮的 anti 值 */
     for (int n = 0; n < c16k; n++) {
-        float ref_raw     = ctx->ref_48k[n];             /* 原始电平 (用于 RMS 显示) */
+        float ref_raw     = ctx->ref_buf[n];             /* 原始电平 (用于 RMS 显示) */
 
         /* 反馈抵消: 估计扬声器→参考麦的反馈分量并减去 */
         float fb_est = 0;
@@ -185,7 +150,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 扰动 = bp(mic) × 预增益 (含软限幅) */
         float dist[E];
         for (int e = 0; e < E; e++) {
-            float es = ctx->err_48k[n*3+e] * MIC_PRE_GAIN;
+            float es = ctx->err_buf[n*3+e] * MIC_PRE_GAIN;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
             dist[e] = fir_tick(&ctx->bp_err[e], es);
@@ -216,7 +181,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 累积功率: 原始声道 + 滤波参考 + 误差 + 反噪声 */
         ctx->acc_ch[0] += ref_raw * ref_raw;             /* 原始 mic 电平 (不含预增益) */
         for (int e = 0; e < E; e++)
-            ctx->acc_ch[1+e] += ctx->err_48k[n*3+e] * ctx->err_48k[n*3+e];
+            ctx->acc_ch[1+e] += ctx->err_buf[n*3+e] * ctx->err_buf[n*3+e];
         ctx->acc_ref += ref_filt * ref_filt;
         ctx->acc_fb  += fb_est * fb_est;                   /* 反馈抵消量 */
         for (int e = 0; e < E; e++) {
@@ -256,14 +221,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* safety_mute 抑制计数 (独立于 ramp, 覆盖到下一次有效 RMS 评估) */
         if (ctx->mute_hold > 0) ctx->mute_hold--;
 
-        ctx->anti_48k[n] = anti_spk[0];
-        ctx->anti_48k[n + c16k] = anti_spk[1];
+        ctx->anti_buf[n] = anti_spk[0];
+        ctx->anti_buf[n + c16k] = anti_spk[1];
     }
 
     /* 内插 + 输出 (ch0=spk0, ch1=spk1) */
     int oi = 0;
     for (int n = 0; n < c16k; n++) {
-        float a0 = ctx->anti_48k[n], a1 = ctx->anti_48k[n + c16k];
+        float a0 = ctx->anti_buf[n], a1 = ctx->anti_buf[n + c16k];
         if (!isfinite(a0)) a0 = 0.0f;
         if (!isfinite(a1)) a1 = 0.0f;
         if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
@@ -287,17 +252,7 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 /* ══════════════════════════════════════════════════════════
    初始化 PortAudio DLL
    ══════════════════════════════════════════════════════════ */
-static int pa_init(void) {
-    pa_dll = LoadLibraryA("libportaudio64bit-asio.dll");
-    if (!pa_dll) { fprintf(stderr, "DLL not found\n"); return -1; }
-    PA_LOAD(Pa_Initialize); PA_LOAD(Pa_Terminate);
-    PA_LOAD(Pa_OpenStream); PA_LOAD(Pa_StartStream);
-    PA_LOAD(Pa_StopStream); PA_LOAD(Pa_CloseStream);
-    PA_LOAD(Pa_GetDeviceCount); PA_LOAD(Pa_GetDeviceInfo);
-    PA_LOAD(Pa_GetHostApiInfo); PA_LOAD(Pa_GetDefaultHostApi);
-    PA_LOAD(Pa_HostApiTypeIdToHostApiIndex); PA_LOAD(Pa_GetErrorText);
-    return 0;
-}
+/* pa_init() → src/pa_loader.c */
 
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
@@ -396,9 +351,9 @@ int main(void) {
     fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
 
     /* 缓冲 */
-    ctx.ref_48k = (float *)malloc(FS_HW * sizeof(float));
-    ctx.anti_48k = (float *)malloc(FS_HW * S * sizeof(float));
-    ctx.err_48k = (float *)malloc(FS_HW * E * sizeof(float));
+    ctx.ref_buf = (float *)malloc(FS_HW * sizeof(float));
+    ctx.anti_buf = (float *)malloc(FS_HW * S * sizeof(float));
+    ctx.err_buf = (float *)malloc(FS_HW * E * sizeof(float));
     printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
     /* 打开 PortAudio 流 */

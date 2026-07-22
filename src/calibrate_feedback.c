@@ -1,6 +1,6 @@
 /** calibrate_feedback — 离线测量扬声器→参考麦反馈路径
  *
- * 编译: gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c -lm -o calibrate_feedback.exe
+ * 编译: gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -o calibrate_feedback.exe
  * 运行: ./calibrate_feedback.exe
  * 输出: data/feedback_path.bin (256 tap float32 FIR)
  *
@@ -33,46 +33,7 @@ typedef struct {
     int    total;
 } cal_data_t;
 
-/* PortAudio 类型 + DLL 函数指针 */
-typedef int PaError;
-typedef void PaStream;
-#define paFloat32 0x00000001
-#define paNoFlag  0
-#define paNoError 0
-
-static HMODULE pa_dll;
-static PaError (*p_Pa_Initialize)(void);
-static PaError (*p_Pa_Terminate)(void);
-static PaError (*p_Pa_OpenStream)(PaStream **, const void *, const void *, double, unsigned long, unsigned long, void *, void *);
-static PaError (*p_Pa_StartStream)(PaStream *);
-static PaError (*p_Pa_StopStream)(PaStream *);
-static PaError (*p_Pa_CloseStream)(PaStream *);
-static int    (*p_Pa_GetDeviceCount)(void);
-static const void *(*p_Pa_GetDeviceInfo)(int);
-static const void *(*p_Pa_GetHostApiInfo)(int);
-static int    (*p_Pa_GetDefaultHostApi)(void);
-static int    (*p_Pa_HostApiTypeIdToHostApiIndex)(int);
-static const char *(*p_Pa_GetErrorText)(int);
-
-typedef struct { int device, channelCount, sampleFormat; double suggestedLatency; void *hostApiSpecificStreamInfo; } PaStreamParams;
-typedef struct { double inputBufferAdcTime, currentTime, outputBufferDacTime; } PaCbTimeInfo;
-typedef struct { int structVersion; const char *name; int type, deviceCount, defaultInputDevice, defaultOutputDevice; } PaHostApiInfo2;
-typedef struct { int structVersion; const char *name; int hostApi, maxInputChannels, maxOutputChannels; double defLowInLat, defLowOutLat, defHighInLat, defHighOutLat, defaultSampleRate; } PaDeviceInfo2;
-
-#define PA_LOAD(fn) p_##fn = (void*)GetProcAddress(pa_dll, #fn)
-
-/* ══════════════════════════════════════════════════════════ */
-static int pa_init(void) {
-    pa_dll = LoadLibraryA("libportaudio64bit-asio.dll");
-    if (!pa_dll) { fprintf(stderr, "DLL not found\n"); return -1; }
-    PA_LOAD(Pa_Initialize); PA_LOAD(Pa_Terminate);
-    PA_LOAD(Pa_OpenStream); PA_LOAD(Pa_StartStream);
-    PA_LOAD(Pa_StopStream); PA_LOAD(Pa_CloseStream);
-    PA_LOAD(Pa_GetDeviceCount); PA_LOAD(Pa_GetDeviceInfo);
-    PA_LOAD(Pa_GetHostApiInfo); PA_LOAD(Pa_GetDefaultHostApi);
-    PA_LOAD(Pa_HostApiTypeIdToHostApiIndex); PA_LOAD(Pa_GetErrorText);
-    return 0;
-}
+#include "pa_loader.h"
 
 /* ══════════════════════════════════════════════════════════
    音频回调: 播放白噪声, 录制参考麦

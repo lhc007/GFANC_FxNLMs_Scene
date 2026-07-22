@@ -15,7 +15,6 @@ typedef struct {
 void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak);
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc);
-void fxnlms_update_wc(fxnlms_mimo_t *fx, const float *wc);
 
 /** 逐样本完整处理.
  * @param Fx      [E*S] 滤波参考
