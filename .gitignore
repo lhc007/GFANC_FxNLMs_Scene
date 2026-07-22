@@ -11,3 +11,7 @@ out.txt
 
 # IDE
 .vscode/
+
+# Claude Code (local)
+.claude/
+.agents/
