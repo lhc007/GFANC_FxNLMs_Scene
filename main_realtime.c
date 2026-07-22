@@ -46,10 +46,10 @@ typedef struct {
     fir_filter_t *sec_firs;      /* [E*S] 次级路径 */
     float        *sec_coeffs;
 
-    /* 反馈抵消 */
-    fir_filter_t     fb_fir;        /* 扬声器→参考麦反馈路径 FIR */
-    float           *fb_coeffs_buf;
-    int              fb_active;     /* 1=反馈抵消已加载 */
+    /* 反馈抵消 (逐扬声器独立 FIR, F-G修复) */
+    fir_filter_t     fb_fir[2];      /* [spk] 扬声器→参考麦反馈路径 FIR */
+    float            fb_coeffs_buf[2][FB_LEN];
+    int              fb_active;      /* 已加载的扬声器数 (0/1/2) */
 
     /* 啸叫检测 */
     howling_detect_t hw;           /* DFT 频谱检测 + IIR 陷波 */
@@ -125,8 +125,10 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 反馈抵消: 估计扬声器→参考麦的反馈分量并减去 */
         float fb_est = 0;
         if (ctx->fb_active) {
-            float anti_mix = (anti_spk[0] + anti_spk[1]) * 0.5f;
-            fb_est = fir_tick(&ctx->fb_fir, anti_mix);
+            fb_est = 0;
+            for (int s = 0; s < 2; s++)
+                if (ctx->fb_fir[s].coeffs)
+                    fb_est += fir_tick(&ctx->fb_fir[s], anti_spk[s]);
         }
         float ref_sample  = (ref_raw - fb_est) * MIC_PRE_GAIN;
         /* 输入软限幅: tanh 防止吹气/冲击导致 FIR 饱和 → 非线性失真 → 发散 */
@@ -352,28 +354,31 @@ int main(void) {
             ctx->sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
         }
 
-    /* 反馈抵消: 加载反馈路径 FIR (需先运行 calibrate_feedback.exe) */
+    /* 反馈抵消: 逐扬声器加载 FIR (需先运行 calibrate_feedback.exe, F-G修复) */
 #if FB_ENABLED
     {
-        float *fb_coeffs_raw = NULL;
-        int fb_loaded = bin_load_float("data/feedback_path.bin", &fb_coeffs_raw);
-        if (fb_loaded > 0 && fb_coeffs_raw) {
-            ctx->fb_coeffs_buf = (float *)calloc(FB_LEN, sizeof(float));
-            int copy_len = fb_loaded < FB_LEN ? fb_loaded : FB_LEN;
-            memcpy(ctx->fb_coeffs_buf, fb_coeffs_raw, copy_len * sizeof(float));
-            ctx->fb_fir.coeffs = ctx->fb_coeffs_buf;
-            ctx->fb_fir.n_taps = FB_LEN;
-            ctx->fb_fir.delay_line = (double *)calloc(FB_LEN, sizeof(double));
-            ctx->fb_fir.ptr = 0;
-            ctx->fb_active = 1;
-            float fb_rms = 0;
-            for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[i] * ctx->fb_coeffs_buf[i];
-            printf("  Feedback cancel: %d taps loaded, RMS=%.4f\n", FB_LEN, sqrtf(fb_rms / FB_LEN));
-            bin_free(fb_coeffs_raw);
-        } else {
-            ctx->fb_active = 0;
-            printf("  Feedback cancel: disabled (run calibrate_feedback.exe first)\n");
+        int loaded = 0;
+        for (int spk = 0; spk < 2; spk++) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "data/feedback_path_%d.bin", spk);
+            float *fb_raw = NULL;
+            int fb_len = bin_load_float(fname, &fb_raw);
+            if (fb_len > 0 && fb_raw) {
+                int n = fb_len < FB_LEN ? fb_len : FB_LEN;
+                memcpy(ctx->fb_coeffs_buf[spk], fb_raw, n * sizeof(float));
+                ctx->fb_fir[spk].coeffs    = ctx->fb_coeffs_buf[spk];
+                ctx->fb_fir[spk].n_taps    = FB_LEN;
+                ctx->fb_fir[spk].delay_line = (double *)calloc(FB_LEN, sizeof(double));
+                ctx->fb_fir[spk].ptr       = 0;
+                float fb_rms = 0;
+                for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
+                printf("  Feedback spk%d: %d taps, RMS=%.4f\n", spk, FB_LEN, sqrtf(fb_rms / FB_LEN));
+                bin_free(fb_raw); loaded++;
+            }
         }
+        ctx->fb_active = loaded;
+        if (loaded == 0)
+            printf("  Feedback cancel: disabled (run calibrate_feedback.exe first)\n");
     }
 #endif
 

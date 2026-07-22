@@ -21,7 +21,7 @@
 | ✅ | F-D | 前馈 | 中 | leak 因子无效 (1-1e-9) | Wc 长期漂移/饱和风险 | 与 step_size 解耦, leak=1e-6 |
 | ✅ | F-E | 前馈 | 中 | anti_spk 跨回调重置为 0 | fb_fir ~3% 错误样本, 抵消精度退化 | anti_spk_prev 持久化到 ctx |
 | ✅ | F-F | 前馈 | 中 | 反馈校准重采样失配 | NLMS 辨识精度下降 | 16k ZOH×3 激励 (2026-07-22) |
-| ❌ | F-G | 前馈 | 中 | 双扬声器反馈路径合并建模 | H0≠H1 时抵消不准 | 分别校准两条路径 |
+| ✅ | F-G | 前馈 | 中 | 双扬声器反馈路径合并建模 | H0≠H1 时抵消不准 | 逐扬声器校准+双FIR (2026-07-22) |
 | — | F-H | 前馈 | 低 | fwd_only err 语义不一致 | 实时路径已不适用, 离线可忽略 | 维持现状 |
 | ✅ | F-I | 前馈 | 低 | acc_anti 在 mute/ramp 前累积 | 控制台 anti_rms 偏高 | 移至 mute/ramp 之后 |
 | ❌ | B-1 | 反馈 | — | 固定反馈 IIR 环路不存在 | 无反馈 ANC 控制层 | 待实现 feedback_iir.c |
@@ -85,11 +85,11 @@
 - **修复**: 改为生成 16k 白噪声 → ZOH×3 播放, 运行时输出路径一致 (2026-07-22)
 - **位置**: `src/calibrate_feedback.c:29-33, 55, 159-167, 192-195`
 
-#### F-G: 双扬声器反馈路径合并建模 ❌
+#### F-G: 双扬声器反馈路径合并建模 ✅
 - **严重度**: 中
-- **后果**: 校准两声道播同一噪声, 辨识 H0+H1 之和; 运行时 `(anti0+anti1)/2` 经单 FIR。H0≠H1 时产生 `(H0-H1)(a0-a1)/2` 误差
-- **修复**: 分别校准两条路径, 运行两个独立 FIR
-- **位置**: `src/calibrate_feedback.c:93-96`, `main_realtime.c:125`
+- **后果**: 原校准两声道播同一噪声, 辨识 H0+H1; 运行时 (anti0+anti1)/2 经单 FIR, H0≠H1 时产生误差
+- **修复**: calibrate_feedback 逐扬声器两轮校准→feedback_path_0.bin/1.bin; 运行时双 fb_fir[2] 独立 FIR, fb_est = Σ fir_tick(fb_fir[s], anti_spk[s]) (2026-07-22)
+- **位置**: `src/calibrate_feedback.c:29-34,56-58,160-210`, `main_realtime.c:50-52,127-131,356-382`
 
 #### F-H: fwd_only err 语义不一致 —
 - **严重度**: 低 (实时不适用)

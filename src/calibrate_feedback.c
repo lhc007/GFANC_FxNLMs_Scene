@@ -31,6 +31,7 @@ typedef struct {
     float *ref_hw;      /* 参考麦录制 (48kHz, 仅在回调中写入) */
     int    idx;         /* 48k 样本计数 */
     int    total;       /* 48k 总样本数 */
+    int    spk_idx;     /* 校准扬声器: 0=spk0, 1=spk1 */
 } cal_data_t;
 
 #include "pa_loader.h"
@@ -51,10 +52,10 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
             out[i*2] = out[i*2+1] = 0;
             continue;
         }
-        /* 16k白噪声 ZOH×3 → 48k播放 (与运行时输出路径一致) */
+        /* 16k白噪声 ZOH×3 → 48k播放 (仅校准扬声器输出, 另一通道静音) */
         float n = cal->noise_16k[cal->idx / 3];
-        out[i*2]   = n;
-        out[i*2+1] = n;
+        out[i*2]   = (cal->spk_idx == 0) ? n : 0.0f;
+        out[i*2+1] = (cal->spk_idx == 1) ? n : 0.0f;
         /* 录制参考麦 (ch0) */
         cal->ref_hw[cal->idx] = in[i*6 + 0];
         cal->idx++;
@@ -161,64 +162,63 @@ int main(void) {
     int n_16k     = total_hw / 3;
     float *noise_16k = (float *)malloc(n_16k * sizeof(float));
     float *ref_hw    = (float *)malloc(total_hw * sizeof(float));
+    float *ref_16k   = (float *)malloc(n_16k * sizeof(float));
     srand(42);  /* 固定种子, 可复现 */
     for (int i = 0; i < n_16k; i++)
         noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
 
-    cal_data_t cal = { noise_16k, ref_hw, 0, total_hw };
-
-    /* 打开音频流 */
     PaStreamParams in_p  = { in_dev,  6, paFloat32, 0.01, NULL };
     PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };
-    PaStream *stream = NULL;
-    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
-    if (err != 0) {
-        fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err));
-        return 1;
-    }
 
-    printf("\nPlaying white noise for %d seconds...\n", CAL_SEC);
-    printf("  Keep the room quiet - no talking or moving!\n");
-    p_Pa_StartStream(stream);
+    /* ── 逐扬声器校准 (F-G修复) ── */
+    for (int spk = 0; spk < 2; spk++) {
+        printf("\n--- Calibrating Speaker %d ---\n", spk);
+        printf("  Playing white noise on speaker %d only for %d seconds...\n", spk, CAL_SEC);
+        printf("  Keep the room quiet - no talking or moving!\n");
 
-    /* 等待完成 */
-    while (cal.idx < total_hw) Sleep(100);
+        memset(ref_hw, 0, total_hw * sizeof(float));
+        cal_data_t cal = { noise_16k, ref_hw, 0, total_hw, spk };
 
-    p_Pa_StopStream(stream);
-    p_Pa_CloseStream(stream);
-    p_Pa_Terminate();
-    printf("  Recording done.\n\n");
+        PaStream *stream = NULL;
+        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
+        if (err) { fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err)); return 1; }
+        p_Pa_StartStream(stream);
+        while (cal.idx < total_hw) Sleep(100);
+        p_Pa_StopStream(stream);
+        p_Pa_CloseStream(stream);
 
-    /* ref_hw 3:1 抽取到 16kHz (noise_16k 已是 16k 速率, 不需抽取) */
-    float *ref_16k = (float *)malloc(n_16k * sizeof(float));
-    for (int i = 0; i < n_16k; i++)
-        ref_16k[i] = ref_hw[i * 3];
+        /* ref_hw 3:1 抽取 → ref_16k */
+        for (int i = 0; i < n_16k; i++)
+            ref_16k[i] = ref_hw[i * 3];
 
-    /* 诊断: 检查信号电平 */
-    {
-        float nrms = 0, rrms = 0;
-        for (int i = 0; i < n_16k; i++) {
-            nrms += noise_16k[i] * noise_16k[i];
-            rrms += ref_16k[i] * ref_16k[i];
+        /* 诊断 */
+        {   float nrms = 0, rrms = 0;
+            for (int i = 0; i < n_16k; i++) {
+                nrms += noise_16k[i] * noise_16k[i];
+                rrms += ref_16k[i] * ref_16k[i];
+            }
+            printf("  Signal RMS: noise=%.4f  ref=%.4f\n",
+                   sqrtf(nrms / n_16k), sqrtf(rrms / n_16k));
         }
-        printf("  Signal RMS: noise=%.4f  ref=%.4f\n",
-               sqrtf(nrms / n_16k), sqrtf(rrms / n_16k));
+
+        /* NLMS 辨识 */
+        float fb_coeffs[FB_TAPS];
+        nlms_identify(noise_16k, ref_16k, n_16k, fb_coeffs, FB_TAPS);
+
+        /* 保存 (feedback_path_0.bin / feedback_path_1.bin) */
+        char fname[64];
+        snprintf(fname, sizeof(fname), "data/feedback_path_%d.bin", spk);
+        FILE *f = fopen(fname, "wb");
+        if (!f) { fprintf(stderr, "ERROR: Cannot write %s\n", fname); return 1; }
+        fwrite(fb_coeffs, sizeof(float), FB_TAPS, f);
+        fclose(f);
+        printf("  Saved: %s (%d taps)\n", fname, FB_TAPS);
     }
 
-    /* NLMS 辨识 */
-    float fb_coeffs[FB_TAPS];
-    nlms_identify(noise_16k, ref_16k, n_16k, fb_coeffs, FB_TAPS);
-
-    /* 保存 */
-    FILE *f = fopen(FB_FILE, "wb");
-    if (!f) { fprintf(stderr, "ERROR: Cannot write %s\n", FB_FILE); return 1; }
-    fwrite(fb_coeffs, sizeof(float), FB_TAPS, f);
-    fclose(f);
-    printf("\n  Saved: %s (%d taps)\n", FB_FILE, FB_TAPS);
+    p_Pa_Terminate();
 
     /* 清理 */
-    free(noise_16k); free(ref_hw);
-    free(ref_16k);
+    free(noise_16k); free(ref_hw); free(ref_16k);
 
     printf("\nDone. Now run gfanc_realtime.exe with feedback cancellation.\n\n");
     return 0;
