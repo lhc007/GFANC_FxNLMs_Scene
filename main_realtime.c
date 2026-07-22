@@ -321,29 +321,30 @@ int main(void) {
     printf("  OK L=%d\n", sub_len / (15*2));
 
     /* 初始化 ANC 模块 */
-    rt_ctx_t ctx; memset(&ctx, 0, sizeof(ctx));
-    ctx.cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
-    g_ctx = &ctx;
-    ctx.running = 1; ctx.first_sec = 1;
-    ctx.mute_hold = MUTE_HOLD_SAMPLES;  /* 启动抑制 safety_mute, 覆盖第一秒 Wc=0 期 */
+    rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
+    if (!ctx) { fprintf(stderr, "OOM\n"); return 1; }
+    ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
+    g_ctx = ctx;
+    ctx->running = 1; ctx->first_sec = 1;
+    ctx->mute_hold = MUTE_HOLD_SAMPLES;  /* 启动抑制 safety_mute, 覆盖第一秒 Wc=0 期 */
 
-    ctx.bp_fir.coeffs = bp_coeff; ctx.bp_fir.n_taps = BP_LEN;
-    ctx.bp_fir.delay_line = (double *)calloc(BP_LEN, sizeof(double));
+    ctx->bp_fir.coeffs = bp_coeff; ctx->bp_fir.n_taps = BP_LEN;
+    ctx->bp_fir.delay_line = (double *)calloc(BP_LEN, sizeof(double));
     for (int e = 0; e < E; e++) {
-        ctx.bp_err[e].coeffs = bp_coeff; ctx.bp_err[e].n_taps = BP_LEN;
-        ctx.bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
+        ctx->bp_err[e].coeffs = bp_coeff; ctx->bp_err[e].n_taps = BP_LEN;
+        ctx->bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
     }
 
     int sp = SEC_LEN + DSP_DELAY;
-    ctx.sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
-    ctx.sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
+    ctx->sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
+    ctx->sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
     for (int e = 0; e < E; e++)
         for (int s = 0; s < S; s++) {
             int idx = e*S+s;
-            memcpy(ctx.sec_coeffs + idx*sp + DSP_DELAY, sec_path + idx*SEC_LEN, SEC_LEN*sizeof(float));
-            ctx.sec_firs[idx].coeffs = ctx.sec_coeffs + idx*sp;
-            ctx.sec_firs[idx].n_taps = sp;
-            ctx.sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
+            memcpy(ctx->sec_coeffs + idx*sp + DSP_DELAY, sec_path + idx*SEC_LEN, SEC_LEN*sizeof(float));
+            ctx->sec_firs[idx].coeffs = ctx->sec_coeffs + idx*sp;
+            ctx->sec_firs[idx].n_taps = sp;
+            ctx->sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
         }
 
     /* 反馈抵消: 加载反馈路径 FIR (需先运行 calibrate_feedback.exe) */
@@ -352,40 +353,40 @@ int main(void) {
         float *fb_coeffs_raw = NULL;
         int fb_loaded = bin_load_float("data/feedback_path.bin", &fb_coeffs_raw);
         if (fb_loaded > 0 && fb_coeffs_raw) {
-            ctx.fb_coeffs_buf = (float *)calloc(FB_LEN, sizeof(float));
+            ctx->fb_coeffs_buf = (float *)calloc(FB_LEN, sizeof(float));
             int copy_len = fb_loaded < FB_LEN ? fb_loaded : FB_LEN;
-            memcpy(ctx.fb_coeffs_buf, fb_coeffs_raw, copy_len * sizeof(float));
-            ctx.fb_fir.coeffs = ctx.fb_coeffs_buf;
-            ctx.fb_fir.n_taps = FB_LEN;
-            ctx.fb_fir.delay_line = (double *)calloc(FB_LEN, sizeof(double));
-            ctx.fb_fir.ptr = 0;
-            ctx.fb_active = 1;
+            memcpy(ctx->fb_coeffs_buf, fb_coeffs_raw, copy_len * sizeof(float));
+            ctx->fb_fir.coeffs = ctx->fb_coeffs_buf;
+            ctx->fb_fir.n_taps = FB_LEN;
+            ctx->fb_fir.delay_line = (double *)calloc(FB_LEN, sizeof(double));
+            ctx->fb_fir.ptr = 0;
+            ctx->fb_active = 1;
             float fb_rms = 0;
-            for (int i = 0; i < FB_LEN; i++) fb_rms += ctx.fb_coeffs_buf[i] * ctx.fb_coeffs_buf[i];
+            for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[i] * ctx->fb_coeffs_buf[i];
             printf("  Feedback cancel: %d taps loaded, RMS=%.4f\n", FB_LEN, sqrtf(fb_rms / FB_LEN));
             bin_free(fb_coeffs_raw);
         } else {
-            ctx.fb_active = 0;
+            ctx->fb_active = 0;
             printf("  Feedback cancel: disabled (run calibrate_feedback.exe first)\n");
         }
     }
 #endif
 
-    scene_ctrl_init(&ctx.sc, centroids, sub_filters, L);
-    howling_init(&ctx.hw, HOWLING_ENABLED);
-    fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
+    scene_ctrl_init(&ctx->sc, centroids, sub_filters, L);
+    howling_init(&ctx->hw, HOWLING_ENABLED);
+    fxnlms_init(&ctx->fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
 
     /* 缓冲 */
-    ctx.ref_buf = (float *)malloc(FS_HW * sizeof(float));
-    ctx.anti_buf = (float *)malloc(FS_HW * S * sizeof(float));
-    ctx.err_buf = (float *)malloc(FS_HW * E * sizeof(float));
+    ctx->ref_buf = (float *)malloc(FS_HW * sizeof(float));
+    ctx->anti_buf = (float *)malloc(FS_HW * S * sizeof(float));
+    ctx->err_buf = (float *)malloc(FS_HW * E * sizeof(float));
     printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
     /* 打开 PortAudio 流 */
     PaStreamParams in_p = { in_dev, 6, 0x00000001, 0.01, NULL };  /* paFloat32 */
     PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.01, NULL };
     PaStream *stream = NULL;
-    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, &ctx);
+    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, ctx);
     if (err != 0) {
         fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err));
         return 1;
@@ -401,92 +402,110 @@ int main(void) {
     printf("Running...\n");
 
     /* 主循环: 只做 CNN (每秒一次) */
-    while (ctx.running) {
+    while (ctx->running) {
         Sleep(100);
         {
-            LONG ready = InterlockedExchange(&ctx.cnn_buf_ready, -1);
+            LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
             if (ready >= 0) {
             float probs[8];
-            int new_scene = scene_ctrl_process(&ctx.sc, ctx.cnn_buf[ready], ctx.wc_cur, probs);
+            int new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, probs);
 
-            if (ctx.first_sec) {
+            if (ctx->first_sec) {
                 /* 首次 INIT: 使用 CNN 通用 Wc, 标记该场景已有记忆 */
-                fxnlms_set_wc(&ctx.fx, ctx.wc_cur);
-                memcpy(ctx.scene_wc[new_scene], ctx.wc_cur, S*L*sizeof(float));
-                ctx.scene_wc_valid[new_scene] = 1;
-                ctx.cur_scene_id = new_scene;
-                ctx.ramp_cnt  = RAMP_SAMPLES;
-                ctx.mute_hold = MUTE_HOLD_SAMPLES;
+                fxnlms_set_wc(&ctx->fx, ctx->wc_cur);
+                ctx->fx.freeze_lms = 0;  /* INIT 清除冻结 */
+                memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
+                ctx->scene_wc_valid[new_scene] = 1;
+                ctx->cur_scene_id = new_scene;
+                ctx->ramp_cnt  = RAMP_SAMPLES;
+                ctx->mute_hold = MUTE_HOLD_SAMPLES;
                 printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
                        new_scene, probs[new_scene], COLDSTART_MS, MUTE_HOLD_MS);
-                ctx.first_sec = 0;
+                ctx->first_sec = 0;
             } else {
                 float dot = 0, np = 0, nc = 0;
                 for (int k = 0; k < 8; k++) {
-                    dot += ctx.sc.prev_probs[k] * probs[k];
-                    np  += ctx.sc.prev_probs[k] * ctx.sc.prev_probs[k];
+                    dot += ctx->sc.prev_probs[k] * probs[k];
+                    np  += ctx->sc.prev_probs[k] * ctx->sc.prev_probs[k];
                     nc  += probs[k] * probs[k];
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
 
                 printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1fdB anti=%.4f%s%s gain=%.0fx cb=%d\n",
                        new_scene, probs[new_scene], cos_sim,
-                       ctx.nr_level, ctx.anti_rms,
-                       ctx.safety_mute ? " [MUTE]" : "",
-                       ctx.ramp_cnt > 0 ? " [RAMP]" : "",
-                       MIC_PRE_GAIN, ctx.callback_count);
+                       ctx->nr_level, ctx->anti_rms,
+                       ctx->safety_mute ? " [MUTE]" : "",
+                       ctx->ramp_cnt > 0 ? " [RAMP]" : "",
+                       MIC_PRE_GAIN, ctx->callback_count);
                 printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f)\n",
-                       ctx.ch_rms[0], ctx.ch_rms[1], ctx.ch_rms[2], ctx.ch_rms[3],
-                       ctx.ref_rms);
+                       ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
+                       ctx->ref_rms);
                 printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
-                       ctx.err_rms, ctx.anti_est_rms);
-                if (ctx.fb_active)
-                    printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx.fb_rms);
-                if (ctx.hw.active_count > 0 || ctx.hw.dominant_db > HW_THRESH_DB * 0.7f)
+                       ctx->err_rms, ctx->anti_est_rms);
+                if (ctx->fb_active)
+                    printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx->fb_rms);
+                if (ctx->hw.active_count > 0 || ctx->hw.dominant_db > HW_THRESH_DB * 0.7f)
                     printf("       HW:  f=%.0fHz peak=%.1fdB notches=%d%s\n",
-                           ctx.hw.dominant_freq, ctx.hw.dominant_db,
-                           ctx.hw.active_count,
-                           ctx.hw.active_count > 0 ? " [NOTCH]" : "");
+                           ctx->hw.dominant_freq, ctx->hw.dominant_db,
+                           ctx->hw.active_count,
+                           ctx->hw.active_count > 0 ? " [NOTCH]" : "");
+
+                /* Wc 发散检测: max|Wc| > 5×stub_rms → 冻结梯度 */
+                {   float wc_max = 0;
+                    for (int i = 0; i < S*L; i++) {
+                        float a = fabsf(ctx->fx.wc[i]);
+                        if (a > wc_max) wc_max = a;
+                    }
+                    if (wc_max > ctx->sc.stub_rms * 5.0f) {
+                        if (!ctx->fx.freeze_lms) {
+                            ctx->fx.freeze_lms = 1;
+                            printf("[WARN] Wc diverged! max|Wc|=%.3f "
+                                   "> 5×stub(%.3f), LMS frozen\n",
+                                   wc_max, ctx->sc.stub_rms);
+                        }
+                    }
+                }
 
                 /* 收敛检测: 连续 3 帧 NR>3dB → 保存当前场景的已收敛 Wc */
-                if (ctx.nr_level > 3.0f && !ctx.safety_mute) {
-                    ctx.converged_frames++;
-                    if (ctx.converged_frames >= 3) {
-                        memcpy(ctx.scene_wc[ctx.cur_scene_id], ctx.fx.wc, S*L*sizeof(float));
-                        ctx.scene_wc_valid[ctx.cur_scene_id] = 1;
-                        ctx.converged_frames = 0;  /* 保存后重置, 避免每帧都写 */
+                if (ctx->nr_level > 3.0f && !ctx->safety_mute) {
+                    ctx->converged_frames++;
+                    if (ctx->converged_frames >= 3) {
+                        memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+                        ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
+                        ctx->converged_frames = 0;  /* 保存后重置, 避免每帧都写 */
                     }
                 } else {
-                    ctx.converged_frames = 0;
+                    ctx->converged_frames = 0;
                 }
 
                 /* 场景切换检测 (cos<0.8 且场景确实变了才触发) */
-                if (cos_sim < 0.8f && new_scene != ctx.cur_scene_id) {
+                if (cos_sim < 0.8f && new_scene != ctx->cur_scene_id) {
                     /* 保存旧场景的当前 Wc (最新的收敛状态) */
-                    memcpy(ctx.scene_wc[ctx.cur_scene_id], ctx.fx.wc, S*L*sizeof(float));
-                    ctx.scene_wc_valid[ctx.cur_scene_id] = 1;
+                    memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+                    ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
 
                     /* 新场景: 有记忆就用记忆, 否则用 CNN 通用 Wc */
-                    if (ctx.scene_wc_valid[new_scene]) {
-                        memcpy(ctx.wc_cur, ctx.scene_wc[new_scene], S*L*sizeof(float));
+                    if (ctx->scene_wc_valid[new_scene]) {
+                        memcpy(ctx->wc_cur, ctx->scene_wc[new_scene], S*L*sizeof(float));
                         printf("  -> RESET s%d→s%d (restored adapted Wc)\n",
-                               ctx.cur_scene_id, new_scene);
+                               ctx->cur_scene_id, new_scene);
                     } else {
                         /* 首次遇到该场景, wc_cur 已是 CNN 通用值 */
-                        ctx.scene_wc_valid[new_scene] = 1;
+                        ctx->scene_wc_valid[new_scene] = 1;
                         printf("  -> RESET s%d→s%d (new scene, CNN preset)\n",
-                               ctx.cur_scene_id, new_scene);
+                               ctx->cur_scene_id, new_scene);
                     }
 
-                    memcpy(ctx.wc_old, ctx.fx.wc, S*L*sizeof(float));
-                    ctx.fade_cnt   = FADE_LEN;
-                    ctx.ramp_cnt   = RAMP_SAMPLES;
-                    ctx.mute_hold  = MUTE_HOLD_SAMPLES;
-                    ctx.cur_scene_id = new_scene;
-                    ctx.converged_frames = 0;
+                    memcpy(ctx->wc_old, ctx->fx.wc, S*L*sizeof(float));
+                    ctx->fx.freeze_lms = 0;  /* 场景切换清除冻结 */
+                    ctx->fade_cnt   = FADE_LEN;
+                    ctx->ramp_cnt   = RAMP_SAMPLES;
+                    ctx->mute_hold  = MUTE_HOLD_SAMPLES;
+                    ctx->cur_scene_id = new_scene;
+                    ctx->converged_frames = 0;
                 }
             }
-            memcpy(ctx.sc.prev_probs, probs, 8*sizeof(float));
+            memcpy(ctx->sc.prev_probs, probs, 8*sizeof(float));
             }
         }
     }

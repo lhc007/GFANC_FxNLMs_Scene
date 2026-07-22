@@ -222,13 +222,18 @@ static void resblock_forward(const float *in, int in_ch, int out_ch, int in_len,
 /* ── 主前向 ── */
 int cnn_m5_forward(const float *audio, float *logits)
 {
-    /* 分配临时缓冲区: 4块, 每块容纳最大中间结果 (stem conv: 64*4000) */
+    /* 静态缓冲: 4块×1MB, 一次性分配避免每1Hz calloc/free碎片化 */
+    static float *b_buf = NULL;
+    static int   b_len = 0;
     int max_buf = CH * STEM_OUT_LEN; /* 64*4000 = 256000 */
-    float *b[4];
-    for (int i = 0; i < 4; i++) {
-        b[i] = (float *)calloc(max_buf, sizeof(float));
-        if (!b[i]) { for (int j = 0; j < i; j++) free(b[j]); return -1; }
+    if (!b_buf || b_len < max_buf * 4) {
+        free(b_buf);
+        b_buf = (float *)calloc(max_buf * 4, sizeof(float));
+        if (!b_buf) return -1;
+        b_len = max_buf * 4;
     }
+    float *b[4];
+    for (int i = 0; i < 4; i++) b[i] = b_buf + i * max_buf;
 
     /* Stem: Conv → BN → ReLU → MaxPool (in:b[0] tmp, out:b[1]) */
     int slen, plen;
@@ -271,6 +276,5 @@ int cnn_m5_forward(const float *audio, float *logits)
         logits[o] = sum;
     }
 
-    for (int i = 0; i < 4; i++) free(b[i]);
     return 0;
 }

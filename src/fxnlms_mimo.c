@@ -154,14 +154,16 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     }
 
     /* 4. 梯度: Wc[s,k] -= μ/power[s] * Σ_e err_meas[e] * Xd[e,s,k] */
-    for (int s = 0; s < S; s++) {
-        float inv_pwr = 1.0f / power[s];
-        for (int e = 0; e < E; e++)
+    if (!fx->freeze_lms) {
+        for (int s = 0; s < S; s++) {
+            float inv_pwr = 1.0f / power[s];
+            for (int e = 0; e < E; e++)
+                for (int k = 0; k < L; k++)
+                    fx->wc[s * L + k] -= fx->step_size * err_meas[e]
+                                       * fx->xd[(e * S + s) * L + k] * inv_pwr;
             for (int k = 0; k < L; k++)
-                fx->wc[s * L + k] -= fx->step_size * err_meas[e]
-                                   * fx->xd[(e * S + s) * L + k] * inv_pwr;
-        for (int k = 0; k < L; k++)
-            fx->wc[s * L + k] *= (1.0f - fx->leak);
+                fx->wc[s * L + k] *= (1.0f - fx->leak);
+        }
     }
 }
 
