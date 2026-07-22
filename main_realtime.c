@@ -209,7 +209,6 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int e = 0; e < E; e++)
                 ctx->acc_anti_est += anti_est[e] * anti_est[e];
         }
-        ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
             float pe = ctx->acc_err, pa = ctx->acc_anti_est;
             /* NR: 模型估计反噪声 vs 实测残差 (proxy for acoustic NR) */
@@ -242,6 +241,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
         /* safety_mute 抑制计数 (独立于 ramp, 覆盖到下一次有效 RMS 评估) */
         if (ctx->mute_hold > 0) ctx->mute_hold--;
+
+        /* 累积实际输出功率 (mute/ramp之后, 反映真实扬声器输出) */
+        ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
 
         ctx->anti_buf[n] = anti_spk[0];
         ctx->anti_buf[n + c16k] = anti_spk[1];
