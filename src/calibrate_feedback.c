@@ -27,10 +27,10 @@
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
-    float *noise_hw;    /* 预生成白噪声 (48kHz) */
-    float *ref_hw;      /* 参考麦录制 (48kHz) */
-    int    idx;
-    int    total;
+    float *noise_16k;   /* 预生成白噪声 (16kHz, 用于ZOH×3播放+NLMS辨识) */
+    float *ref_hw;      /* 参考麦录制 (48kHz, 仅在回调中写入) */
+    int    idx;         /* 48k 样本计数 */
+    int    total;       /* 48k 总样本数 */
 } cal_data_t;
 
 #include "pa_loader.h"
@@ -51,8 +51,8 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
             out[i*2] = out[i*2+1] = 0;
             continue;
         }
-        /* 两声道输出同相位白噪声 */
-        float n = cal->noise_hw[cal->idx];
+        /* 16k白噪声 ZOH×3 → 48k播放 (与运行时输出路径一致) */
+        float n = cal->noise_16k[cal->idx / 3];
         out[i*2]   = n;
         out[i*2+1] = n;
         /* 录制参考麦 (ch0) */
@@ -156,15 +156,16 @@ int main(void) {
     printf("\nInput device ID (YDM6MIC): "); fflush(stdout); scanf("%d", &in_dev);
     printf("Output device ID (USB Speaker): "); fflush(stdout); scanf("%d", &out_dev);
 
-    /* 预生成白噪声 (48kHz) */
+    /* 预生成 16kHz 白噪声 — ZOH×3 播放, 与运行时输出路径一致 (F-F修复) */
     int total_hw = FS_HW * CAL_SEC;
-    float *noise_hw = (float *)malloc(total_hw * sizeof(float));
-    float *ref_hw   = (float *)malloc(total_hw * sizeof(float));
+    int n_16k     = total_hw / 3;
+    float *noise_16k = (float *)malloc(n_16k * sizeof(float));
+    float *ref_hw    = (float *)malloc(total_hw * sizeof(float));
     srand(42);  /* 固定种子, 可复现 */
-    for (int i = 0; i < total_hw; i++)
-        noise_hw[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
+    for (int i = 0; i < n_16k; i++)
+        noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
 
-    cal_data_t cal = { noise_hw, ref_hw, 0, total_hw };
+    cal_data_t cal = { noise_16k, ref_hw, 0, total_hw };
 
     /* 打开音频流 */
     PaStreamParams in_p  = { in_dev,  6, paFloat32, 0.01, NULL };
@@ -188,14 +189,10 @@ int main(void) {
     p_Pa_Terminate();
     printf("  Recording done.\n\n");
 
-    /* 3:1 抽取到 16kHz */
-    int n_16k = total_hw / 3;
-    float *noise_16k = (float *)malloc(n_16k * sizeof(float));
-    float *ref_16k   = (float *)malloc(n_16k * sizeof(float));
-    for (int i = 0; i < n_16k; i++) {
-        noise_16k[i] = noise_hw[i * 3];
-        ref_16k[i]   = ref_hw[i * 3];
-    }
+    /* ref_hw 3:1 抽取到 16kHz (noise_16k 已是 16k 速率, 不需抽取) */
+    float *ref_16k = (float *)malloc(n_16k * sizeof(float));
+    for (int i = 0; i < n_16k; i++)
+        ref_16k[i] = ref_hw[i * 3];
 
     /* 诊断: 检查信号电平 */
     {
@@ -220,8 +217,8 @@ int main(void) {
     printf("\n  Saved: %s (%d taps)\n", FB_FILE, FB_TAPS);
 
     /* 清理 */
-    free(noise_hw); free(ref_hw);
-    free(noise_16k); free(ref_16k);
+    free(noise_16k); free(ref_hw);
+    free(ref_16k);
 
     printf("\nDone. Now run gfanc_realtime.exe with feedback cancellation.\n\n");
     return 0;
