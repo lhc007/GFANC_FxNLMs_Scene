@@ -59,8 +59,11 @@ typedef struct {
     int    fade_cnt;
     int    ramp_cnt;        /* 输出渐变: RAMP_SAMPLES → 0, anti_out 0→1 */
     int    mute_hold;       /* safety_mute 抑制: MUTE_HOLD_SAMPLES → 0, 覆盖首次 RMS */
-    float  cnn_buf[FS_ANC];
-    int    cnn_cnt;
+    /* CNN 双缓冲: 回调填一块→原子标记就绪→切到另一块, 无数据竞争零样本丢失 */
+    float  cnn_buf[2][FS_ANC];
+    int    cnn_fill_idx;      /* 当前填充块 (0/1), 仅回调访问 */
+    int    cnn_cnt;           /* 当前填充块已写入样本数, 仅回调访问 */
+    volatile LONG cnn_buf_ready; /* -1=无就绪, 0/1=该块已满待主线程处理 */
     int    first_sec;
 
     /* 每场景记忆: 保存已收敛的 Wc, 下次切回时直接恢复 */
@@ -130,7 +133,15 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         float ref_filt = fir_tick(&ctx->bp_fir, ref_sample);
 
         /* CNN 累积 */
-        if (ctx->cnn_cnt < FS_ANC) ctx->cnn_buf[ctx->cnn_cnt++] = ref_filt;
+        /* CNN 双缓冲: 填满一块→原子标记就绪→切到另一块 */
+        if (ctx->cnn_cnt < FS_ANC) {
+            ctx->cnn_buf[ctx->cnn_fill_idx][ctx->cnn_cnt++] = ref_filt;
+            if (ctx->cnn_cnt >= FS_ANC) {
+                InterlockedExchange(&ctx->cnn_buf_ready, ctx->cnn_fill_idx);
+                ctx->cnn_fill_idx ^= 1;
+                ctx->cnn_cnt = 0;
+            }
+        }
 
         /* CrossFader */
         if (ctx->fade_cnt > 0) {
@@ -298,6 +309,7 @@ int main(void) {
 
     /* 初始化 ANC 模块 */
     rt_ctx_t ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
     g_ctx = &ctx;
     ctx.running = 1; ctx.first_sec = 1;
     ctx.mute_hold = MUTE_HOLD_SAMPLES;  /* 启动抑制 safety_mute, 覆盖第一秒 Wc=0 期 */
@@ -378,9 +390,11 @@ int main(void) {
     /* 主循环: 只做 CNN (每秒一次) */
     while (ctx.running) {
         Sleep(100);
-        if (ctx.cnn_cnt >= FS_ANC) {
+        {
+            LONG ready = InterlockedExchange(&ctx.cnn_buf_ready, -1);
+            if (ready >= 0) {
             float probs[8];
-            int new_scene = scene_ctrl_process(&ctx.sc, ctx.cnn_buf, ctx.wc_cur, probs);
+            int new_scene = scene_ctrl_process(&ctx.sc, ctx.cnn_buf[ready], ctx.wc_cur, probs);
 
             if (ctx.first_sec) {
                 /* 首次 INIT: 使用 CNN 通用 Wc, 标记该场景已有记忆 */
@@ -460,7 +474,7 @@ int main(void) {
                 }
             }
             memcpy(ctx.sc.prev_probs, probs, 8*sizeof(float));
-            ctx.cnn_cnt = 0;
+            }
         }
     }
 
