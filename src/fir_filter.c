@@ -35,13 +35,16 @@ gfanc_float_t fir_tick(fir_filter_t *f, gfanc_float_t x)
 
     dl[p] = (double)x;
 
-    /* double 精度匹配 Python scipy.signal.lfilter 的 float64 */
+    /* 双段线性循环 — 从p递减到0, 再从N-1递减到p+1, 零取模
+       等价于原 (p - k + N) % N 逆序访问, 消除 ~339k idiv/回调 */
     double y = 0.0;
-    for (int k = 0; k < N; k++) {
-        y += (double)c[k] * dl[(p - k + N) % N];
-    }
+    int k = 0;
+    for (int i = p; i >= 0; i--)
+        y += (double)c[k++] * dl[i];
+    for (int i = N - 1; i > p; i--)
+        y += (double)c[k++] * dl[i];
 
-    f->ptr = (p + 1) % N;
+    f->ptr = (p + 1 == N) ? 0 : p + 1;  /* 条件替代取模, 仅 1/N 概率触发 */
     return (gfanc_float_t)y;
 }
 
