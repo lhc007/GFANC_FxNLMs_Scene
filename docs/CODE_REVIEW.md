@@ -118,7 +118,7 @@
 |---|---|---|
 | ~~F-A~~ | ~~**高**~~ | ❌ **已回退 (2026-07-16)**。`fxnlms_tick_rt` 经 `tools/verify_fa.c` 验证正确 (SISO +11.4dB, MIMO +5.6dB)，但因 F-B 硬件阻塞连带 revert (`git revert 162d357`)。**2026-07-22 硬件已升级到 ASIO 共时钟声卡**，待 F-B 重新校准后可 `git revert 162d357` 恢复。原问题：(1) 实时版把误差麦实测信号作为 `disturbance` 传入，`fxnlms_tick` 再加一次 `anti_est` → `err ≈ d + 2·anti`，NR 理论上限 ~6dB。(2) 扬声器驱动信号被 Ŝ 模型二次滤波 + 对 3 条误差路径求和。 |
 | F-B | ~~**高**~~ | ❌ **已回退 (2026-07-16), 🔧 硬件就绪待重新校准**。`calibrate_secondary.exe` 源码已在 revert 中移除（`git revert 162d357`，仅残留 .exe 二进制）。原阻塞原因：双独立时钟 USB 设备流滑移 1484~1917ppm 导致 NLMS 辨识 ERLE≈0。**2026-07-22 硬件已升级到 ASIO 共时钟声卡**，可重新运行 `calibrate_feedback.exe` 验证时钟稳定性后再恢复 `calibrate_secondary.c` 源码。恢复方法：`git revert 162d357`。 |
-| F-C | **中** | **tanh 软限幅不连续**：`if (x > 1.0) x = tanhf(x)`（`main_realtime.c:161-162, 189-190`）——x 从 1.0⁻ 到 1.0⁺ 时输出从 1.0 跳到 tanh(1)≈0.762，**0.24 的硬跳变**恰在大信号时注入宽带毛刺，与"防失真"目的相反。应改为全程 `MIC_CLIP_MAX * tanhf(x / MIC_CLIP_MAX)`。 |
+| ~~F-C~~ | ~~**中**~~ | ~~**tanh 软限幅不连续**~~ **FALSE (2026-07-22 全局分析)**：单行代码在 1.0 处确有 ~0.24 跳变，但经 bp_fir(1024) → Ŝ(1040) → Wc(1024) 三层 FIR 级联平滑后，声学输出影响远低于底噪。当前设计 `<1.0 线性通过, >1.0 软限幅` 是正确的——保护正常电平线性度（LMS 依赖），只在极端声压触发饱和防护。"全程 tanh"反而破坏正常信号的线性增益。 |
 | F-D | ~~**中**~~ | ✅ **已修复 (2026-07-22, commit e8771b0)**。leak 公式从 `wc *= (1 - step_size*leak)` 改为 `wc *= (1 - leak)`，与 step_size 解耦。leak 参数从 `1e-5f` 调整为 `1e-6f`（~1.5%/秒衰减，float32 可分辨）。位置：[src/fxnlms_mimo.c:94](src/fxnlms_mimo.c#L94)、[main.c:192](main.c#L192)、[main_realtime.c:393](main_realtime.c#L393)。 |
 | F-E | **中** | **反馈抵消的跨回调状态丢失**：`anti_spk[S]={0,0}` 在每次回调开头重置（`main_realtime.c:149`），每个回调的第一个样本把 0 而非上一回调末样本的真实输出推入反馈 FIR 延迟线——256 抽头历史中恒有 ~8 个错误样本（256/32），持续劣化反馈抵消精度。`anti_spk` 应存入 `ctx` 跨回调保持。 |
 | F-F | **中** | **反馈路径校准与运行时的重采样不匹配**：校准播放 48k 白噪声、录音后两路都做最近邻 3:1 抽取（`calibrate_feedback.c:230-237`）——抽取后输入输出之间**不再是 16k 速率的 LTI 关系**（非整数倍相位分量表现为不可建模噪声，NLMS 只能辨识 1/3 的多相分量）。而运行时的等效反馈路径是 `decimate ∘ H ∘ ZOH`。校准激励应改为"16k 白噪声经 ZOH 上采样到 48k 播放"，与运行时输出路径完全一致。 |
@@ -266,7 +266,7 @@ gfanc_float_t fir_tick(fir_filter_t *f, gfanc_float_t x)
 
 | 问题 | 修复 | 状态 |
 |---|---|---|
-| tanh 限幅不连续（F-C） | `x = MIC_CLIP_MAX * tanhf(x / MIC_CLIP_MAX);` 全程应用 | ❌ |
+| ~~tanh 限幅不连续（F-C）~~ | 三层FIR级联平滑, 声学影响远低于底噪; 当前线性区+软限幅设计正确 | ❌ FALSE |
 | anti_spk 跨回调重置（F-E） | 移入 `rt_ctx_t`，仅初始化时清零 | ❌ |
 | 反馈校准激励失配（F-F） | 校准程序生成 16k 噪声 → ZOH ×3 播放；两扬声器分别校准（F-G），运行两条 FIR | ❌ |
 | ramp 起点跳变（S-2） | 场景切换只走 CrossFader（加长到 10-100ms），不重触发 ramp；ramp 仅用于冷启动 | ❌ |
@@ -299,7 +299,7 @@ gfanc_float_t fir_tick(fir_filter_t *f, gfanc_float_t x)
 | ~~高~~ | ~~§6.1~~ | ~~fir_tick 取模~~ ✅ 已修复 (2026-07-22), xd 环形化待定 |
 | ~~高~~ | ~~B-2~~ | ~~啸叫陷波状态跨扬声器串用~~ ✅ 已修复 |
 | ~~中~~ | ~~F-D~~ | ~~leak 因子无效~~ ✅ 已修复 |
-| 中 | S-1, S-2, F-C, F-E~F-G, P-1, P-2 | 滞回/ramp/tanh/校准/混叠 |
+| 中 | S-1, S-2, F-E~F-G, P-1, P-2 | 滞回/ramp/校准/混叠 |
 | 低 | S-4, S-6, F-H, B-3, P-3, P-4 | Blend/死代码 |
 | ~~中~~ | ~~S-5, §6.4~~ | ~~MinMax~~ / ~~功率正则~~ **FALSE** |
 | 🆕 已修复 | F-A, F-D, B-2, S-3, F-I, §6.1, §6.3, §6.5, §6.6, FIX-1~3,6 | 2026-07-22 系列修复 |
