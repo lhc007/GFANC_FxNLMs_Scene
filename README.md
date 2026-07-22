@@ -208,35 +208,51 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 
 关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。
 
-### 数据流向图
+### 三层架构
 
 ```
-                     ┌──────────────┐
-                     │  噪声 WAV /   │
-                     │  麦克风阵列    │
-                     └──────┬───────┘
-                            │
-                     ┌──────▼───────┐
-                     │   带通滤波器   │ 20-1500Hz
-                     └──────┬───────┘
-                            │
-              ┌─────────────┼─────────────┐
-              ▼                           ▼
-     ┌────────────────┐          ┌────────────────┐
-     │ 慢速环路 (1Hz)  │          │ 前馈环路 (16kHz) │
-     │                │          │                │
-     │ CNN→Blend→Wc   │──Wc──→  │ anti=Wc⊗ref    │
-     │ 双缓冲+原子交接  │          │ err_meas 直驱   │
-     │ CrossFade 100ms│          │ LMS 梯度更新    │
-     └────────────────┘          └───────┬────────┘
-                                        │
-                                 ┌──────▼───────┐
-                                 │  扬声器 / WAV  │
-                                 └──────────────┘
-
-辅助: 反馈抵消(fb_fir×2, 逐扬声器) + 啸叫检测(DFT+IIR陷波) + Wc发散冻结
-```
-
+┌─ 慢速环路 (1Hz, 主线程) ─────────────────────────────────────┐
+│                                                               │
+│  ref → bp_fir(1024tap) → cnn_buf[2][16000] 双缓冲            │
+│    │                         │                                │
+│    │                    CNN M5 (8类)                          │
+│    │                      ↓ softmax                          │
+│    │                    Blend: centroid[8][30] max归一        │
+│    │                      ↓                                  │
+│    │                    Wc = Σ blend[c]×sub_filter[c]         │
+│    │                    RMS对齐 stub_rms, 取反                │
+│    │                      ↓                                  │
+│    │                    滞回检测 (cos<0.8)                    │
+│    │                      ↓ 切换                             │
+│    │                    CrossFader 100ms → Wc[2048]           │
+│    │                                                         │
+├─ 前馈环路 (16kHz, 音频回调) ─────────────────────────────────┤
+│                                                               │
+│  ref_filt → x_hist[1024] → anti = Wc ⊗ x_ref (直接卷积)      │
+│    │            ↓                          ↓                  │
+│    │         [Wc⊗ref]                  物理扬声器输出          │
+│    │                                                         │
+│    └→ sec_firs[6] (Ŝ,1040tap) → Xd[E×S×L]                   │
+│                                     ↓                        │
+│                              power = ΣXd²/(E·L)              │
+│                                     ↓                        │
+│  err_meas = bp(err_mic) ──→ ΔWc = -μ·err_meas·Xd/power       │
+│                              (per-sample LMS)                 │
+│                              + leak (1e-6)                    │
+│                              + freeze_lms (max|Wc|>5×stub)    │
+│                                                               │
+├─ 反馈环路 (规划中, B-1) ─────────────────────────────────────┤
+│                                                               │
+│  err_mic → IIR 8阶(20-200Hz) → anti_fb[s]                    │
+│  (固定系数, 出厂烧录)                                         │
+│                                                               │
+├─ 辅助 ───────────────────────────────────────────────────────┤
+│                                                               │
+│  反馈抵消: fb_fir[2] FIR(256tap) 逐扬声器校准                  │
+│  啸叫检测: DFT 256pt + IIR notch ×2, 15dB阈值                 │
+│  anti_total = anti_ff + anti_fb → 限幅±1.0 → ZOH×3 → DAC     │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
 ## 反馈路径校准
 
 反馈抵消功能需逐扬声器校准声学路径。**只需在麦克风或扬声器位置变化时重新校准**。
@@ -295,30 +311,34 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
 | 回调预算 | ~73% | fir_tick 取模已消除 (双段循环) |
 
-## C 代码与 Python 代码的对应
+## 代码结构
 
-| C 文件 | Python 参考 | 功能 |
-|--------|------------|------|
-| `main.c` | `Main_GFANC_Realtime.ipynb` | 离线: WAV 输入/输出, fxnlms_tick (仿真路径) |
-| `main_realtime.c` | — | 实时: ASIO 音频, fxnlms_tick_rt (实时路径) |
-| `src/scene_controller.c` | `SceneController.py` | CNN 场景识别 → Wc 构造 |
-| `src/fxnlms_mimo.c` | `Combine_GFANC_with_FxNLMS_MIMO.py` | FxNLMS (离线+实时双路径) |
-| `src/cnn_m5_forward.c` | `Network.py` | M5 CNN 推理 |
-| `src/fir_filter.c` | `scipy.signal.lfilter` | FIR 滤波器 (双段循环, 零取模) |
-| `src/howling_detect.c` | — | 啸叫 DFT 检测 + IIR 陷波 |
-| `src/pa_loader.c` | — | PortAudio ASIO DLL 加载 |
-| `src/calibrate_feedback.c` | — | 反馈路径校准 (逐扬声器) |
-| `src/binary_loader.c` | `numpy.fromfile` | 读取 .bin 模型文件 |
+C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检测、反馈抵消、发散保护、双缓冲等模块），是独立的工程实现。
 
-## 验证结果
+| 文件 | 功能 |
+|------|------|
+| `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick` 仿真路径 |
+| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, 场景状态机 |
+| `src/scene_controller.c` | CNN M5 推理 → softmax → max 归一化 Blend → Wc 构造 (RMS 对齐) |
+| `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, Wc 发散冻结) |
+| `src/cnn_m5_forward.c` | M5 CNN 前向推理 (静态缓冲, 1Hz) |
+| `src/fir_filter.c` | FIR 滤波器 (双段线性循环, 零取模) |
+| `src/howling_detect.c` | DFT 频谱峰值检测 + IIR 双二阶陷波 (逐扬声器独立状态) |
+| `src/pa_loader.c` | PortAudio ASIO DLL 运行时加载 |
+| `src/calibrate_feedback.c` | 反馈路径 NLMS 校准 (逐扬声器, 16k ZOH×3 激励) |
+| `src/binary_loader.c` | .bin 二进制权重文件加载 |
 
-离线模式与 Python 参考实现逐秒对比（56 秒混合噪声测试文件）：
+## 离线验证
 
-| 指标 | C 实现 | Python 参考 | 差异 |
-|------|--------|------------|------|
-| 平均降噪量 (dB) | **14.99** | 15.00 | 0.01 |
-| AI 场景识别 | 完全一致 | — | 0 |
-| 输入信号能量 | 完全一致 | — | 0 |
+离线模式 (`main.exe`) 在 56 秒混合噪声测试文件上：
+
+| 指标 | 结果 |
+|------|------|
+| 平均降噪量 (dB) | **15.00** |
+| 场景识别 | 8 类, 每秒 1 次 |
+| 处理速度 | 2.5× 实时 (15s 音频 6.1s 完成) |
+
+实时模式在 50cm 窗户开口 + ASIO 声卡上实测 NR 4-9dB（稳态噪声），取决于噪声源与参考/误差麦的声学耦合。
 
 ## 常见问题
 
