@@ -56,6 +56,7 @@ typedef struct {
 
     /* 跨回调状态 */
     float  wc_old[S*L], wc_cur[S*L];
+    float  anti_spk_prev[S]; /* 上一回调末anti值, 反馈抵消跨回调连续性 */
     int    fade_cnt;
     int    ramp_cnt;        /* 输出渐变: RAMP_SAMPLES → 0, anti_out 0→1 */
     int    mute_hold;       /* safety_mute 抑制: MUTE_HOLD_SAMPLES → 0, 覆盖首次 RMS */
@@ -115,7 +116,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     }
 
     /* ── ANC @ 16kHz ── */
-    float anti_spk[S] = {0, 0};   /* 反馈抵消需要上一轮的 anti 值 */
+    float anti_spk[S];
+    anti_spk[0] = ctx->anti_spk_prev[0];  /* 跨回调连续性, 首个样本用上一轮回调的末值 */
+    anti_spk[1] = ctx->anti_spk_prev[1];
     for (int n = 0; n < c16k; n++) {
         float ref_raw     = ctx->ref_buf[n];             /* 原始电平 (用于 RMS 显示) */
 
@@ -248,6 +251,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         ctx->anti_buf[n] = anti_spk[0];
         ctx->anti_buf[n + c16k] = anti_spk[1];
     }
+    ctx->anti_spk_prev[0] = anti_spk[0];  /* 保存末值, 供下一回调首样本反馈抵消 */
+    ctx->anti_spk_prev[1] = anti_spk[1];
 
     /* 内插 + 输出 (ch0=spk0, ch1=spk1) */
     int oi = 0;
