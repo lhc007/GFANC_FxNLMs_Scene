@@ -15,14 +15,15 @@
 
 ### 硬件（实时模式）
 
-- **麦克风阵列**：YDM6MIC（6 声道，插 USB）
-- **扬声器**：USB Audio Device（2 声道，插 USB）
+- **音频接口**：ASIO 多通道声卡（4in/2out+，共时钟）
+- **麦克风**：参考麦 ×1 + 误差麦 ×3
+- **扬声器**：2 声道
 - **电脑**：Windows 10/11
 
-> **注意**：当前使用两个独立 USB 设备，时钟异步导致 F-A/F-B 功能暂时回退。
-> 换用共时钟多通道声卡（如 Focusrite Scarlett）后，执行 `git revert 162d357` 即可恢复。
+> 当前使用单设备 ASIO 声卡（共时钟驱动所有 ADC/DAC），时钟同步问题已解决。
+> 反馈抵消需运行 `calibrate_feedback.exe` 逐扬声器校准。
 
-这两个设备同时插在电脑上。**噪声源必须同时覆盖参考麦克风和误差麦克风**——ANC 只能抵消两个位置都能"听到"的噪声。参考麦（YDM6MIC 的 ch0）朝向噪声源，误差麦（ch1-3）和扬声器朝向听音区。
+**噪声源必须同时覆盖参考麦克风和误差麦克风**——ANC 只能抵消两个位置都能"听到"的噪声。参考麦朝向噪声源，误差麦和扬声器朝向听音区。系统总长约 50cm，建议安装在窗户开口处（参考麦朝向窗外，误差麦+扬声器朝向室内）。
 
 ### 软件
 
@@ -51,7 +52,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c -lm -lole32 -o gfanc_realtime.exe
+gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/pa_loader.c -lm -o gfanc_realtime.exe
 ```
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
@@ -141,21 +142,30 @@ GFANC_FxNLMs_Scene/
 │   ├── gfanc_types.h      基础类型（FIR 滤波器）
 │   ├── fir_filter.h       FIR 滤波器
 │   ├── scene_controller.h CNN 场景识别 + 滤波器构造
-│   ├── fxnlms_mimo.h      自适应降噪算法
+│   ├── fxnlms_mimo.h      自适应降噪算法（离线+实时双路径）
+│   ├── howling_detect.h   啸叫检测 + IIR 陷波
 │   ├── binary_loader.h    模型加载器
-│   └── wasapi_io.h        音频输入/输出（实时模式）
+│   └── pa_loader.h        PortAudio DLL 共享加载层
 │
 ├── src/                   源代码（实现）
-│   ├── fir_filter.c       FIR 滤波器（快速卷积运算）
+│   ├── fir_filter.c       FIR 滤波器（双段循环, 零取模）
 │   ├── scene_controller.c AI 场景识别 + 控制滤波器构造
-│   ├── fxnlms_mimo.c      自适应降噪核心算法
-│   ├── cnn_m5_forward.c   神经网络推理引擎
+│   ├── fxnlms_mimo.c      自适应降噪核心（离线仿真+实时双路径）
+│   ├── cnn_m5_forward.c   神经网络推理（静态缓冲）
+│   ├── howling_detect.c   啸叫 DFT 检测 + IIR 陷波（逐扬声器独立状态）
 │   ├── binary_loader.c    从文件加载模型参数
-│   └── wasapi_io.c        音频设备驱动（实时模式）
+│   ├── pa_loader.c        PortAudio 运行时 DLL 加载
+│   ├── calibrate_feedback.c  反馈路径校准（逐扬声器, 16k ZOH×3）
+│   └── measure_drift.c    时钟漂移测量工具
 │
 ├── data/                  模型参数文件（运行时加载）
 │   ├── *.bin              二进制权重（滤波器系数、神经网络权重）
 │   └── ...
+│
+├── docs/                  文档
+│   ├── CODE_REVIEW.md     代码审查报告（问题追踪）
+│   ├── UPGRADE_ROADMAP.md 升级路线图
+│   └── micphone.md        麦克风数据手册
 │
 └── export/                工具脚本（Python → C 格式转换）
     ├── export_bin.py      导出为 .bin 文件
@@ -168,54 +178,42 @@ GFANC_FxNLMs_Scene/
 
 ### 慢速环路（每秒执行一次）— "大脑"
 
-这个环路像一个**智能管家**，每秒分析一次噪声类型（是马路噪声？空调声？人声？），然后选择合适的降噪策略。
+CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（8 种），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
 
 ```
-噪声信号
-  │
-  ├─→ 带通滤波器（只保留 20-1500Hz — 人耳敏感且 ANC 能处理的频率）
-  │
-  ├─→ AI 神经网络（CNN，8 种场景分类）
-  │     │
-  │     └─→ "这是第 3 类噪声，置信度 35%"
-  │
-  ├─→ 查表选择滤波器组合（15 个子滤波器，按 AI 建议的比例混合）
-  │
-  └─→ 构造控制滤波器 Wc（1024 个系数，定义反噪声的形状）
-        │
-        └─→ 如果噪声类型变了 → 平滑过渡到新滤波器（1ms 内完成，听不出切换）
-           如果没变 → 保持当前滤波器，让自适应算法继续微调
+噪声 → 带通(20-1500Hz) → CNN(M5, 8类) → Blend(15子滤波器) → Wc(1024tap)
+                                    ↑ 1Hz, 双缓冲+原子交接
 ```
+
+场景识别为 1Hz 是正确设计——噪声类型变化是秒级到分钟级的，1 秒窗口保证足够的频率分辨率。场景切换时 CrossFader 在 100ms 内平滑过渡。
 
 ### 前馈环路（每秒 16000 次）— "肌肉"
 
-这个环路是**执行者**，每个音频样本（1/16000 秒）都在工作：
+F-A 修复后，实时和离线使用独立路径，互不影响：
 
+**实时路径**（`fxnlms_tick_rt`）：
 ```
-噪声样本（当前时刻）
-  │
-  ├─→ 次级路径滤波（模拟"反噪声从扬声器到耳朵的传播过程"）
-  │     └─→ Fx = 扬声器播放的声音到达耳朵后会变成什么样
-  │
-  ├─→ 干扰信号（耳朵位置测到的噪声）
-  │     └─→ Dis = 如果没有降噪，耳朵会听到什么
-  │
-  ├─→ 反噪声计算
-  │     └─→ anti = Wc（控制滤波器）× Fx（传播路径）
-  │
-  ├─→ 误差 = Dis + anti（噪声 + 反噪声，理想情况下 = 0）
-  │
-  └─→ 自适应更新（FANLMS 算法）
-        └─→ 根据误差微调 Wc 的 1024 个系数
-           （像自动对焦一样，不断逼近最佳降噪效果）
+ref → bp_fir → x_ref ─┬─→ [Wc ⊗ x_ref] → anti (物理扬声器输出)
+                      │
+                      └─→ Ŝ ⊗ ref → Fx → 梯度更新
+                                         ↑
+                           err_meas = bp(err_mic) (实测误差直驱)
 ```
+
+**离线路径**（`fxnlms_tick`，保留）：
+```
+ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
+              Pri(ref) → Dis → err = Dis + anti → 梯度
+```
+
+关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。
 
 ### 数据流向图
 
 ```
                      ┌──────────────┐
-                     │  噪声 WAV 文件 │（离线）
-                     │  或 麦克风    │（实时）
+                     │  噪声 WAV /   │
+                     │  麦克风阵列    │
                      └──────┬───────┘
                             │
                      ┌──────▼───────┐
@@ -223,68 +221,45 @@ GFANC_FxNLMs_Scene/
                      └──────┬───────┘
                             │
               ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-     ┌────────────┐  ┌────────────┐  ┌────────────┐
-     │ 慢速环路    │  │ Pri 路径    │  │ Sec 路径    │
-     │ (每秒1次)   │  │ (噪声→耳朵) │  │ (扬声器→耳朵)│
-     │            │  │            │  │            │
-     │ CNN→Blend  │  │ Dis = 扰动  │  │ Fx = 滤波   │
-     │ →Wc 构造   │  │            │  │     参考    │
-     └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
-           │               │               │
-           │   Wc (控制滤波器)              │
-           └───────┐       │               │
-                   │       │               │
-                   ▼       ▼               ▼
-            ┌──────────────────────────────────┐
-            │        前馈环路 (每秒16000次)       │
-            │                                  │
-            │  anti = Wc × Fx （计算反噪声）    │
-            │  err  = Dis + anti （计算误差）    │
-            │  Wc ← Wc - μ × err × Fx （自适应） │
-            └──────────────┬───────────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │  anti_out.wav │（离线输出）
-                    │  或 扬声器     │（实时输出）
-                    └──────────────┘
+              ▼                           ▼
+     ┌────────────────┐          ┌────────────────┐
+     │ 慢速环路 (1Hz)  │          │ 前馈环路 (16kHz) │
+     │                │          │                │
+     │ CNN→Blend→Wc   │──Wc──→  │ anti=Wc⊗ref    │
+     │ 双缓冲+原子交接  │          │ err_meas 直驱   │
+     │ CrossFade 100ms│          │ LMS 梯度更新    │
+     └────────────────┘          └───────┬────────┘
+                                        │
+                                 ┌──────▼───────┐
+                                 │  扬声器 / WAV  │
+                                 └──────────────┘
+
+辅助: 反馈抵消(fb_fir×2, 逐扬声器) + 啸叫检测(DFT+IIR陷波) + Wc发散冻结
 ```
 
 ## 反馈路径校准
 
-反馈抵消功能需要先校准一次扬声器→参考麦的声学路径。**只需在麦克风或扬声器位置发生变化时重新校准**（日常使用无需重复）。
-
-### 什么时候需要校准
-
-| 情况 | 需要校准？ |
-|------|-----------|
-| 首次使用 | ✅ 需要 |
-| 重新启动程序 | ❌ 不需要 |
-| 挪了扬声器或参考麦位置 | ✅ 需要 |
-| 更换麦克风/扬声器硬件 | ✅ 需要 |
-| 仅改代码/重新编译 | ❌ 不需要 |
+反馈抵消功能需逐扬声器校准声学路径。**只需在麦克风或扬声器位置变化时重新校准**。
 
 ### 校准步骤
 
 ```bash
 # 编译校准程序（只需一次）
-gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c -lm -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -o calibrate_feedback.exe
 
-# 运行校准
+# 运行校准（自动逐扬声器两轮）
 ./calibrate_feedback.exe
 ```
 
-1. 选择 YDM6MIC 输入设备（如 `22`）
-2. 选择 USB 扬声器输出设备（如 `18`）
-3. 保持安静 4 秒，自动完成
-4. 生成 `data/feedback_path.bin`
+保持安静 4 秒×2 轮，自动生成 `data/feedback_path_0.bin` 和 `data/feedback_path_1.bin`。
 
-校准完成后直接运行 `./gfanc_realtime.exe`，启动日志会显示：
+校准完成后运行 `./gfanc_realtime.exe`，日志显示：
 ```
-Feedback cancel: 256 taps loaded, RMS=0.0005
+Feedback spk0: 256 taps, RMS=0.0005
+Feedback spk1: 256 taps, RMS=0.0006
 ```
 
-如果文件缺失，反馈抵消自动禁用，不影响正常降噪。
+文件缺失时反馈抵消自动禁用，不影响降噪。
 
 ## 啸叫检测
 
@@ -299,34 +274,41 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| 内部采样率 | 16000 Hz | 每秒处理 16000 个音频样本 |
-| 硬件采样率 | 48000 Hz | 麦克风和扬声器的实际采样率（实时模式会做转换） |
-| 误差麦克风 (E) | 3 个 | 放在"想安静的位置"，监测降噪效果 |
-| 扬声器 (S) | 2 个 | 播放反噪声 |
-| 子滤波器 (C) | 15 个 | 每个覆盖不同频率段，组合使用 |
-| 场景类型 (K) | 8 种 | AI 能识别 8 种不同的噪声环境 |
-| 滤波器长度 (L) | 1024 个系数 | 控制反噪声的"形状" |
-| 带通频率 | 20-1500 Hz | ANC 只对这个范围有效 |
-| 输入预增益 | 10x (+20dB) | 可调, 反馈抵消后稳定上限 ~15-20x |
-| 步长 (μ) | 0.0001 | 自适应速度（太大不稳定，太小收敛慢） |
-| 泄漏因子 | 0.00001 | 防止长时间运行后滤波器漂移 |
-| 输出限幅 | ±1.0 | 防止削波失真 |
-| 场景切换阈值 | 余弦相似度 < 0.8 | 噪声类型变化超过这个程度才切换策略 |
-| 切换过渡 | 16 个样本 (1ms) | 新旧滤波器 CrossFader，配合 ramp 400ms 渐变 |
-| 音频延迟 | 10 ms | 麦克风→处理→扬声器的总延迟（实时模式） |
+| 内部采样率 | 16000 Hz | ANC 处理速率 |
+| 硬件采样率 | 48000 Hz | ASIO 声卡采样率（3:1 抽取/内插） |
+| 误差麦克风 (E) | 3 | 放在降噪目标位置 |
+| 扬声器 (S) | 2 | 播放反噪声 |
+| 子滤波器 (C) | 15 | 预训练滤波器, 按场景混合 |
+| 场景类型 (K) | 8 | CNN 可识别的噪声环境数 |
+| 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
+| 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
+| 输入预增益 | 10x (+20dB) | MIC_PRE_GAIN, 可调 |
+| 步长 (μ) | 0.0001 | LMS 自适应步长 |
+| 泄漏因子 | 1e-6 (~1.5%/秒) | Wc 正则化, 与 step_size 解耦 |
+| 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
+| 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
+| 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
+| 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
+| Wc 发散阈值 | max\|Wc\| > 5×stub_rms | 自动冻结 LMS 梯度 |
+| 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
+| 啸叫陷波 | DFT 256pt, IIR ×2 | 15dB 峰均值阈值, 逐扬声器独立状态 |
+| CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
+| 回调预算 | ~73% | fir_tick 取模已消除 (双段循环) |
 
 ## C 代码与 Python 代码的对应
 
-| C 文件 | Python 文件 | 功能 |
+| C 文件 | Python 参考 | 功能 |
 |--------|------------|------|
-| `main.c` | `notebooks/Main_GFANC_Realtime.ipynb` | 离线: WAV 输入/输出 + 主循环 |
-| `main_realtime.c` | — | 实时: WASAPI 音频 + 重采样 + 主循环 |
-| `src/scene_controller.c` | `gfanc/SceneController.py` | AI 场景识别 → 滤波器构造 |
-| `src/fxnlms_mimo.c` | `gfanc/Combine_GFANC_with_FxNLMS_MIMO.py` | FxNLMS 自适应算法 |
-| `src/cnn_m5_forward.c` | `gfanc/Network.py` | 神经网络推理 |
-| `src/fir_filter.c` | `scipy.signal.lfilter` | FIR 滤波器 |
-| `src/wasapi_io.c` | `sounddevice.Stream` | 音频设备输入/输出 |
-| `src/binary_loader.c` | `numpy.fromfile` | 读取二进制模型文件 |
+| `main.c` | `Main_GFANC_Realtime.ipynb` | 离线: WAV 输入/输出, fxnlms_tick (仿真路径) |
+| `main_realtime.c` | — | 实时: ASIO 音频, fxnlms_tick_rt (实时路径) |
+| `src/scene_controller.c` | `SceneController.py` | CNN 场景识别 → Wc 构造 |
+| `src/fxnlms_mimo.c` | `Combine_GFANC_with_FxNLMS_MIMO.py` | FxNLMS (离线+实时双路径) |
+| `src/cnn_m5_forward.c` | `Network.py` | M5 CNN 推理 |
+| `src/fir_filter.c` | `scipy.signal.lfilter` | FIR 滤波器 (双段循环, 零取模) |
+| `src/howling_detect.c` | — | 啸叫 DFT 检测 + IIR 陷波 |
+| `src/pa_loader.c` | — | PortAudio ASIO DLL 加载 |
+| `src/calibrate_feedback.c` | — | 反馈路径校准 (逐扬声器) |
+| `src/binary_loader.c` | `numpy.fromfile` | 读取 .bin 模型文件 |
 
 ## 验证结果
 
@@ -344,10 +326,10 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看 dB(Band) 数字，不要用耳朵直接听 error_out.wav。
 
 **Q: 实时模式怎么验证效果？**
-A: 目前实时版在终端只输出状态日志。后续可以加入实时 dB 显示。
+A: 终端每秒输出 NR(dB)、err/anti RMS、啸叫状态。NR > 3dB 表示有效降噪。
 
 **Q: 可以处理其他采样率的文件吗？**
 A: 离线模式自动将输入重采样到 16000 Hz。支持 8/16/24 bit WAV。
 
-**Q: 为什么编译实时版需要 `-lole32`？**
-A: Windows 的音频 API（WASAPI）是 COM 组件，需要链接 ole32 库。
+**Q: 实时版使用什么音频 API？**
+A: PortAudio + ASIO 后端 (`libportaudio64bit-asio.dll`)，通过 `src/pa_loader.c` 运行时加载。
