@@ -36,7 +36,7 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
 {
     int K = SC_K, S = SC_S, C = SC_C, L = sc->L;
 
-    /* minmaxscaler */
+    /* minmaxscaler (阈值 1e-6 防止静默信号过度放大 → CNN 输入爆炸) */
     float mx = audio[0], mn = audio[0];
     for (int i = 1; i < 16000; i++) {
         if (audio[i] > mx) mx = audio[i];
@@ -44,15 +44,29 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     }
     float denom = mx - mn;
     float *cnn_in = (float *)malloc(16000 * sizeof(float));
-    if (denom > 1e-10f)
+    if (denom > 1e-6f)
         for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
     else
-        memcpy(cnn_in, audio, 16000 * sizeof(float));
+        memset(cnn_in, 0, 16000 * sizeof(float));  /* 静音 → 全零, 不传噪声 */
 
     /* CNN 前向 */
     float logits[SC_K];
-    cnn_m5_forward(cnn_in, logits);
+    int cnn_ret = cnn_m5_forward(cnn_in, logits);
     free(cnn_in);
+
+    if (cnn_ret != 0) {
+        /* CNN 推理失败 (malloc 失败等), 保持上一帧场景 */
+        if (sc->cur_scene >= 0) {
+            scene_ctrl_construct_wc(sc, sc->cur_scene, wc_out);
+            for (int k = 0; k < K; k++) probs_out[k] = sc->prev_probs[k];
+            return sc->cur_scene;
+        }
+        /* 无历史场景 → 回退到 scene 0 */
+        memset(probs_out, 0, K * sizeof(float));
+        probs_out[0] = 1.0f;
+        scene_ctrl_construct_wc(sc, 0, wc_out);
+        return 0;
+    }
 
     /* softmax */
     float logit_mx = logits[0], sum_exp = 0;
@@ -96,6 +110,16 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out
     /* RMS 对齐 stub + 取反 */
     float rms_sq = 0;
     for (int i = 0; i < S * L; i++) rms_sq += wc_out[i] * wc_out[i];
-    float scale = (rms_sq > 1e-10f) ? sc->stub_rms / sqrtf(rms_sq / (S * L)) : 1.0f;
+    float wc_rms = sqrtf(rms_sq / (S * L));
+    if (wc_rms < 1e-6f) {
+        /* Wc 退化: 所有 blend 权重接近零 → 反噪声失效 (可能为 centroid 全零/全负) */
+        static int warn_cnt = 0;
+        if (warn_cnt < 3) {
+            fprintf(stderr, "[WARN] Wc RMS=%.6f near zero for scene=%d, ANC may be silent\n",
+                    wc_rms, scene_id);
+            warn_cnt++;
+        }
+    }
+    float scale = (rms_sq > 1e-10f) ? sc->stub_rms / wc_rms : 1.0f;
     for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i] * scale;
 }

@@ -198,8 +198,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         else
             fxnlms_forward_only(&ctx->fx, Fx_arr, anti_spk, err_sig);
 
-        /* 输出钳位 (防止 FxNLMS 计算值远超 ±1.0 导致硬截断失真) */
+        /* NaN/Inf 保护 + 输出钳位 (防止 FxNLMS 计算值远超 ±1.0 导致硬截断失真) */
         for (int s = 0; s < S; s++) {
+            if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
             if (anti_spk[s] > 1.0f) anti_spk[s] = 1.0f;
             if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
         }
@@ -263,6 +264,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     int oi = 0;
     for (int n = 0; n < c16k; n++) {
         float a0 = ctx->anti_48k[n], a1 = ctx->anti_48k[n + c16k];
+        if (!isfinite(a0)) a0 = 0.0f;
+        if (!isfinite(a1)) a1 = 0.0f;
         if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
         if (a1 > 1.0f) a1 = 1.0f; if (a1 < -1.0f) a1 = -1.0f;
         for (int r = 0; r < 3; r++) { out[oi++] = a0; out[oi++] = a1; }
@@ -390,7 +393,7 @@ int main(void) {
 
     scene_ctrl_init(&ctx.sc, centroids, sub_filters, L);
     howling_init(&ctx.hw, HOWLING_ENABLED);
-    fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-5f);
+    fxnlms_init(&ctx.fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
 
     /* 缓冲 */
     ctx.ref_48k = (float *)malloc(FS_HW * sizeof(float));

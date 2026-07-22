@@ -91,7 +91,7 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
                 fx->wc[s * L + k] -= fx->step_size * err_out[e]
                                    * fx->xd[(e * S + s) * L + k] * inv_pwr;
         for (int k = 0; k < L; k++)
-            fx->wc[s * L + k] *= (1.0f - fx->step_size * fx->leak);
+            fx->wc[s * L + k] *= (1.0f - fx->leak);  /* leak 与 step_size 解耦 */
     }
 }
 

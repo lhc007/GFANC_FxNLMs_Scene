@@ -189,7 +189,7 @@ int main(int argc, char **argv)
 
     /* 2e. FxNLMS */
     fxnlms_mimo_t fx;
-    fxnlms_init(&fx, E, S, L, 0.0001f, 1e-5f);
+    fxnlms_init(&fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
     printf("  System ready (CNN loaded).\n");
 
     /* ── 3. 读取 WAV ── */
@@ -362,7 +362,11 @@ int main(int argc, char **argv)
             else
                 fxnlms_forward_only(&fx, Fx_arr, anti_spk, err_sig);
 
-            for (int s = 0; s < S; s++) anti_out[s * N + idx] = anti_spk[s];
+            /* NaN/Inf 保护: 防止异常值进入输出文件/扬声器 */
+            for (int s = 0; s < S; s++) {
+                if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
+                anti_out[s * N + idx] = anti_spk[s];
+            }
             for (int e = 0; e < E; e++) {
                 err_out[e * N + idx] = err_sig[e];
                 err_pwr += err_sig[e] * err_sig[e];

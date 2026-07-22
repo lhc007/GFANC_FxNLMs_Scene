@@ -147,8 +147,10 @@ static int add_notch(howling_detect_t *hw, float freq)
     int idx = hw->active_count;
     notch_design(freq, 16000.0f, HW_NOTCH_R,
                  &hw->b1[idx], &hw->a1[idx], &hw->a2[idx]);
-    hw->x1[idx] = hw->x2[idx] = 0;
-    hw->y1[idx] = hw->y2[idx] = 0;
+    for (int s = 0; s < HW_S; s++) {
+        hw->x1[s][idx] = hw->x2[s][idx] = 0;
+        hw->y1[s][idx] = hw->y2[s][idx] = 0;
+    }
     hw->active_freqs[idx] = freq;
     hw->active_count++;
     return idx;
@@ -162,14 +164,16 @@ static void remove_notch(howling_detect_t *hw, int idx)
     if (idx < 0 || idx >= hw->active_count) return;
     hw->active_count--;
     if (idx < hw->active_count) {
-        /* 用最后一个覆盖 */
+        /* 用最后一个覆盖 (系数 + 所有扬声器状态) */
         hw->b1[idx] = hw->b1[hw->active_count];
         hw->a1[idx] = hw->a1[hw->active_count];
         hw->a2[idx] = hw->a2[hw->active_count];
-        hw->x1[idx] = hw->x1[hw->active_count];
-        hw->x2[idx] = hw->x2[hw->active_count];
-        hw->y1[idx] = hw->y1[hw->active_count];
-        hw->y2[idx] = hw->y2[hw->active_count];
+        for (int s = 0; s < HW_S; s++) {
+            hw->x1[s][idx] = hw->x1[s][hw->active_count];
+            hw->x2[s][idx] = hw->x2[s][hw->active_count];
+            hw->y1[s][idx] = hw->y1[s][hw->active_count];
+            hw->y2[s][idx] = hw->y2[s][hw->active_count];
+        }
         hw->active_freqs[idx] = hw->active_freqs[hw->active_count];
     }
 }
@@ -191,7 +195,8 @@ void howling_tick(howling_detect_t *hw, float err_sample,
             float x = anti_spk[s];
             for (int i = 0; i < hw->active_count; i++)
                 x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
-                                &hw->x1[i], &hw->x2[i], &hw->y1[i], &hw->y2[i]);
+                                &hw->x1[s][i], &hw->x2[s][i],
+                                &hw->y1[s][i], &hw->y2[s][i]);
             anti_spk[s] = x;
         }
         return;
@@ -243,12 +248,13 @@ void howling_tick(howling_detect_t *hw, float err_sample,
         hw->candidate_count = 0;  /* 重置候选 (中间断了) */
     }
 
-    /* ── 应用陷波器 ── */
+    /* ── 应用陷波器 (每扬声器独立 IIR 状态) ── */
     for (int s = 0; s < S; s++) {
         float x = anti_spk[s];
         for (int i = 0; i < hw->active_count; i++)
             x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
-                            &hw->x1[i], &hw->x2[i], &hw->y1[i], &hw->y2[i]);
+                            &hw->x1[s][i], &hw->x2[s][i],
+                            &hw->y1[s][i], &hw->y2[s][i]);
         anti_spk[s] = x;
     }
 }

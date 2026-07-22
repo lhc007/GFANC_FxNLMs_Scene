@@ -20,7 +20,7 @@
 | 反馈抵消 | ✅ 完成 | NLMS 256tap + 实时 FIR 减法, 反馈衰减 -34dB |
 | 啸叫检测 | ✅ 完成 | DFT + IIR biquad 陷波, 跳过工频, 15dB 阈值 |
 | 在线降噪实测 | ✅ 完成 | NR 4-9dB (稳态), 10x增益, 无啸叫, err底噪 ~0.0003 |
-| F-A/F-B 修复 | ❌ 已回退 | fxnlms_tick_rt 梯度设计错误导致发散, 实测次级路径无意义 |
+| F-A/F-B 修复 | 🔧 待验证 | 硬件已升级到单设备 ASIO (共时钟), 可重新测试 F-B 次级路径校准 |
 
 ---
 
@@ -33,11 +33,13 @@
 **设计本身正确**：`fxnlms_tick_rt`（anti_out = Wc ⊗ ref，ΔWc = -μ × err_meas × Fx）
 是标准 Filtered-x LMS 的实时形式，商业 ANC 均采用此结构。
 
-**当前为何失败**：F-B 提供的实测 Sec 含 73ms USB 缓冲延迟 → `err_meas` 与 `Xd` 时域
+**当前为何失败**：F-B 提供的实测 Sec 含大量 I/O 缓冲延迟 → `err_meas` 与 `Xd` 时域
 完全错位 → LMS 梯度方向随机 → Wc 瞬间发散。**根因在 F-B（Sec 模型错误），不在 F-A。**
 
-**何时重新启用**：换共时钟多通道声卡后，F-B 可测得正确的声学路径（~0.3ms），
-F-A 即可正常工作。恢复方法：`git revert 162d357`。
+**硬件状态更新 (2026-07-22)**：已从双 USB 设备升级到单设备 ASIO（共时钟），
+F-B 的硬件阻塞条件理论上已消除。可重新运行 `calibrate_feedback.exe` 验证。
+
+**何时重新启用**：F-B 校准通过后即可恢复。恢复方法：`git revert 162d357`。
 **当前已回退，代码在 git 历史中保留。**
 
 ### F-B: 次级路径实测校准
@@ -46,16 +48,16 @@ F-A 即可正常工作。恢复方法：`git revert 162d357`。
 
 **设计本身正确**：实测次级路径比仿真数据更准确，是 ANC 系统校准的标准做法。
 
-**当前为何失败**：两个独立 USB 设备（YDM6MIC + USB Audio）的 I/O 缓冲延迟每次都不同
-（实测 73ms，jitter 几十 ms）。离线测量值在下次运行时已失效——这不是测量方法的错，
-是硬件架构的物理限制。
+**当前为何失败**（历史原因，已解决）：双 USB 设备（YDM6MIC + USB Audio）的 I/O 缓冲
+延迟每次都不同（实测 73ms，jitter 几十 ms）。离线测量值在下次运行时已失效。
 
-**何时重新启用**：换共时钟多通道声卡后，同一时钟驱动所有 ADC/DAC，
-I/O 延迟固定 → 离线测量值每次一致 → F-B 生效 → 连带修复 F-A。
-恢复方法：`git revert 162d357`。
+**硬件状态更新 (2026-07-22)**：已升级到单设备 ASIO 声卡（共时钟驱动所有 ADC/DAC），
+I/O 延迟固定且可复现。可重新运行 `calibrate_feedback.exe` 验证。
+
+**何时重新启用**：确认 ASIO 声卡的次级路径校准成功后即可恢复。恢复方法：`git revert 162d357`。
 
 **当前替代方案**：`data/secondary_path.bin`（仅含声学路径）+ `DSP_DELAY=16`。
-在独立 USB 设备上已足够，NR 4-9dB 证明系统正常工作。
+NR 4-9dB 证明系统在仿真次级路径下正常工作。
 
 ---
 
@@ -132,6 +134,171 @@ LMS 无法抵消不相关的噪声分量。这是前馈 ANC 在开放空间的�
 
 ---
 
+## 代码审查修复记录 (2026-07-22)
+
+### 已修复项
+
+#### ✅ FIX-1: MinMax Scaler 静默输入保护不足
+
+**问题**：[src/scene_controller.c:45-50](src/scene_controller.c#L45-L50) MinMax scaler 的静默保护阈值 `1e-10f`
+过低。当音频接近静音时 `denom = 2e-10`，CNN 输入被放大 ~5×10⁹ 倍，经 Conv1D 累加 (STEM_K=80)
+后 float32 溢出到 ±Inf，经 softmax 产生 NaN，Wc 用垃圾数据构建 → 输出错误。
+
+**影响**：静默/极低音量场景下，CNN 输出 NaN → argmax 随机场景 → Wc 随机 → 抗噪声可能反相，
+触发正反馈啸叫。
+
+**修复**：
+- 阈值从 `1e-10f` 提高到 `1e-6f`（对应约 -120 dBFS，远低于任何有效信号）
+- 低于阈值时 `memset(cnn_in, 0, ...)` 全零填充而非 `memcpy` 原始音频
+- 位置：[src/scene_controller.c](src/scene_controller.c) 第 47-50 行
+
+#### ✅ FIX-2: CNN 前向失败返回值未检查
+
+**问题**：[src/scene_controller.c:53-54](src/scene_controller.c#L53-L54) `cnn_m5_forward()` 的返回值被忽略。
+当 CNN 内部 `malloc` 失败时返回 -1，但 `logits` 是栈上的未初始化垃圾数据，后续 softmax/argmax/Wc 构造
+全部基于垃圾值。
+
+**影响**：内存不足时 Wc 被设置为随机值，输出不可预测。
+
+**修复**：
+- 检查 `cnn_m5_forward()` 返回值
+- 失败时保持上一帧场景（`sc->cur_scene`）和对应的 Wc
+- 首帧失败时回退到 scene 0
+- 位置：[src/scene_controller.c](src/scene_controller.c) 第 53-69 行
+
+#### ✅ FIX-3: NaN/Inf 无声传播至音频输出
+
+**问题**：整个代码库无 `isnan()`/`isinf()` 检查。任何环节产生 NaN（除零、log10 负数、
+MinMax 溢出等）会无声传播至 `anti_spk`。更严重的是，输出钳位 `if (anti_spk[s] > 1.0f)` 
+对 NaN 无效（NaN 比较永远返回 false），NaN 直接进入 DAC → 扬声器。
+
+**影响**：NaN 值进入音频 DAC 可能导致硬件损坏或听力损伤（取决于 DAC 的异常值处理）。
+
+**修复**：
+- 在 `anti_spk` 钳位前加 `isfinite()` 检查，非有限值清零
+- 在 48kHz 输出内插循环中也加 `isfinite()` 检查
+- 位置：[main_realtime.c](main_realtime.c) 第 202-206 行、第 265-267 行；[main.c](main.c) 第 359-362 行
+
+#### ✅ FIX-4: FxNLMS Leak 与 step_size 耦合导致实际无效
+
+**问题**：[src/fxnlms_mimo.c:93-94](src/fxnlms_mimo.c#L93-L94) leak 公式为 `wc *= (1.0f - step_size * leak)`。
+当前参数 `step_size=0.0001, leak=1e-5` → 有效衰减 `1 - 1e-9`。在 float32 精度下 `1.0f - 1e-9f = 1.0f`
+（完全无效果），Wc 无任何正则化。
+
+**影响**：长期运行中 Wc 可能漂移/饱和，无内在机制限制系数增长。之前需依赖 `safety_mute`
+被动检测发散。
+
+**修复**：
+- 公式改为 `wc *= (1.0f - leak)`，leak 与 step_size 解耦
+- leak 参数从 `1e-5f` 调整为 `1e-6f`（~1.5%/秒衰减，float32 可分辨）
+- 位置：[src/fxnlms_mimo.c](src/fxnlms_mimo.c) 第 93-94 行；[main.c](main.c) 第 192 行；[main_realtime.c](main_realtime.c) 第 393 行
+
+#### ✅ FIX-5: 啸叫陷波器 IIR 状态跨扬声器串用 (原 B-2)
+
+**问题**：[src/howling_detect.c:247-253](src/howling_detect.c#L247-L253) 两个扬声器共用同一组 IIR 状态变量
+`x1[i], x2[i], y1[i], y2[i]`。扬声器 0 处理后状态被更新，扬声器 1 接着用被污染的
+历史状态继续滤波 → 第二个扬声器的陷波相位/幅度错误。
+
+**影响**：多扬声器场景下陷波效果不可靠，可能导致某扬声器陷波深度不足或过度衰减。
+
+**修复**：
+- IIR 状态数组从 `[HW_MAX_NOTCHES]` 扩展为 `[HW_S][HW_MAX_NOTCHES]`（HW_S=2）
+- `add_notch()` 初始化所有扬声器的状态
+- `remove_notch()` 搬运所有扬声器的状态
+- `howling_tick()` 两处 `notch_apply` 调用传入 `[s][i]` 索引
+- 位置：[include/howling_detect.h](include/howling_detect.h) 第 26、45-46 行；
+  [src/howling_detect.c](src/howling_detect.c) 第 148-151、167-173、193-196、249-253 行
+
+#### ✅ FIX-6: Wc RMS 退化无告警
+
+**问题**：[src/scene_controller.c:99](src/scene_controller.c#L99) 当 Wc 全零时（blend 权重全部接近零
+或 centroid 训练异常），RMS 对齐使用 `scale=1.0`，Wc 保持全零 → ANC 静默，但无任何日志输出，
+调试时难以发现。
+
+**影响**：ANC 静默时无法区分是 Wc 退化还是 acoustic path 解相关。
+
+**修复**：
+- 在 RMS 对齐前检查 `wc_rms < 1e-6`，低于阈值时 stderr 告警（限 3 次）
+- 位置：[src/scene_controller.c](src/scene_controller.c) 第 113-122 行
+
+---
+
+### 待修复项（需要实际测量或数据分析后修改）
+
+#### 🔶 TODO-1: Wc Max 归一化低权重时可能放大伪峰
+
+**问题**：[src/scene_controller.c:94-96](src/scene_controller.c#L94-L96) 的 max 归一化 `blend[i] / bmax` 将
+blend 最大值强制映射为 1.0。当 centroid 中存在训练噪声/离群分量时，该分量会主导 Wc 构造，
+压制其他 14 个子滤波器的贡献。极端情况下 (bmax→0)，所有 blend 被等幅放大到 1.0，Wc 退化为
+等权平均（stub），丧失场景特异性。
+
+**需要的数据**：
+1. 打印 8 个 centroid 各自的 30 维 blend 值，分析每维的分布和离群情况
+2. 统计各 scene 的 `bmax` 和次大值 `bmax2` 的比值 `bmax/bmax2`，判断是否过度集中
+3. 如果 `bmax/bmax2 > 10` 的 scene 比例 >30%，说明存在显著的单分量主导风险
+
+**候选方案**（选一）：
+- **方案 A**（最小改动）：加 `bmax` 下限 `if (bmax < 0.01f) bmax = 0.01f`，防止全低幅场景退化
+- **方案 B**（中等改动）：用 softmax 替代 max 归一化：`b[i] = exp(blend[i]/T) / Σexp(blend[j]/T)`，温度 T 控制集中度
+- **方案 C**（大改动）：用 L2 归一化：`b[i] = blend[i] / ||blend||`，保持向量方向，不加 clamp
+
+**建议**：先用 `printf` 在运行时打印各 scene centroid 的统计特征（min/max/mean/std），根据实际数据分布选择方案。
+
+#### 🔶 TODO-2: 反馈抵消符号假设未验证
+
+**问题**：[main_realtime.c:159](main_realtime.c#L159) `ref_sample = (ref_raw - fb_est) * MIC_PRE_GAIN` 假设
+NLMS 辨识的 FIR 相位正确（扬声器正信号 → 参考麦正响应）。如果声学路径有反相（取决于
+麦克风极性/扬声器接线/声腔共振），减去 `fb_est` 会变成**加上反馈**，形成正反馈环路。
+
+**需要的数据**：
+1. 运行 `calibrate_feedback.exe`，检查 FIR 系数的首个峰值符号（正=同相，负=反相）
+2. 实测：比较启用/禁用反馈抵消时的 `ref_rms`。启用后 ref_rms 应**降低**，若升高说明反相
+
+**修复方向**：若确认反相，将减法改为加法：`ref_sample = (ref_raw + fb_est) * MIC_PRE_GAIN`；
+或更稳健的做法：运行时检测反馈抵消效果，自动选择符号。
+
+#### 🔶 TODO-3: 离线/在线 MIC_PRE_GAIN 不一致
+
+**问题**：[main.c:126](main.c#L126) `MIC_PRE_GAIN=1.0` vs [main_realtime.c:29](main_realtime.c#L29)
+`MIC_PRE_GAIN=10.0`。离线验证和在线部署使用不同增益，导致：
+- 离线测试的收敛行为（步长等效值、leak 有效值、NR 水平）与在线不可比
+- 离线调优的参数不能直接用于在线
+
+**需要的数据**：
+1. 用 `main.c` 分别在 `MIC_PRE_GAIN=1.0` 和 `10.0` 跑同一噪声文件，对比 NR 差异
+2. 确认差异是否可以完全由 FxNLMS 的功率归一化自动补偿
+
+**修复方向**：统一为同一值，或至少文档说明差异原因和影响。长期方案：自动增益标定
+（已在 §P1: 增益标定 中描述）。
+
+#### 🔶 TODO-4: FxNLMS 功率归一化 epsilon 边界调优
+
+**问题**：[src/fxnlms_mimo.c:79](src/fxnlms_mimo.c#L79) 功率计算的 epsilon（1e-10）在信号功率处于
+1e-8 级别（极小但不是零）时，`inv_pwr` 可达 3e7。如果此时误差信号因其他原因非零
+（如反馈残余），有效步长 `step_size * inv_pwr = 0.0001 * 3e7 = 3000`，导致巨大的单步
+Wc 更新，可能触发瞬时发散。
+
+**需要的数据**：
+1. 在实际 ANC 运行中记录 `power[s]` 的最小值（排除纯静默）
+2. 正常情况下 `power[s]` 的典型范围（用 `MIC_PRE_GAIN=10x` 在线测）
+
+**修复方向**：将 epsilon 提高到与典型最低信号功率匹配的值（如 `1e-6` 或 `1e-4`），
+或使用 `power[s] = fmaxf(power[s], MIN_POWER)` 的 hard floor 方式。
+
+#### 🔶 TODO-5: volatile 变量跨线程无原子性保证
+
+**问题**：[main_realtime.c:78-87](main_realtime.c#L78-L87) 多个 `volatile` 变量在音频回调
+（高优先级 PortAudio 线程）写入，主循环（低优先级线程）读取。C 标准下 `volatile`
+不保证原子性，且无内存屏障。虽然在 x86 平台上对齐的 float 读写通常原子，但这是
+未定义行为。
+
+**影响**：极低概率的监控数据撕裂（如 NR level 显示瞬间跳变），不影响音频处理逻辑。
+
+**修复方向**：使用 C11 `_Atomic` 或 Windows `InterlockedExchange`。优先级低，当前仅影响
+控制台显示。
+
+---
+
 ## 二、与商业 ANC 设备的功能差距
 
 | 功能 | 商业 ANC | 本系统 | 优先级 |
@@ -181,7 +348,7 @@ LMS 无法抵消不相关的噪声分量。这是前馈 ANC 在开放空间的�
 3. 计算预增益：`pre_gain = target_rms / measured_rms`
 4. 存入配置文件，即插即用
 
-**预期收益**：换硬件零配置，但当前 5x 上限由反馈环路决定，标定本身不能突破这一限制。
+**预期收益**：换硬件零配置，MIC_PRE_GAIN 上限由反馈抵消效果决定，标定本身不能突破这一限制。
 
 #### P1: 窗户 ANC 实验配置
 
@@ -299,13 +466,15 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
 ## 三、推荐升级顺序
 
 ```
-第一阶段 (本周)
+第一阶段 (当前)
 ├── 🔴 反馈抵消 (P0) ✅ 已完成 —— NLMS 离线辨识 + 实时 FIR 减法
-├── 🟡 啸叫检测 (P1) ✅ 已完成 —— DFT 频谱峰值 + IIR 陷波
-├── 🟡 窗户 ANC 实验 —— 参考麦伸窗外，验证高相关路径 NR 提升
-└── 预期: 窗户场景 NR 10-15dB
+├── 🟡 啸叫检测 (P1) ✅ 已完成 —— DFT 频谱峰值 + IIR 陷波, 陷波状态跨通道已修复
+├── 🔧 F-A/F-B 恢复测试 —— 硬件已升级到 ASIO 共时钟, 重新校准次级路径
+├── 🔧 代码安全修复 (2026-07-22) ✅ —— MinMax/CNN返回值/NaN保护/Leak解耦/陷波串扰
+└── 预期: 确认 F-B 校准成功后恢复 F-A, NR 有望提升至 10-18dB
 
 第二阶段 (1-2 周)
+├── 🟡 窗户 ANC 实验 —— 参考麦伸窗外，验证高相关路径 NR 提升
 ├── Wc 发散检测 (P1) —— 系数监控 + 自动回退
 ├── 增益标定 (P1) —— 自动测量 + 配置文件
 └── 预期: 系统稳定性接近商业产品
@@ -314,55 +483,123 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
 ├── 子带处理 (P1)
 ├── 自适应步长 (P2)
 ├── 双讲检测 (P2)
-└── 舒适噪声 (P2)
+├── 舒适噪声 (P2)
+└── 量产硬件方案评估 (ARM定制板 vs AI ANC SoC)
 ```
 
 ---
 
 ## 四、硬件改造建议
 
-### 方案 A：低成本原型（基于现有硬件，¥30）
+### 方案 A：当前原型（ASIO 单设备声卡 + Windows PC，¥700-1500）
 
 ```
-[YDM6MIC]──USB──┐
-                ├── [Windows PC/笔记本]
-[USB Audio]─USB─┘
-
-新增: MAX9814 前放模块 (¥20) + PAM8403 功放 (¥10)
-状态: 当前代码可直接跑, NR 4-9dB, F-A/F-B 不可用
+[多通道 ASIO 声卡] ──USB── [Windows PC/笔记本]
+  (4in/2out+, 共时钟)
+  
+  当前状态: NR 4-9dB, 所有软件功能正常, F-A/F-B 可重新测试
+  新增: 驻极体麦前放 MAX9814 (¥20) + PAM8403 功放 (¥10) [可选]
 ```
 
-### 方案 B：正式原型（共时钟，¥800-1500）
+### 方案 B：正式原型（独立运行, 脱离PC, ¥400-2200）
+
+### 独立运行路径（脱离 PC）
+
+| 路径 | 硬件 | CNN可行性 | 工作量 | BOM成本 | 适用 |
+|------|------|-----------|--------|---------|------|
+| **Windows 迷你主机** | LattePanda 3 Delta + USB 声卡 | ✅ float32 直接跑 | **零** | ~¥2200 | 展会原型、小批量(<50) |
+| **ARM Linux SBC** | 树莓派5 + Audio HAT | ✅ float32 直接跑 | 中 (PortAudio→ALSA) | ~¥800 | 便携原型 |
+| **ARM Linux 定制板** | RK3568 + PCM1865 ADC + TPA2016D2 AMP | ✅ float32 直接跑; 可选 NPU 加速 CNN | 中 (Linux BSP + 驱动) | BOM ¥180-250; 成品 ¥400-600 | **小批量量产 (100-1k)** |
+| **AI ANC SoC** | Qualcomm QCC5181 / BES 2700 | ✅ int8 量化 CNN (TF Lite Micro) + NPU | 大 (定点移植, SDK适配) | BOM ¥80-150 (10k+起订) | **消费电子量产 (10k+)** |
+| **传统定点 DSP** | ADI SHARC / TI C55x | ❌ 内存不足以跑 M5 CNN, 需替换为轻量分类器 | 巨大 (全定点重写) | BOM ¥40-80 | 极限低成本 (无场景分类) |
+
+**推荐量产路径**：
+- **100-1000 台** → ARM Linux 定制板 (RK3568)，float32 代码零改动，成品 ¥400-600/台
+- **10k+ 台** → Qualcomm AI ANC SoC，需 int8 量化 CNN + SDK 移植，BOM ¥100-150/台
+- **展会/原型** → Windows 迷你主机，零移植，¥2200/台
+
+### 当前硬件 vs 升级方案差距
+
+| | 当前 (ASIO 单设备) | 方案B: ARM定制板 | 方案C: AI ANC SoC |
+|------|------|------|------|
+| NR | 4-9dB | 预计 6-15dB (校准后) | 预计 10-20dB (校准+NPU加速) |
+| F-A/F-B | 🔧 待重新测试 | ✅ 可恢复 | ✅ 可恢复 |
+| 时钟 jitter | ~0 (共时钟) | ~0 | ~0 |
+| 啸叫检测/反馈抵消 | ✅ | ✅ | ✅ |
+| CNN 场景分类 | ✅ M5 float32 | ✅ M5 float32 | ✅ M5 int8 量化 |
+| 独立运行 | ❌ 需PC | ✅ | ✅ |
+| 功耗 | PC ~30W | ~3-5W | ~0.2-0.5W |
+| 体积 | PC + 声卡 | 名片大小 PCB | 硬币大小 |
+| 成本 | ¥700-1500 + PC | ¥400-600/台 | ¥100-150/台 (BOM) |
+
+### 量产硬件方案 BOM 明细
+
+#### 方案 B: ARM Linux 定制板（推荐 100-1000 台量产路径）
+
+基于瑞芯微 RK3566/RK3568 平台，浮点代码零改动直接移植。
+
+| 元件 | 型号 | 功能 | 单价 (¥) | 数量 | 小计 |
+|------|------|------|----------|------|------|
+| SoC | Rockchip RK3566 (Cortex-A55 ×4 @1.8GHz) | 主控 + NPU (可选CNN加速) | 45 | 1 | 45 |
+| RAM | LPDDR4 512MB | 运行内存 | 15 | 1 | 15 |
+| Flash | eMMC 8GB | 系统 + 权重文件 | 20 | 1 | 20 |
+| ADC | PCM1865 (4-ch, 24-bit, 110dB SNR) | 麦克风采集 | 25 | 1 | 25 |
+| DAC | TLV320AIC3254 (stereo, I2S) | 扬声器输出 | 15 | 1 | 15 |
+| AMP | TPA2016D2 (2×1.7W Class-D) | 扬声器功放 | 8 | 1 | 8 |
+| 电源 | RT8059 + RT9013 | 3.3V/1.8V/1.2V/5V | 10 | 1 | 10 |
+| 晶振 | 24MHz ±10ppm | 系统时钟 | 2 | 1 | 2 |
+| PCB | 4层板, 50×50mm | — | 30 | 1 | 30 |
+| 被动元件 | 电阻/电容/电感/连接器 | — | 15 | 1 | 15 |
+| 驻极体麦 | CMA-4544PF-W (-44dB, 20-20kHz) | 参考+误差麦 | 3 | 4 | 12 |
+| 微型扬声器 | 20mm, 1W, 8Ω | 反噪声输出 | 8 | 2 | 16 |
+| 外壳 | 3D打印 / 开模 | 定制外壳 | 30 | 1 | 30 |
+| **BOM 合计** | | | | | **~243** |
+| 组装+测试 | 小批量手工 | | 100 | 1 | 100 |
+| **成品成本** | (100台小批量) | | | | **~350-500** |
+
+**软件移植工作量**：
+- Linux BSP (Yocto/Buildroot): 1 周
+- ALSA 替代 PortAudio (音频回调): 3-5 天 (改动 <200 行)
+- 交叉编译 (aarch64-gcc): 1 天
+- 测试调优: 1 周
+- **总计**: 2-3 周单人
+
+#### 方案 C: Qualcomm AI ANC SoC（10k+ 消费电子量产路径）
+
+| 元件 | 型号 | 功能 | 单价 (¥) |
+|------|------|------|----------|
+| SoC | QCC5181 (含 Kalimba DSP + NPU + BT + 4-ch ADC/2-ch DAC) | 全集成 | 35-50 |
+| Flash | 外挂 SPI NOR 16MB | 固件+权重 | 5 |
+| AMP | 内置 Class-D | 扬声器驱动 | 0 |
+| 电源 | 单节锂电池 PMIC | 供电 | 8 |
+| MEMS 麦 | 4×数字 MEMS (PDM接口) | 参考+误差 | 20 |
+| 扬声器 | 定制 15mm 动铁/动圈 | ANR 输出 | 15 |
+| PCB + 被动 + 外壳 | 量产 | | 30 |
+| **BOM 合计** (10k+量) | | | **~¥110-130** |
+
+**软件移植工作量**：
+- int8 量化 M5 CNN (TF Lite Micro / Qualcomm AI Engine): 2-3 周
+- 浮点→定点 FxNLMS + FIR: 2-3 周 (或用 QCC5181 内置浮点 DSP)
+- Qualcomm ADK 集成: 3-4 周
+- ANC 调谐 (Qualcomm ANC Designer): 1-2 周
+- 认证 (BQB/FCC/CE): 4-8 周
+- **总计**: 3-6 月团队 (2-3 人)
+
+#### 量产路径决策树
 
 ```
-[4×驻极体麦]──┬── [UMC404HD 或 Scarlett 4i4] ──USB── [Windows PC/笔记本]
-[小扬声器]  ──┘    (4进4出, 共时钟, ASIO驱动)
-
-新增: UMC404HD (¥600-800) + 驻极体麦×4 (¥20) + 扬声器 (¥15) + PAM8403 (¥10)
-状态: git revert 162d357 恢复 F-A/F-B, 预计 NR 10-18dB
+当前阶段: ASIO 声卡 + Windows PC (原型验证)
+        │
+        ├─ 需要脱离 PC?
+        │   ├─ 否 → Windows 迷你主机, ¥2200, 零移植, 适合展会/小批量
+        │   └─ 是 →
+        │       ├─ 量 < 1000 台?
+        │       │   └─ ARM Linux 定制板 (RK3568), BOM ¥240, 移植 2-3 周
+        │       └─ 量 > 10k 台?
+        │           └─ Qualcomm AI ANC SoC, BOM ¥120, 移植 3-6 月
+        │
+        └─ 核心瓶颈: 声学设计 + ANC 调谐 > 芯片选型
 ```
-
-### 独立运行（脱离电脑）
-
-上述方案均需 PC 提供算力。若要脱离电脑独立运行：
-
-| 路径 | 硬件 | 工作量 | 适用 |
-|------|------|--------|------|
-| **Windows 迷你主机** | Intel NUC / LattePanda (~¥1500) | **零**（代码直接跑） | 展会原型、小批量 |
-| **ARM Linux 板** | 树莓派 5 + 音频 HAT (~¥800) | 中等（PortAudio DLL→ALSA, Windows→POSIX） | 便携原型 |
-| **DSP 芯片** | ADI SHARC / Qualcomm ANC SoC | 巨大（全代码重写定点数, CNN不可行） | 量产 |
-
-**推荐路径**：原型阶段用 Windows 迷你主机（零移植成本），量产阶段移植到 ARM Linux 或定制 DSP。
-
-### 当前硬件 vs 方案B 差距
-
-| | 当前 (双USB) | 方案B (共时钟) |
-|------|------|------|
-| NR | 4-9dB | 预计 10-18dB |
-| F-A/F-B | ❌ 回退 | ✅ 恢复 |
-| 时钟 jitter | 几十ms | 0 |
-| 啸叫检测/反馈抵消/冷启动 | ✅ | ✅ |
-| 成本 | ¥30 | ¥800-1500 |
 
 ---
 
@@ -398,15 +635,15 @@ NR 可达 -10 到 -20 dB，用户感知为"开机嘭的一声"。
 {
   "audio": {
     "sample_rate": 48000,
-    "input_device": "YDM6MIC",
-    "output_device": "USB Audio",
+    "input_device": "ASIO 多通道声卡",
+    "output_device": "ASIO 多通道声卡",
     "input_channels": 6,
     "output_channels": 2,
     "latency_ms": 10
   },
   "anc": {
     "step_size": 0.0001,
-    "leak": 1e-5,
+    "leak": 1e-6,
     "mic_pre_gain": 5.0,
     "input_clip_max": 1.0,
     "output_limit": 1.0,
