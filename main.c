@@ -124,7 +124,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define SEC_LEN 1024
 #define DSP_DELAY 16
 #define MIC_PRE_GAIN  1.0f    /* 输入预增益 (离线已做峰值归一化, 默认1.0; >1.0模拟硬件前放) */
-#define FADE_LEN  16
+#define FADE_LEN  1600  /* Wc切换CrossFader时长 (100ms @16k, =20Hz×2周期) */
 
 /* ══════════════════════════════════════════════════════════
    主函数

@@ -25,7 +25,7 @@
 #define BP_LEN   1024
 #define SEC_LEN  1024
 #define DSP_DELAY 16
-#define FADE_LEN 16
+#define FADE_LEN 1600  /* Wc切换CrossFader时长 (100ms @16k, =20Hz×2周期, ≥FIR长度) */
 #define MIC_PRE_GAIN  10.0f    /* 输入数字预增益 (噪声源良好耦合时 8-10x 足够) */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */
 #define COLDSTART_MS  400     /* 冷启动 ramp 时长 ms (anti_out 0→1) */
