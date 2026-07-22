@@ -1,305 +1,244 @@
 # 代码审查报告 — GFANC FxNLMS 窗户开口降噪系统
 
-> 审查日期：2026-07-16
-> 审查范围：`main_realtime.c`、`src/fxnlms_mimo.c`、`src/scene_controller.c`、`src/fir_filter.c`、`src/howling_detect.c`、`src/cnn_m5_forward.c`、`src/binary_loader.c`、`src/calibrate_feedback.c` 及相关头文件
-> 
-> **状态更新 2026-07-22**：F-D (leak解耦) ✅ 已修复 · B-2 (陷波串状态) ✅ 已修复 · F-A/F-B 代码已回退待硬件验证恢复 · 新增 MinMax/CNN返回值/NaN保护 三项修复
+> 审查日期：2026-07-16 · 最后更新：2026-07-22
+> 审查范围：全部 C 源码及头文件
 
 ---
 
 ## 1. 总体评估
 
-代码整体模块划分清晰、离线仿真移植质量高。主要问题集中在：~~实时 FxNLMS 信号结构~~（✅ F-A 已修复）、~~fir_tick 取模~~（✅ §6.1 已修复）、跨线程数据竞争（§6.2）、无抗混叠重采样（P-1/P-2）、"固定反馈 IIR 环路"待实现（B-1）。其余 23 项已验证问题按严重度分级见速查表。
+代码模块划分清晰，离线仿真移植质量高。经 2026-07-22 多轮审查修复，已消除 17 项问题（含 2 项高危、5 项中危），剩余 14 项未修（1 项高危待跨平台处理、6 项中危、7 项低危/待实现）。当前 x86 Windows + ASIO 硬件上稳定运行。
 
 ---
 
-## 2. 架构一致性
+## 2. 问题总览
 
-### 2.1 慢速 CNN 环路 — ✅ 设计正确
+| 状态 | 编号 | 类别 | 严重度 | 问题 | 后果 | 修复 |
+|------|------|------|--------|------|------|------|
+| ✅ | F-A | 前馈 | 高 | 误差信号双重计入 | NR 理论上限 ~6dB | fxnlms_tick_rt 独立实时路径 |
+| 🔧 | F-B | 前馈 | 高 | 次级路径未实测校准 | Ŝ 模型不准, LMS 收敛慢 | ASIO 硬件重新校准后 git revert |
+| ❌ | F-C | 前馈 | 伪 | tanh 软限幅断点 | 无 — 三层 FIR 级联平滑, 声学影响远低于底噪 | FALSE |
+| ✅ | F-D | 前馈 | 中 | leak 因子无效 (1-1e-9) | Wc 长期漂移/饱和风险 | 与 step_size 解耦, leak=1e-6 |
+| ✅ | F-E | 前馈 | 中 | anti_spk 跨回调重置为 0 | fb_fir ~3% 错误样本, 抵消精度退化 | anti_spk_prev 持久化到 ctx |
+| ❌ | F-F | 前馈 | 中 | 反馈校准重采样失配 | NLMS 辨识精度下降 | 16k ZOH 激励替代 48k 白噪声 |
+| ❌ | F-G | 前馈 | 中 | 双扬声器反馈路径合并建模 | H0≠H1 时抵消不准 | 分别校准两条路径 |
+| — | F-H | 前馈 | 低 | fwd_only err 语义不一致 | 实时路径已不适用, 离线可忽略 | 维持现状 |
+| ✅ | F-I | 前馈 | 低 | acc_anti 在 mute/ramp 前累积 | 控制台 anti_rms 偏高 | 移至 mute/ramp 之后 |
+| ❌ | B-1 | 反馈 | — | 固定反馈 IIR 环路不存在 | 无反馈 ANC 控制层 | 待实现 feedback_iir.c |
+| ✅ | B-2 | 反馈 | 高 | 陷波 IIR 状态跨扬声器串用 | 通道间串扰失真 | 状态数组加 HW_S 维度 |
+| ❌ | B-3 | 反馈 | 低 | remove_notch 未被调用 | 无, 当前批量清除够用 | 保留 (逐频率管理预留) |
+| ❌ | S-1 | 场景 | 中 | 滞回检测渐变噪声失效 | 场景记忆污染 (新收敛 Wc 写入旧场景槽) | 锚点 probs 替代相邻帧比较 |
+| ❌ | S-2 | 场景 | 中 | 场景切换 ramp 首样本为 0 | 反噪声消失 400ms, "无感切换"不成立 | 切换只走 CrossFader, ramp 仅冷启动 |
+| ✅ | S-3 | 场景 | 低 | CrossFader 末帧 6% 跳变 | 已降至 0.06% (FADE_LEN=1600) | 100ms CrossFader (=20Hz×2 周期) |
+| ❌ | S-4 | 场景 | 低 | RMS 重标定抹除增益信息 | 预训练滤波器绝对增益丢失 | 离线数据验证必要性 |
+| ❌ | S-5 | 场景 | 伪 | MinMax 不减 min 与训练不匹配 | 无 — Python 训练代码公式一致 | FALSE |
+| — | S-6 | 场景 | 低 | CNN 输入延迟 ~1.0s | 1s 窗口是场景分类正确设计 | 记录即可, 双缓冲已消除样本丢失 |
+| ❌ | P-1 | 信号 | 中 | 48k→16k 抽取无抗混叠滤波 | >8kHz 折叠进通带, 虚假成分 | FIR 低通 (fc≈7kHz) |
+| ❌ | P-2 | 信号 | 中 | 16k→48k ZOH 内插无抗镜像 | 镜像频率可闻杂音 + 反馈回灌 | FIR 低通 |
+| ❌ | P-3 | 信号 | 低 | 限幅 ±1.0 (非 ±0.5) | 无, ±1.0 是 DAC 满幅, 正确 | 文档对齐 |
+| ❌ | P-4 | 信号 | 低 | 带通 FIR 群延迟 32ms | 绝对延迟叠加在因果裕度上 | 物理事实, 非 bug |
+| ✅ | §6.1 | 性能 | 高 | fir_tick 取模 idiv 占 142% 预算 | 回调预算 217%, 嵌入式不可行 | 双段线性循环, 零取模 |
+| 🔧 | §6.2 | 线程 | 高 | 主线程/回调对 fx.wc 等无同步 | x86 实测安全, ARM relaxed model 必崩 | 跨平台前修改 (影子缓冲+原子序号) |
+| ✅ | §6.3 | 性能 | 低 | CNN 每秒 calloc 4×1MB | 堆碎片化 | 静态缓冲单次分配 |
+| ❌ | §6.4 | 数值 | 伪 | 功率正则被 /(E·L) 缩小 | 无 — 数学推导证明 eps 未缩小 | FALSE |
+| ✅ | §6.5 | 安全 | 中 | 无 Wc 发散防线 | 系数暴涨无保护 (仅被动 safety_mute) | max\|Wc\|>5×stub_rms → 冻结 LMS |
+| ✅ | §6.6 | 内存 | 低 | rt_ctx_t ~211KB 在 main 栈上 | Windows 1MB 栈够用, 嵌入式危险 | 堆 calloc 分配 |
 
-- 实现位置：主线程循环，每积满 1 秒（16000 样本）触发一次 `scene_ctrl_process`，轮询周期 `Sleep(100)`。
-- **为何是 1Hz 而非更高频率**：场景分类区分的是噪声类型（马路/空调/工地），类型变化是秒级到分钟级的。1s 窗口保证足够频率分辨率做可靠分类，17ms 窗口（272 样本 @16kHz）低频分辨率仅 ~59Hz，无法可靠区分场景。且 CNN 推理 ~8ms/次，提到 60Hz 会吃掉 ~4 GMACs/s CPU 预算。
-- **"Delayless" 含义**：CNN 决策不在控制滤波器的信号路径上——它每 1 秒选择/混合一次 Wc 预设，FxNLMS 的逐样本自适应独立运行，不受 CNN 速度影响。1Hz 是这个架构的**正确设计频率**，不是待修复的 bug。
-- **17ms 备注**：早期设计设想，后确认不适用于场景分类用途。保留为设计决策记录。
-- 数据交接机制：~~旧版"填满即停→主线程清零"~~ **✅ 已修复 (2026-07-22)**。改为 `cnn_buf[2][FS_ANC]` 双缓冲：回调填满一块后 `InterlockedExchange` 原子标记就绪、立即切到另一块继续填充，主线程 `InterlockedExchange` 原子消费就绪块。`cnn_cnt`/`cnn_fill_idx` 仅回调访问，`cnn_buf_ready` 原子交换——消除数据竞争、零样本丢失。
-
-### 2.2 实时前馈 FxNLMS 环路 — ✅ 已修复 (2026-07-22, F-A)
-
-- 实现位置：PortAudio 回调，逐样本 @16kHz（62.5μs）✅。
-- ~~**核心问题**~~：~~`fxnlms_tick` 的 `err = disturbance + anti_est` 是为离线仿真设计的。实时版把误差麦实测信号（已含真实反噪声）作为 `disturbance` 传入，再叠加 `anti_est` → 反噪声被计入两次~~ **✅ 已修复**。
-- 修复方案：新增 `fxnlms_tick_rt` / `fxnlms_forward_rt`（`fxnlms_mimo.c`），实时路径独立于离线仿真：
-  - 输出：`anti[s] = Σ_k Wc[s,k] × x_ref[n-k]`（直接卷积带通参考，不经 Ŝ 模型）
-  - 梯度：实测误差麦信号 `err_meas` 直接驱动，不合成 `err = dist + anti_est`
-  - NR：模型估计反噪声 vs 实测残差 `(err² + anti_est²) / err²`
-- 离线 `fxnlms_tick` / `fxnlms_forward_only` 保留不动，两套路径互不影响。
-
-### 2.3 固定反馈 IIR 环路 — ❌ 不存在
-
-代码中**没有**任何"误差麦 → 固定 8 阶 IIR 带通(20-200Hz) → 扬声器"的反馈 ANC 控制器。实际存在的是两个不同的东西：
-
-| 架构描述中的模块 | 代码中实际存在的 |
-|---|---|
-| 固定反馈 IIR 控制器（8 阶级联双二阶，20-200Hz 带通） | **无** |
-| — | 反馈**路径抵消** FIR（256 taps，`main_realtime.c:153-159`）：消除扬声器→参考麦声泄漏，属于前馈环路的辅助，不是反馈控制器 |
-| — | 啸叫陷波 biquad（`src/howling_detect.c`）：最多 2 个二阶陷波，是安全机制，不是带通控制器 |
-
-同样，早期设计描述中的"固定反馈 IIR 环路"（8 阶 IIR 20-200Hz）在代码中并不存在——这是待实现的架构层模块（见 B-1），非代码缺陷。CNN 周期 1s 是场景分类的正确设计（见 §2.1）。
-
-### 2.4 执行频率与实时约束划分
-
-| 环路 | 设计 | 实际 | 满足实时约束？ |
-|---|---|---|---|
-| CNN 慢速环路 | 1s 帧 | 1s 帧 + 100ms 轮询，主线程执行 | ✅ 不阻塞回调 (场景分类正确设计, 见 §2.1) |
-| 前馈 FxNLMS | 逐样本 | 回调内逐样本 @16kHz | ✅ 回调预算 73% (fir_tick取模已消除, §6.1) |
-| 反馈 IIR | 待实现 | 不存在 (见 B-1) | — |
+> **图例**: ✅ 已修复 · 🔧 阻塞/待验证 · ❌ 未修复 · ❌ 伪错误(FALSE) · — 不适用/可忽略
 
 ---
 
-## 3. 硬编码值
+## 3. F 系列 — 前馈环路
 
-| 数值 | 位置 | 评估 | 建议 |
-|---|---|---|---|
-| `FS_HW=48000` / `FS_ANC=16000` | `main_realtime.c:20-21` | 结构性参数，编译期常量合理 | 保留宏，3:1 比率应派生（`FS_HW/FS_ANC`）并 `_Static_assert` 整除 |
-| `E=3, S=2, L=1024` | `main_realtime.c:22-24` | 合理为编译期常量，但与 `SC_S`、`sub_len/(15*2)` 重复定义 | 与 `scene_controller.h:9-11` 统一到一个头文件；加载 `.bin` 后校验长度一致 |
-| `BP_LEN=1024, SEC_LEN=1024` | `main_realtime.c:25-26` | **危险**：从文件加载却假设长度，无校验 | 用 `bin_load_float` 返回值校验，长度不符即报错退出 |
-| `DSP_DELAY=16`（1ms） | `main_realtime.c:27`、`346-352` | **不合理**：WASAPI + 96 帧缓冲的真实 I/O 往返延迟远大于 1ms（典型 10-30ms） | 必须实测（可复用反馈校准的 NLMS 代码），存入配置文件；见 §5.2-B |
-| `FADE_LEN=1600`（100ms） | `main_realtime.c:28` | ✅ 已修正 (2026-07-22), =20Hz×2周期, ≥FIR 64ms | 可配 |
-| `MIC_PRE_GAIN=10.0f` | `main_realtime.c:29` | 硬件相关整定值，换硬件即失效 | 移入配置文件；配合路线图中的自动增益标定 |
-| `MIC_CLIP_MAX=1.0f` | `main_realtime.c:30` | 值合理，但配套 tanh 限幅实现有不连续 bug（§5.2-C） | 修 bug 后可保留 |
-| `COLDSTART_MS=400` / `MUTE_HOLD_MS=1500` | `main_realtime.c:31-33` | 经验值，与 1s RMS 评估周期耦合（注释已说明） | 运行时可配；`MUTE_HOLD` 应表达为"覆盖 N 个 RMS 周期"而非独立毫秒数 |
-| `FB_LEN=256` | `main_realtime.c:35` | 与 `calibrate_feedback.c` 的 `FB_TAPS=256` 重复且必须相等 | 提取到共享头文件，或把长度写入 `.bin` 文件头 |
-| 输出/anti 钳位 `±1.0` | `main_realtime.c:203-204, 266-267` | 合理（DAC 满幅），但与架构文档的 ±0.5 不符 | 做成可配置 `output_limit`（路线图 config.json 已规划） |
-| `0.0001f, 1e-5f`（μ、leak） | `main_realtime.c:385` | μ 量级合理；**leak 实际无效**（见 §5.2-D） | 移入配置；leak 语义修正 |
-| `cos_sim < 0.8f`、`NR>3dB`、连续 3 帧 | `main_realtime.c:459-471` | 滞回阈值属整定参数 | 运行时可配 |
-| `probs[8]`、`k<8`、`8*sizeof(float)` | `main_realtime.c:416, 432, 496` | 魔数，应为 `SC_K` | 全部替换为 `SC_K` |
-| `15*2`（打印 L 用） | `main_realtime.c:331` | 魔数 = `SC_C*SC_S` | 替换 |
-| `96`（framesPerBuffer）、`0.01`（latency）、`6`/`2`（通道数）、`paWASAPI=6` | `main_realtime.c:394-397, 318` | 硬件绑定值散落在调用点 | 集中为配置块；打开流前校验设备通道数/采样率支持 |
-| `16000.0f` 字面量 ×4 处 | `howling_detect.c:135, 148, 208, 213` | 与 `FS_ANC` 重复 | 传参或引用统一宏 |
-| `HW_*` 系列（256/2/24/15dB/4/8/0.96/2） | `howling_detect.h:18-25` | 编译期常量位置合理，注释充分 ✅ | 阈值类（THRESH/PERSIST/R）可提为运行时配置 |
-| `CAL_SEC=4, NOISE_AMP=0.3, NLMS_MU=0.2, srand(42)` | `calibrate_feedback.c:23-26, 203` | 校准程序内合理 | 可保留 |
-| CNN 结构常量（K/CH/STEM_* 等） | `cnn_m5_forward.c:15-35` | 与训练模型绑定，编译期合理 | 换模型需重编译——若要可替换模型，应把结构描述写入导出文件 |
-| `Sleep(100)` | `main_realtime.c:414` | 引入最高 100ms 决策抖动 | 可用事件/条件变量替代轮询 |
-| BN epsilon `1e-5f`、功率正则 `1e-10f`、各处 `1e-12f` | `cnn_m5_forward.c:158`、`fxnlms_mimo.c:79`、`main_realtime.c:229` | 数值防护，位置合理 | 保留；`fxnlms` 正则项量纲问题见 §5.2 |
+#### F-A: 误差信号双重计入 ✅
+- **严重度**: 高
+- **后果**: `fxnlms_tick` 的 `err = dist + anti_est` 中 dist 是实测误差麦 (已含 S×anti), 再加 anti_est → 反噪声被计两次, NR 理论上限 ~6dB
+- **修复**: 新增 `fxnlms_tick_rt` / `fxnlms_forward_rt` (2026-07-22): anti=Wc⊗x_ref 直接卷积, 梯度用 err_meas 直接驱动
+- **位置**: `include/fxnlms_mimo.h`, `src/fxnlms_mimo.c`, `main_realtime.c`
 
-**总原则**：结构维度（E/S/L/K/C）→ 编译期常量 + 加载校验；声学/硬件整定值（增益、延迟、阈值、μ）→ 外部配置文件。路线图 §六 的 config.json 方案方向正确，应落实。
+#### F-B: 次级路径未实测 🔧
+- **严重度**: 高
+- **后果**: 使用 Python 仿真 Ŝ (不含 I/O 延迟), 与真实 S 存在相位偏差, LMS 收敛条件退化
+- **状态**: 源码已实现但随 162d357 revert。ASIO 硬件就绪后可重新校准。恢复: `git revert 162d357`
+- **位置**: `calibrate_secondary.c` (git 历史), `main_realtime.c` DSP_DELAY
 
----
+#### F-C: tanh 软限幅断点 ❌ FALSE
+- **严重度**: 伪错误
+- **分析**: 代码级 f(1.0)=1.0, f(1.001)≈0.762 确有跳变。但经 bp_fir(1024)→Ŝ(1040)→Wc(1024) 三层 FIR 级联平滑, 单样本跳变能量分散到声学输出底噪以下。当前 `<1.0 线性 + >1.0 软限幅` 是正确设计
+- **位置**: `main_realtime.c:130-131, 164-166`
 
-## 4. 可维护性
+#### F-D: leak 因子无效 ✅
+- **严重度**: 中
+- **后果**: 原公式 `wc *= (1 - step×leak)` → 1-1e-9, float32 下等同 1.0, Wc 无正则化
+- **修复**: 解耦为 `wc *= (1 - leak)`, leak=1e-6 (~1.5%/秒) (2026-07-22)
+- **位置**: `src/fxnlms_mimo.c:94`, `main.c:192`, `main_realtime.c:377`
 
-1. **模块化良好**：CNN、场景控制、FxNLMS、FIR、啸叫检测均为独立编译单元，权重全部外置 `.bin` —— 替换 CNN/滤波器组无需改算法代码 ✅。但**加载几乎零校验**（`binary_loader.c:6-22` 无 magic/长度/维度检查；`main_realtime.c:326-329` 未检查返回值，文件缺失 → NULL 解引用崩溃）。
-2. **`main_realtime.c` 承担过多**（~500 行）：PortAudio DLL 绑定、重采样、信号链、场景状态机、统计、UI 全在一个文件；回调函数 `audio_cb` 内联了整条信号链，**无法单独单元测试**。建议抽出 `anc_process_sample()` 纯函数。**→ 与 §6.2 (数据竞争修复) + 4.6 (耦合解耦) 合并处理，作为专项重构。**
-3. **注释质量不均**：啸叫模块注释优秀（原理+用法+状态机说明）；~~FxNLMS 的步长归一化有注释但语义存疑~~ **FALSE (2026-07-22)**；~~`main_realtime.c:73` 残留注释~~ ✅ 已清理；~~`ref_48k`/`err_48k` 命名误导~~ ✅ 已修复 (2026-07-22, → `ref_buf`/`err_buf`/`anti_buf`)。
-4. **死代码**（2026-07-22 清理）：
-   - ~~`decimate_3to1`/`interpolate_1to3`~~ ✅ 已删除 — 单通道裸函数，回调版本含通道拆分+NaN保护，无法替代
-   - ~~`fxnlms_update_wc`~~ ✅ 已删除 — 与 `set_wc` 字节级相同，零调用者
-   - `remove_notch`（`howling_detect.c:162-179`）：**保留**，后续反馈环路需逐频率管理
-5. ~~**重复的 PortAudio 绑定样板**~~ ✅ 已修复 (2026-07-22)。提取到 `include/pa_loader.h` + `src/pa_loader.c`，`main_realtime.c` 和 `calibrate_feedback.c` 各减少 ~40 行样板。`measure_drift.c` 保留独立简化版（独立工具）。
-6. **过度耦合点**：回调直接读写 `ctx->fx.wc`（交叉淡化时整块覆写，`main_realtime.c:171-177`），FxNLMS 内部状态被外部模块直接操纵——建议由 `fxnlms_*` API 封装淡化。**→ 与 §6.2 (数据竞争修复) + 4.2 (重构) 合并处理。单纯加 API 封装不解决竞态问题，假安全不如不封装。**
+#### F-E: anti_spk 跨回调重置 ✅
+- **严重度**: 中
+- **后果**: 每回调开头 `anti_spk={0,0}`, fb_fir 首个样本馈入 0 → 256 tap 中 ~3% 错误样本, 反馈抵消精度退化
+- **修复**: anti_spk_prev[S] 存入 rt_ctx_t, 回调首样本继承上轮回调末值 (2026-07-22)
+- **位置**: `main_realtime.c:58, 118-119, 253-254`
 
----
+#### F-F: 反馈校准重采样失配 ❌
+- **严重度**: 中
+- **后果**: 校准播 48k 白噪声 → 两路都最近邻 3:1 抽取 → NLMS 辨识 16k FIR。抽取后输入输出不再是 16k LTI 关系, 多相分量表现为不可建模噪声
+- **修复**: 校准激励改为 16k 白噪声经 ZOH ×3 播放, 与运行时输出路径一致
+- **位置**: `src/calibrate_feedback.c:230-237`
 
-## 5. 逻辑/算法错误
+#### F-G: 双扬声器反馈路径合并建模 ❌
+- **严重度**: 中
+- **后果**: 校准两声道播同一噪声, 辨识 H0+H1 之和; 运行时 `(anti0+anti1)/2` 经单 FIR。H0≠H1 时产生 `(H0-H1)(a0-a1)/2` 误差
+- **修复**: 分别校准两条路径, 运行两个独立 FIR
+- **位置**: `src/calibrate_feedback.c:93-96`, `main_realtime.c:125`
 
-### 5.1 慢速环路
+#### F-H: fwd_only err 语义不一致 —
+- **严重度**: 低 (实时不适用)
+- **分析**: 离线 `fwd_only` 的 err_out 只含 anti_est。F-A 修复后实时用 `fwd_rt` (不输出 err), 回调直接用 err_meas 统计。离线 100ms fade 可忽略
+- **位置**: `src/fxnlms_mimo.c:37-45`
 
-| # | 严重程度 | 问题 |
-|---|---|---|
-| S-1 | **中** | **滞回检测在渐变噪声下失效 + 场景记忆污染**：`cos_sim` 比较的是**相邻两帧** probs（`main_realtime.c:431-437`，`prev_probs` 每秒无条件更新于 `:496`）。若场景缓慢过渡（每帧 cos≈0.95 但 argmax 已永久改变），切换永不触发，`cur_scene_id` 停留旧值；此时收敛保存逻辑（`:459-465`）会把**新场景收敛出的 Wc 写进旧场景的记忆槽**。修复：cos 应对比"当前帧 vs 进入当前场景时的锚点 probs"，或增加"argmax 连续 N 帧 ≠ cur_scene 也触发切换"。 |
-| S-2 | **中** | **场景切换瞬间输出跳变为 0**：切换时 `ramp_cnt=RAMP_SAMPLES`（`:490`），而 ramp 公式 `1 - ramp_cnt/RAMP_SAMPLES` 首样本即为 **0**（`:248-253`）——反噪声瞬间消失再花 400ms 爬回，1ms CrossFader 完全被 ramp 掩盖，"无感切换"不成立；且期间自适应仍按"输出已全额播出"的假设更新（模型失配）。 |
-| S-3 | ~~低~~ | ~~**交叉淡化首尾**~~ ✅ 已修复 (2026-07-22)。FADE_LEN 16→1600 (100ms @16k, =20Hz×2周期, ≥FIR长度64ms), 末帧跳变 6.25%→0.0625%, 可忽略。 |
-| S-4 | 低 | **Blend/Wc 构造设计决策**：`construct_wc` 用 centroid 按 max 归一 + 截断 [0,1] 加权 15 个子滤波器，再**强制 RMS 对齐到"15 个子滤波器等权和"的 RMS** 并取反（`scene_controller.c:96-100`）。GFANC 软组合 + RMS 重标定——重标定会抹掉预训练滤波器隐含的绝对增益标定，需用离线数据验证必要性。 |
-| S-5 | 低 | ~~minmaxscaler 疑似不完整~~ **FALSE (2026-07-22 验证)**。Python 训练/推理三处 `minmaxscaler` 均使用 `data / (max - min)` 公式（不先减 min），C 端实现一致。阈值差异 (1e-6 vs 1e-10) 和静默填充策略 (全零 vs pass-through) 属安全强化，不影响语义。 |
-| S-6 | 低 | CNN 输入延迟：分类结果对应的是"上一秒"音频，加上轮询延迟约 1.0-1.1s 才生效——对准平稳场景分类可接受。~~"填满-丢弃"~~ 已改为双缓冲 (零样本丢失, §2.1)。 |
-
-### 5.2 前馈环路（最严重问题集中区）
-
-| # | 严重程度 | 问题 |
-|---|---|---|
-| ~~F-A~~ | ~~**高**~~ | ❌ **已回退 (2026-07-16)**。`fxnlms_tick_rt` 经 `tools/verify_fa.c` 验证正确 (SISO +11.4dB, MIMO +5.6dB)，但因 F-B 硬件阻塞连带 revert (`git revert 162d357`)。**2026-07-22 硬件已升级到 ASIO 共时钟声卡**，待 F-B 重新校准后可 `git revert 162d357` 恢复。原问题：(1) 实时版把误差麦实测信号作为 `disturbance` 传入，`fxnlms_tick` 再加一次 `anti_est` → `err ≈ d + 2·anti`，NR 理论上限 ~6dB。(2) 扬声器驱动信号被 Ŝ 模型二次滤波 + 对 3 条误差路径求和。 |
-| F-B | ~~**高**~~ | ❌ **已回退 (2026-07-16), 🔧 硬件就绪待重新校准**。`calibrate_secondary.exe` 源码已在 revert 中移除（`git revert 162d357`，仅残留 .exe 二进制）。原阻塞原因：双独立时钟 USB 设备流滑移 1484~1917ppm 导致 NLMS 辨识 ERLE≈0。**2026-07-22 硬件已升级到 ASIO 共时钟声卡**，可重新运行 `calibrate_feedback.exe` 验证时钟稳定性后再恢复 `calibrate_secondary.c` 源码。恢复方法：`git revert 162d357`。 |
-| ~~F-C~~ | ~~**中**~~ | ~~**tanh 软限幅不连续**~~ **FALSE (2026-07-22 全局分析)**：单行代码在 1.0 处确有 ~0.24 跳变，但经 bp_fir(1024) → Ŝ(1040) → Wc(1024) 三层 FIR 级联平滑后，声学输出影响远低于底噪。当前设计 `<1.0 线性通过, >1.0 软限幅` 是正确的——保护正常电平线性度（LMS 依赖），只在极端声压触发饱和防护。"全程 tanh"反而破坏正常信号的线性增益。 |
-| F-D | ~~**中**~~ | ✅ **已修复 (2026-07-22, commit e8771b0)**。leak 公式从 `wc *= (1 - step_size*leak)` 改为 `wc *= (1 - leak)`，与 step_size 解耦。leak 参数从 `1e-5f` 调整为 `1e-6f`（~1.5%/秒衰减，float32 可分辨）。位置：[src/fxnlms_mimo.c:94](src/fxnlms_mimo.c#L94)、[main.c:192](main.c#L192)、[main_realtime.c:393](main_realtime.c#L393)。 |
-| ~~F-E~~ | ~~**中**~~ | ~~**反馈抵消跨回调状态丢失**~~ ✅ 已修复 (2026-07-22): `anti_spk_prev` 存入 rt_ctx_t, 回调开头继承上一轮回调末值, 消除 fb_fir 延迟线中 ~3% 错误样本。 |
-| F-F | **中** | **反馈路径校准与运行时的重采样不匹配**：校准播放 48k 白噪声、录音后两路都做最近邻 3:1 抽取（`calibrate_feedback.c:230-237`）——抽取后输入输出之间**不再是 16k 速率的 LTI 关系**（非整数倍相位分量表现为不可建模噪声，NLMS 只能辨识 1/3 的多相分量）。而运行时的等效反馈路径是 `decimate ∘ H ∘ ZOH`。校准激励应改为"16k 白噪声经 ZOH 上采样到 48k 播放"，与运行时输出路径完全一致。 |
-| F-G | **中** | **双扬声器反馈路径被合并建模**：校准时两声道播同一噪声（`calibrate_feedback.c:93-98`），辨识出的是 H0+H1 之和；运行时用 `(anti0+anti1)/2` 过这一个 FIR（`main_realtime.c:156`）。当两路 anti 不相等时误差项为 `(H0−H1)(a0−a1)/2`。应分别校准两条路径、运行两个 FIR。 |
-| F-H | 低 | `fxnlms_forward_only`(离线) 的 `err_out` 只含 `anti_est` 不含 dist。~~实时路径已不适用 (F-A修复后 fwd_rt 不输出err, 回调直接用err_meas)~~。离线 100ms fade 窗口占整文件比例极小, 维持现状。 |
-| ~~F-I~~ | ~~低~~ | ~~**统计口径**~~ ✅ 已修复 (2026-07-22): `acc_anti` 移至 mute/ramp 之后累积, anti_rms 反映真实输出。 |
-
-### 5.3 反馈环路
-
-| # | 严重程度 | 问题 |
-|---|---|---|
-| B-1 | — | **架构模块待实现**：8 阶 IIR 20-200Hz 反馈控制器（见 §2.3），实现建议：双二阶级联 + Direct Form II Transposed + float 下每级系数单独设计（不要高阶直接型），20Hz 极点在 fs=16k 下 `r→0.9998`，需用 double 存状态防极限环。 |
-| B-2 | ~~**高**~~ | ✅ **已修复 (2026-07-22, commit e8771b0)**。IIR 状态数组从 `[HW_MAX_NOTCHES]` 扩展为 `[HW_S][HW_MAX_NOTCHES]`（HW_S=2）。`add_notch()` 初始化所有扬声器状态，`remove_notch()` 搬运所有扬声器状态，`howling_tick()` 两处 `notch_apply` 调用传入 `[s][i]` 索引。位置：[include/howling_detect.h](include/howling_detect.h#L26)、[src/howling_detect.c](src/howling_detect.c#L148-L253)。 |
-| B-3 | 低 | 陷波器本身（r=0.96 二阶）稳定 ✅；检测跳过 bin0/1 避开直流与工频 ✅；`HW_MAX_BIN=24`（1500Hz）与带通上限匹配 ✅。`remove_notch` 是死代码。 |
-
-### 5.4 信号通路汇总（重采样/限幅/输出映射)
-
-| # | 严重程度 | 问题 |
-|---|---|---|
-| P-1 | **中** | **48k→16k 抽取无抗混叠滤波**：最近邻取样（`main_realtime.c:141-146`），8-24kHz 内容全部折叠进 0-8k；其中 14.5-16k 折叠到 20-1500Hz **恰好落入带通通带**，成为参考/误差信号中的虚假成分。 |
-| P-2 | **中** | **16k→48k 内插为零阶保持**（`main_realtime.c:263-269`），16k 镜像频率成分直接送扬声器（仅受 ZOH sinc 微弱衰减），产生可闻镜像杂音，并进一步经反馈路径回灌参考麦。 |
-| P-3 | 低 | 限幅为 ±1.0（非架构文档所述 ±0.5），anti 在 FxNLMS 后钳位一次（`:201-205`）、输出前再钳位一次（`:266-267`），逻辑正确；2 扬声器交织映射 `out[2n]=spk0, out[2n+1]=spk1` 正确 ✅。 |
-| P-4 | 低 | 带通对 ref 与 err 使用同一 FIR（群延迟 512 样本=32ms 双方相同），Fx 与 dist 相对对齐不受影响 ✅——但绝对延迟叠加在因果裕度上，窗户场景需确认初级路径传播延迟 > 总处理延迟。 |
+#### F-I: acc_anti 累积时序 ✅
+- **严重度**: 低
+- **后果**: acc_anti 在 safety_mute/ramp 之前累积, 控制台显示值高于实际输出
+- **修复**: 移至 mute/ramp 之后 (2026-07-22)
+- **位置**: `main_realtime.c:249`
 
 ---
 
-## 6. 实时性与数值稳定性风险
+## 4. B 系列 — 反馈环路
 
-1. ~~**【高】回调 CPU 逼近预算**~~ ✅ 已修复 fir_tick 取模 (2026-07-22, 83a329d)：`fir_tick` 改双段线性循环消除 ~339k idiv/回调，回调预算 217%→73%。`xd_roll_write` 环形化留作独立优化（涉及 xd 读取 7 处，离线/实时共用存储格式）。
-2. **【高】跨线程数据竞争 (已知, x86暂安全)**：主线程/回调对 `fx.wc`（memcpy 8KB 非原子）、`fade_cnt`/`ramp_cnt`/`mute_hold`（读-改-写）无同步。当前 x86 Windows 上：64-bit memcpy 带宽(~50GB/s) 使 8KB 拷贝在 ~0.16μs 完成，远小于 62.5μs 样本周期，概率性重合极低，实测未观察到撕裂。`_cnt` 变量一次递减丢失对 1600+ 样本的过渡期影响可忽略。**跨平台前必修**：ARM relaxed memory model 下概率性重合大幅升高。修复方案见 §7.4（影子缓冲 + 原子序号）。
-3. ~~**【低】CNN calloc**~~ ✅ 已修复 (2026-07-22, 71948d2)：改为静态缓冲单次分配，后续复用，消除每1Hz calloc/free。
-4. **【中】除零/定义域**：`log10f`、cos 相似度、`construct_wc` 的 RMS 缩放均有 epsilon 防护 ✅；~~`fxnlms` 功率正则项被 `/(E*L)` 缩小~~ **FALSE (2026-07-22 验证)**：`inv_pwr = 1/((eps+sum_x2)/(E*L)) = (E*L)/(eps+sum_x2)`，eps 和信号功率同比例缩放，分母中 eps 仍为 `1e-10`，正则效果不受除法影响。`(E*L)` 因子成为等效步长的一部分，不影响正则化强度。
-5. ~~**【中】无 Wc 发散防线**~~ ✅ 已修复 (2026-07-22, 71948d2)：新增 max\|Wc\| > 5×stub_rms 检测 → 自动冻结 LMS 梯度更新。INIT/场景切换自动清除冻结。Leak (1e-6) 提供正则化。后续可加变化率检测和自动回退（路线图P1）。
-6. ~~**【低】rt_ctx_t 栈分配**~~ ✅ 已修复 (2026-07-22, 71948d2)：改为 `calloc` 堆分配。83 处 `ctx.`→`ctx->` 机械替换。
+#### B-1: 固定反馈 IIR 环路不存在 ❌
+- **严重度**: 架构模块待实现
+- **后果**: 无反馈 ANC 控制回路 (误差麦→IIR→扬声器), 仅有前馈路径
+- **修复**: 独立模块 `feedback_iir.c`: 4 级双二阶级联 (DF2T, double 状态), 20Hz 极点 r→0.9998 需 double 防极限环
+- **位置**: 待新建
 
----
+#### B-2: 陷波 IIR 状态跨扬声器串用 ✅
+- **严重度**: 高
+- **后果**: s=0/1 共用 x1/x2/y1/y2, 陷波激活时通道间注入串扰失真
+- **修复**: 状态数组扩展为 [HW_S][HW_MAX_NOTCHES] (2026-07-22)
+- **位置**: `include/howling_detect.h:45-46`, `src/howling_detect.c:148-253`
 
-## 7. 具体修改建议
-
-### 7.1 P0 — ~~修正实时 FxNLMS 信号结构（对应 F-A）~~ ✅ 已修复 (2026-07-22, fxnlms_tick_rt)
-
-```c
-/* fxnlms_mimo.h: 增加参考信号历史 */
-typedef struct {
-    float *wc;      /* [S*L] */
-    float *xd;      /* [E*S*L] 滤波参考(梯度用) */
-    float *x_hist;  /* [L]     原始带通参考(输出用) — 新增 */
-    ...
-} fxnlms_mimo_t;
-
-/* 实时版 tick: e 直接用实测误差, 输出用 Wc⊗x */
-void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
-                    const float *err_meas /*实测误差麦(带通)*/,
-                    float *anti_out)
-{
-    xd_roll_write(fx, Fx);
-    x_hist_push(fx, x_ref);
-
-    /* 物理输出: anti[s] = Σ_k Wc[s,k] * x[n-k]  (不再经过 Ŝ, 不再对 e 求和) */
-    for (int s = 0; s < S; s++) {
-        anti_out[s] = 0;
-        for (int k = 0; k < L; k++)
-            anti_out[s] += fx->wc[s*L+k] * fx->x_hist[k];
-    }
-
-    /* 梯度: w[s,k] -= μ/power[s] * Σ_e err_meas[e] * xd[e,s,k] */
-    ...
-}
-```
-
-主回调中删除 `err_sig = dist + anti_est` 的合成，`err_meas[e] = fir_tick(&bp_err[e], mic_e)` 直接作为误差；NR 统计改为"ANC 开/关对比"或用收敛前基线估计 dist。
-
-**⚠️ F-A 代码已于 `162d357` revert 移除，`tools/verify_fa.c` 亦随 revert 删除。恢复方法：`git revert 162d357`（需 F-B 先确认 ASIO 硬件校准可行）。**
-
-### 7.2 P0 — ~~实测次级路径与系统延迟（对应 F-B）~~ ❌ 已回退 (2026-07-16), ASIO就绪可重新校准
-
-新建 `calibrate_secondary.c`（复用 `calibrate_feedback.c` 的 NLMS 框架）：每只扬声器逐一播 ZOH 上采样的 16k 白噪声，用 3 只误差麦同时录音，NLMS 辨识 6 条 `Ŝ(e,s)`（含 I/O 往返延迟，**从而不再需要 `DSP_DELAY` 猜测值**），写入 `data/secondary_path_measured.bin`。运行时优先加载实测版本，缺失时回退仿真版并打印醒目警告。**⚠️ 源码已于 `162d357` revert 移除，可通过 `git revert 162d357` 恢复。**
-
-### 7.3 P0 — ~~修复啸叫陷波状态串用（对应 B-2）~~ ✅ 已修复 (2026-07-22, e8771b0)
-
-```c
-/* howling_detect.h */
-float x1[HW_MAX_NOTCHES][2], x2[HW_MAX_NOTCHES][2];  /* [notch][speaker] */
-float y1[HW_MAX_NOTCHES][2], y2[HW_MAX_NOTCHES][2];
-
-/* howling_tick 内 */
-for (int s = 0; s < S; s++)
-    for (int i = 0; i < hw->active_count; i++)
-        anti_spk[s] = notch_apply(anti_spk[s], hw->b1[i], hw->a1[i], hw->a2[i],
-                                  &hw->x1[i][s], &hw->x2[i][s],
-                                  &hw->y1[i][s], &hw->y2[i][s]);
-```
-
-（`add_notch`/`remove_notch` 同步清零/搬移二维状态。）
-
-### 7.4 P0 — 消除跨线程竞争（对应 §6.2）
-
-```c
-/* ctx 增加影子缓冲 + 原子序号 */
-float          wc_pending[S*L];
-volatile LONG  wc_seq;        /* 主线程发布, 回调消费 */
-
-/* 主线程 (替代 fxnlms_set_wc / 直接写 wc_cur): */
-memcpy(ctx->wc_pending, new_wc, sizeof(ctx->wc_pending));
-InterlockedIncrement(&ctx->wc_seq);
-
-/* 回调开头 (样本边界): */
-LONG seq = ctx->wc_seq;
-if (seq != ctx->wc_seq_seen) {
-    memcpy(ctx->wc_cur, ctx->wc_pending, sizeof(ctx->wc_cur));
-    memcpy(ctx->wc_old, ctx->fx.wc, ...);
-    ctx->fade_cnt = FADE_LEN;
-    ctx->wc_seq_seen = seq;
-}
-```
-
-场景记忆保存（主线程读 `fx.wc`）改为回调侧周期性快照到另一影子缓冲。
-
-### 7.5 P1 — ~~FIR 性能重写（对应 §6.1）~~ fir_tick 取模 ✅ 已修复, xd 环形化待实施
-
-```c
-gfanc_float_t fir_tick(fir_filter_t *f, gfanc_float_t x)
-{
-    double *dl = f->delay_line;
-    int N = f->n_taps, p = f->ptr;
-    dl[p] = (double)x;
-    double y = 0.0;
-    const gfanc_float_t *c = f->coeffs;
-    /* 两段线性循环, 无取模 */
-    int k = 0;
-    for (int i = p; i >= 0; i--) y += (double)c[k++] * dl[i];
-    for (int i = N-1; i > p;  i--) y += (double)c[k++] * dl[i];
-    f->ptr = (p + 1 == N) ? 0 : p + 1;
-    return (gfanc_float_t)y;
-}
-```
-
-`xd_roll_write` 改环形写指针（O(E·S) 而非 O(E·S·L)），点积循环按环形偏移读取；再考虑 `-O3 -march=native` 与 SIMD。
-
-### 7.6 P1 — 重采样加抗混叠/抗镜像（对应 P-1/P-2）
-
-48k 侧各加一个 ~63 阶 FIR 低通（fc≈7kHz）：输入端 4 通道滤波后再 3:1 取样；输出端先 3 倍零插值再低通（或多相实现，每 16k 样本 21 次 MAC/相位）。CPU 增量远小于现有 FxNLMS 负荷。
-
-### 7.7 P1 — 其余定点修复
-
-| 问题 | 修复 | 状态 |
-|---|---|---|
-| ~~tanh 限幅不连续（F-C）~~ | 三层FIR级联平滑, 声学影响远低于底噪; 当前线性区+软限幅设计正确 | ❌ FALSE |
-| anti_spk 跨回调重置（F-E） | 移入 `rt_ctx_t`，仅初始化时清零 | ❌ |
-| 反馈校准激励失配（F-F） | 校准程序生成 16k 噪声 → ZOH ×3 播放；两扬声器分别校准（F-G），运行两条 FIR | ❌ |
-| ramp 起点跳变（S-2） | 场景切换只走 CrossFader（加长到 10-100ms），不重触发 ramp；ramp 仅用于冷启动 | ❌ |
-| 滞回失效（S-1） | 保存"场景锚点 probs"；`cos(anchor, cur) < 0.8` 或 argmax 连续 3 帧偏离才切换 | ❌ |
-| ~~leak 无效（F-D）~~ | `wc *= (1-leak)`，leak=1e-6，与 step_size 解耦 | ✅ 2026-07-22 |
-| ~~啸叫陷波串状态（B-2）~~ | IIR 状态扩展为 `[HW_S][HW_MAX_NOTCHES]` | ✅ 2026-07-22 |
-| ~~MinMax不减min（S-5）~~ | Python 训练/推理均用 `data/(max-min)`，C 端一致 | ❌ FALSE |
-| ~~功率正则量纲（§6.4）~~ | `inv_pwr = (E*L)/(eps+sum)`，eps 实际未被缩小 | ❌ FALSE |
-| 功率正则量纲 | `power[s] = sum/(E*L) + 1e-10f;`（正则加在除法之后） | ❌ |
-| 加载零校验 | `bin_load_float` 后逐一断言长度 == 期望值（BP_LEN、E*S*SEC_LEN、SC_K*SC_S*SC_C、…），失败即退出 | ❌ |
-| 魔数 `8`/`15*2`/`16000.0f` | 统一替换为 `SC_K`/`SC_C*SC_S`/`FS_ANC` | ❌ |
-| 死代码 | 删除 `decimate_3to1`/`interpolate_1to3`/`remove_notch`/`fxnlms_update_wc` 或改为实际调用 | ❌ |
-| MinMax scaler 阈值/CNN返回值/NaN保护 | 见 commit e8771b0 中 FIX-1/2/3/6 | ✅ 2026-07-22 |
-
-### 7.8 P2 — 工程化
-
-1. 落实 `config.json`（路线图 §六），启动时加载：增益、μ、leak、阈值、淡化时长、设备名。
-2. 抽出 `anc_pipeline.c`（纯函数信号链）+ `pa_loader.c`（DLL 绑定），使 `main_realtime.c` 缩至 I/O 与调度；信号链用 WAV 回灌建立回归测试（与离线版输出比对）。
-3. "固定反馈 IIR 环路"（20-200Hz 反馈 ANC）作为独立模块 `feedback_iir.c` 待实现：4 级双二阶级联（DF2T、double 状态）、误差麦平均输入、输出与前馈 anti 求和后统一限幅。
+#### B-3: remove_notch 未被调用 ❌
+- **严重度**: 低
+- **后果**: 无, 当前 `active_count=0` 批量清除够用
+- **状态**: 保留 — 后续反馈环路需逐频率管理时直接启用
+- **位置**: `src/howling_detect.c:162-179`
 
 ---
 
-## 附：问题严重度速查
+## 5. S 系列 — 慢速环路 (CNN/场景)
 
-| 等级 | 编号 | 一句话 |
-|---|---|---|
-| ~~高~~ | ~~F-A~~ | ~~误差双重计入 + Ŝ 二次滤波~~ ✅ 已修复 (2026-07-22, fxnlms_tick_rt 独立实时路径) |
-| ~~高~~ | ~~F-B~~ | ~~次级路径延迟/校准~~ ❌ 已回退, ASIO硬件就绪可重新校准 (`git revert 162d357`) |
-| 高 | §6.2 | 跨线程数据竞争 (x86实测安全, 跨平台前必修) |
-| ~~高~~ | ~~§6.1~~ | ~~fir_tick 取模~~ ✅ 已修复 (2026-07-22), xd 环形化待定 |
-| ~~高~~ | ~~B-2~~ | ~~啸叫陷波状态跨扬声器串用~~ ✅ 已修复 |
-| ~~中~~ | ~~F-D~~ | ~~leak 因子无效~~ ✅ 已修复 |
-| 中 | S-1, S-2, F-F, F-G, P-1, P-2 | 滞回/ramp/校准/混叠 |
-| 低 | S-4, S-6, F-H, B-3, P-3, P-4 | Blend/死代码 |
-| ~~中~~ | ~~S-5, §6.4~~ | ~~MinMax~~ / ~~功率正则~~ **FALSE** |
-| 🆕 已修复 | F-A, F-D, B-2, S-3, F-I, §6.1, §6.3, §6.5, §6.6, FIX-1~3,6 | 2026-07-22 系列修复 |
+#### S-1: 滞回检测渐变噪声失效 ❌
+- **严重度**: 中
+- **后果**: cos_sim 比较相邻两帧 probs, 渐变场景 cos 始终 >0.8 但 argmax 已永久改变 → 切换永不触发 → 新场景收敛出的 Wc 写入旧场景记忆槽
+- **修复**: 保存"场景锚点 probs"; `cos(anchor, cur) < 0.8` 或 argmax 连续 3 帧偏离才切换
+- **位置**: `main_realtime.c:442-448, 464-507`
+
+#### S-2: 场景切换 ramp 首样本为 0 ❌
+- **严重度**: 中
+- **后果**: 切换时 `ramp_cnt=RAMP_SAMPLES`, ramp=0 → 反噪声瞬间消失 400ms, CrossFader(1ms) 完全被掩盖
+- **修复**: 场景切换只走 CrossFader (FADE_LEN=1600), ramp 仅用于冷启动
+- **位置**: `main_realtime.c:483, 236-241`
+
+#### S-3: CrossFader 末帧跳变 ✅
+- **严重度**: 低
+- **后果**: FADE_LEN=16 时末帧 6.25%→0 跳变 → FADE_LEN=1600 后 0.0625%
+- **修复**: FADE_LEN=1600 (100ms = 20Hz×2 周期) (2026-07-22)
+- **位置**: `main_realtime.c:28`, `main.c:127`
+
+#### S-4: Blend/Wc RMS 重标定 ❌
+- **严重度**: 低
+- **后果**: 构造 Wc 后强制 RMS 对齐 stub_rms, 抹除 pre-trained 滤波器隐含的绝对增益信息
+- **修复**: 离线数据验证必要性, 或改为 L2 归一化保持向量方向
+- **位置**: `src/scene_controller.c:110-124`
+
+#### S-5: MinMax 不减 min ❌ FALSE
+- **严重度**: 伪错误
+- **分析**: Python 训练/推理三处 minmaxscaler 均用 `data/(max-min)`, C 端一致
+- **位置**: `src/scene_controller.c:48`
+
+#### S-6: CNN 输入延迟 ~1.0s —
+- **严重度**: 低 (设计特性)
+- **后果**: 场景分类结果对应 ~1.0s 前音频, 平稳场景无影响
+- **状态**: 双缓冲已消除样本丢失, 1s 窗口是分类正确设计
+- **位置**: `main_realtime.c:62-66, 137-143`
+
+---
+
+## 6. P 系列 — 信号通路
+
+#### P-1: 48k→16k 抽取无抗混叠 ❌
+- **严重度**: 中
+- **后果**: 最近邻取样, >8kHz 内容全部折叠进 0-8k; 14.5-16k 折叠到 20-1500Hz 通带内
+- **修复**: 48k 侧各通道加 ~63 阶 FIR 低通 (fc≈7kHz) 后 3:1 取样
+- **位置**: `main_realtime.c:141-146`
+
+#### P-2: 16k→48k ZOH 无抗镜像 ❌
+- **严重度**: 中
+- **后果**: 16k 镜像频率直接送扬声器 → 可闻杂音 + 反馈回灌参考麦
+- **修复**: 先 3 倍零插值再低通 (或多相实现)
+- **位置**: `main_realtime.c:265-272`
+
+#### P-3: 限幅 ±1.0 vs 架构文档 ±0.5 ❌
+- **严重度**: 低
+- **后果**: ±1.0 是 DAC 满幅, 正确值; 文档需对齐
+- **位置**: `main_realtime.c:179-181, 267-269`
+
+#### P-4: 带通 FIR 群延迟 32ms ❌
+- **严重度**: 低
+- **后果**: (1024-1)/(2×16000) = 32ms, 叠加在因果裕度上
+- **状态**: 物理事实, 非 bug; 窗户场景需确认初级路径延迟 > 总处理延迟
+- **位置**: `main_realtime.c:317-322`
+
+---
+
+## 7. §6 系列 — 实时性/数值/安全
+
+#### §6.1: fir_tick 取模性能 ✅
+- **严重度**: 高
+- **后果**: `(p-k+N)%N` idiv ×339k/回调 → 回调预算 217%, 嵌入式必丢帧
+- **修复**: 双段线性循环 `i=p→0, N-1→p+1` (2026-07-22), 预算降至 73%
+- **位置**: `src/fir_filter.c:40-45`
+
+#### §6.2: 跨线程数据竞争 🔧
+- **严重度**: 高 (x86 暂安全)
+- **后果**: 主线程 memcpy 8KB fx.wc 与回调梯度更新竞争, x86 带宽大+样本周期 62.5μs → 概率性重合极低; ARM relaxed model 下概率大幅升高
+- **修复**: 跨平台前实施 — 影子缓冲 + InterlockedExchange 序号 (§7.4)
+- **位置**: `main_realtime.c:414, 151, 453-484`
+
+#### §6.3: CNN calloc 4MB/次 ✅
+- **严重度**: 低
+- **后果**: 每秒 calloc/free 4MB, Windows 堆无压力但跨平台需注意
+- **修复**: 静态缓冲单次分配复用 (2026-07-22)
+- **位置**: `src/cnn_m5_forward.c:223-231`
+
+#### §6.4: 功率正则量纲 ❌ FALSE
+- **严重度**: 伪错误
+- **分析**: `inv_pwr = (E·L)/(eps + Σx²)`, eps 与信号功率同比例缩放, 实际 eps=1e-10 未缩小
+- **位置**: `src/fxnlms_mimo.c:76-84`
+
+#### §6.5: Wc 发散防线 ✅
+- **严重度**: 中
+- **后果**: 仅被动 safety_mute (err>ref), 无系数监控/变化率检测/自动回退
+- **修复**: 每秒检查 max|Wc| > 5×stub_rms → freeze_lms (2026-07-22), INIT/切换清除
+- **位置**: `include/fxnlms_mimo.h:13`, `src/fxnlms_mimo.c:127`, `main_realtime.c:451-461`
+
+#### §6.6: rt_ctx_t 栈分配 ✅
+- **严重度**: 低
+- **后果**: ~211KB 在 main 栈上, Windows 1MB 够用, 嵌入式栈 <256KB 则溢出
+- **修复**: calloc 堆分配, 83 处 ctx.→ctx-> (2026-07-22)
+- **位置**: `main_realtime.c:324`
+
+---
+
+## 附: 2026-07-22 新增修复 (不在原始审查编号中)
+
+| 编号 | 问题 | 后果 | 修复 |
+|------|------|------|------|
+| FIX-1 | MinMax scaler 阈值 1e-10 → 静默输入爆炸 | CNN 输入 Inf → NaN → Wc 随机 | 1e-6 阈值 + 零填充 |
+| FIX-2 | cnn_m5_forward 返回值未检查 | malloc 失败后 Wc 用垃圾数据 | 检查回退到上一帧场景 |
+| FIX-3 | NaN/Inf 无声传播至 DAC | 可能损坏硬件 | isfinite 保护 |
+| FIX-4 | Wc 退化至零无告警 | ANC 静默时无法排查 | stderr 告警 (限 3 次) |
+| FIX-5 | CNN 双缓冲 + 原子交接 | 数据竞争 + 样本丢失 | InterlockedExchange 交接 |
+| FIX-6 | pa_loader 共享层提取 | ~40 行 PA 样板重复 3 处 | pa_loader.h/.c |
+| FIX-7 | FADE_LEN 16→1600 | CrossFader 1ms 硬切换 | 100ms 平滑过渡 |
