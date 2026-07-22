@@ -70,7 +70,7 @@ typedef struct {
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
 
     /* 48k 重采样缓冲 */
-    float *ref_48k, *anti_48k, *err_48k; /* 在回调内部分配? 用固定大小 */
+    float *ref_48k, *anti_48k, *err_48k; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
     int    dec_phase;
 
     /* 统计 */
@@ -114,7 +114,7 @@ typedef struct { int structVersion; const char *name; int hostApi, maxInputChann
 
 #define PA_LOAD(fn) p_##fn = (void*)GetProcAddress(pa_dll, #fn)
 
-/* 3:1 抽取 (简单线性) */
+/* 3:1 抽取/内插 — 预留工具函数, 后续反馈环路扩展时使用 */
 static void decimate_3to1(const float *in, int in_len, float *out) {
     for (int i = 0; i < in_len / 3; i++) out[i] = in[i*3];
 }

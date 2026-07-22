@@ -83,8 +83,11 @@
 
 1. **模块化良好**：CNN、场景控制、FxNLMS、FIR、啸叫检测均为独立编译单元，权重全部外置 `.bin` —— 替换 CNN/滤波器组无需改算法代码 ✅。但**加载几乎零校验**（`binary_loader.c:6-22` 无 magic/长度/维度检查；`main_realtime.c:326-329` 未检查返回值，文件缺失 → NULL 解引用崩溃）。
 2. **`main_realtime.c` 承担过多**（~500 行）：PortAudio DLL 绑定、重采样、信号链、场景状态机、统计、UI 全在一个文件；回调函数 `audio_cb` 内联了整条信号链，**无法单独单元测试**。建议抽出 `anc_process_sample()` 纯函数（输入 4 通道样本 → 输出 2 通道样本），使其可用 WAV 回灌做回归测试。
-3. **注释质量不均**：啸叫模块注释优秀（原理+用法+状态机说明）；FxNLMS 的步长归一化有注释但语义存疑（`power` 对 E 求和后除以 `E*L`，正则项 `1e-10` 被一并缩小 6144 倍，`fxnlms_mimo.c:76-84`）；`main_realtime.c:73` 残留 `/* 在回调内部分配? 用固定大小 */` 未决问题注释；`ref_48k`/`err_48k` 实际存的是 **16k 速率**数据，命名误导。
-4. **死代码**：`decimate_3to1`/`interpolate_1to3`（`main_realtime.c:117-124`）定义了但回调里是手写循环；`remove_notch`（`howling_detect.c:160-175`）从未被调用（释放路径直接 `active_count=0`）；`fxnlms_update_wc` 与 `fxnlms_set_wc` 完全相同。
+3. **注释质量不均**：啸叫模块注释优秀（原理+用法+状态机说明）；~~FxNLMS 的步长归一化有注释但语义存疑（`power` 对 E 求和后除以 `E*L`，正则项 `1e-10` 被一并缩小 6144 倍，`fxnlms_mimo.c:76-84`）~~ **FALSE (2026-07-22)**：`inv_pwr=(E*L)/(eps+sum)`，eps 未缩小；`main_realtime.c:73` 残留 `/* 在回调内部分配? 用固定大小 */` 未决问题注释；`ref_48k`/`err_48k` 实际存的是 **16k 速率**数据，命名误导。
+4. **死代码**（2026-07-22 已标注为预留）：
+   - `decimate_3to1`/`interpolate_1to3`（`main_realtime.c:117-124`）：**预留工具函数**，当前回调手写抽取/内插（含通道拆分+NaN保护），后续反馈环路扩展时可复用
+   - `remove_notch`（`howling_detect.c:162-179`）：**预留**，当前释放路径直接 `active_count=0` 批量清除，后续反馈环路需逐频率管理时启用
+   - `fxnlms_update_wc`（`fxnlms_mimo.c:19`）：**预留**，当前与 `fxnlms_set_wc` 实现相同，后续可差异化（加锁/校验等）
 5. **重复的 PortAudio 绑定样板**在 `main_realtime.c` 与 `calibrate_feedback.c` 各一份（约 60 行），应抽出 `pa_loader.h/.c`。
 6. **过度耦合点**：回调直接读写 `ctx->fx.wc`（交叉淡化时整块覆写，`main_realtime.c:171-177`），FxNLMS 内部状态被外部模块直接操纵——建议由 `fxnlms_*` API 封装淡化。
 

@@ -16,6 +16,7 @@ void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc)
     { memcpy(fx->wc, wc, fx->S * fx->L * sizeof(float)); }
 
+/* 预留: 运行时更新 Wc (当前与 set_wc 同实现, 后续可加锁/校验等差异化逻辑) */
 void fxnlms_update_wc(fxnlms_mimo_t *fx, const float *wc)
     { memcpy(fx->wc, wc, fx->S * fx->L * sizeof(float)); }
 
