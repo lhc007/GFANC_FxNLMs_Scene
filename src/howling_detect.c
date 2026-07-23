@@ -152,6 +152,7 @@ static int add_notch(howling_detect_t *hw, float freq)
         hw->y1[s][idx] = hw->y2[s][idx] = 0;
     }
     hw->active_freqs[idx] = freq;
+    hw->notch_age[idx] = 0;  /* 新陷波器从0开始计数 */
     hw->active_count++;
     return idx;
 }
@@ -207,6 +208,9 @@ void howling_tick(howling_detect_t *hw, float err_sample,
     /* 满一帧: DFT 检测 */
     hw->buf_pos = 0;
 
+    /* 递增所有活动陷波器的帧龄 (CR-2: 最小保持时间) */
+    for (int i = 0; i < hw->active_count; i++) hw->notch_age[i]++;
+
     /* 复制并加窗 */
     float frame[HW_FFT_N];
     memcpy(frame, hw->buf, HW_FFT_N * sizeof(float));
@@ -242,8 +246,28 @@ void howling_tick(howling_detect_t *hw, float err_sample,
         if (hw->active_count > 0 && hw->candidate_count == 0) {
             hw->release_timer++;
             if (hw->release_timer >= HW_RELEASE) {
-                /* 释放所有陷波器 (啸叫已消失) */
-                hw->active_count = 0;
+                /* 只释放已超过最小保持时间的陷波器 (CR-2修复: 防释放死循环) */
+                int new_count = 0;
+                for (int i = 0; i < hw->active_count; i++) {
+                    if (hw->notch_age[i] < HW_MIN_HOLD) {
+                        /* 未到最小保持时间, 保留陷波器 (压缩到前面) */
+                        if (new_count != i) {
+                            hw->b1[new_count] = hw->b1[i];
+                            hw->a1[new_count] = hw->a1[i];
+                            hw->a2[new_count] = hw->a2[i];
+                            hw->active_freqs[new_count] = hw->active_freqs[i];
+                            hw->notch_age[new_count] = hw->notch_age[i];
+                            for (int s = 0; s < HW_S; s++) {
+                                hw->x1[s][new_count] = hw->x1[s][i];
+                                hw->x2[s][new_count] = hw->x2[s][i];
+                                hw->y1[s][new_count] = hw->y1[s][i];
+                                hw->y2[s][new_count] = hw->y2[s][i];
+                            }
+                        }
+                        new_count++;
+                    }
+                }
+                hw->active_count = new_count;
                 hw->release_timer = 0;
             }
         }

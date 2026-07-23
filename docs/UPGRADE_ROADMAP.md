@@ -253,7 +253,7 @@ ramp 400ms + mute_hold 1500ms + CrossFader 100ms。场景切换仅走 CrossFader
 
 **前置条件**：跨平台移植 — ARM relaxed memory model 下概率性重合大幅升高，x86 上实测安全。
 
-**修复**：影子缓冲 + `InterlockedExchange` 序号（见 CODE_REVIEW §7.4）。
+**修复**：影子缓冲 + `InterlockedExchange` 序号（见 COMPREHENSIVE_REVIEW.md 附录 B §6.2）。
 
 ### TODO-1: Wc Max 归一化低权重伪峰 🔶
 

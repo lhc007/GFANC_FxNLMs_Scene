@@ -14,8 +14,8 @@ typedef struct {
     volatile int freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 */
 } fxnlms_mimo_t;
 
-void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
-                 float step_size, float leak);
+int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
+                 float step_size, float leak);  /* 返回0=成功, -1=OOM */
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc);
 
 /* ── 离线仿真 (保留, 互不影响) ── */

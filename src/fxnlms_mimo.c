@@ -4,7 +4,7 @@
 #include <math.h>
 #include "fxnlms_mimo.h"
 
-void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
+int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak)
 {
     fx->E = E; fx->S = S; fx->L = L;
@@ -12,6 +12,13 @@ void fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
     fx->wc     = (float *)calloc(S * L,     sizeof(float));
     fx->xd     = (float *)calloc(E * S * L, sizeof(float));
     fx->x_hist = (float *)calloc(L,         sizeof(float));
+    fx->freeze_lms = 0;
+    if (!fx->wc || !fx->xd || !fx->x_hist) {
+        free(fx->wc); free(fx->xd); free(fx->x_hist);
+        fx->wc = NULL; fx->xd = NULL; fx->x_hist = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc)

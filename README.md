@@ -163,7 +163,7 @@ GFANC_FxNLMs_Scene/
 │   └── ...
 │
 ├── docs/                  文档
-│   ├── CODE_REVIEW.md     代码审查报告（问题追踪）
+│   ├── COMPREHENSIVE_REVIEW.md  综合审查报告（架构·算法·问题追踪）
 │   ├── UPGRADE_ROADMAP.md 升级路线图
 │   └── micphone.md        麦克风数据手册
 │

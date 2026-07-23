@@ -36,6 +36,12 @@
 #define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
 #define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
 
+/* ── 运行时参数 (CRC-1): 环境变量 GFANC_* 可覆盖编译期 #define ── */
+static float   cfg_mic_gain  = MIC_PRE_GAIN;
+static float   cfg_step      = 0.0001f;
+static int     cfg_ramp_ms   = COLDSTART_MS;
+static int     cfg_mute_ms   = MUTE_HOLD_MS;
+
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
     /* ANC 模块 */
@@ -73,6 +79,10 @@ typedef struct {
     int    cur_scene_id;
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
     float  anchor_probs[SC_K];    /* 进入当前场景时的probs锚点 (S-1修复) */
+    int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
+    int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
+    int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
+    volatile int peak_mute;       /* 峰值快检测触发静音 */
 
     /* 48k 重采样缓冲 */
     float *ref_buf, *anti_buf, *err_buf; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
@@ -131,7 +141,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 if (ctx->fb_fir[s].coeffs)
                     fb_est += fir_tick(&ctx->fb_fir[s], anti_spk[s]);
         }
-        float ref_sample  = (ref_raw - fb_est) * MIC_PRE_GAIN;
+        float ref_sample  = (ref_raw - fb_est) * cfg_mic_gain;
         /* 输入软限幅: tanh 防止吹气/冲击导致 FIR 饱和 → 非线性失真 → 发散 */
         if      (ref_sample >  MIC_CLIP_MAX) ref_sample =  tanhf(ref_sample);
         else if (ref_sample < -MIC_CLIP_MAX) ref_sample = -tanhf(-ref_sample);
@@ -168,7 +178,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
         float err_meas[E];
         for (int e = 0; e < E; e++) {
-            float es = ctx->err_buf[n*3+e] * MIC_PRE_GAIN;
+            float es = ctx->err_buf[n*3+e] * cfg_mic_gain;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
@@ -185,6 +195,18 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
             if (anti_spk[s] > 1.0f) anti_spk[s] = 1.0f;
             if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
+        }
+
+        /* 峰值快检测: 连续10样本|anti|>0.95 → 立即静音 (CR-12, 0.6ms响应 vs 原1秒) */
+        {   int peak = 0;
+            for (int s = 0; s < S; s++)
+                if (fabsf(anti_spk[s]) > 0.95f) peak = 1;
+            if (peak) {
+                if (++ctx->peak_hold_cnt >= 10) ctx->peak_mute = 1;
+            } else {
+                ctx->peak_hold_cnt = 0;
+                ctx->peak_mute = 0;  /* 峰值恢复, 解除快检测静音 */
+            }
         }
 
         /* 啸叫检测 + 陷波 (钳位后, 统计前) */
@@ -234,8 +256,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
-        /* 安全静音时输出零 (冷启动抑制期内不触发) */
-        if (ctx->safety_mute) { anti_spk[0] = 0; anti_spk[1] = 0; }
+        /* 安全静音时输出零 (冷启动抑制期内不触发). peak_mute=快检测, safety_mute=慢检测 */
+        if (ctx->safety_mute || ctx->peak_mute) { anti_spk[0] = 0; anti_spk[1] = 0; }
 
         /* 冷启动 ramp: INIT/RESET 后 anti_out 从 0 平滑渐入 */
         if (ctx->ramp_cnt > 0) {
@@ -286,8 +308,119 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
    ══════════════════════════════════════════════════════════ */
 /* pa_init() → src/pa_loader.c */
 
+/* ── 主循环辅助函数 (CR-4: 从 ~110 行 while 块拆分) ── */
+
+static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
+                              const float *probs) {
+    printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1fdB anti=%.4f%s%s gain=%.0fx cb=%d\n",
+           new_scene, probs[new_scene], cos_sim,
+           ctx->nr_level, ctx->anti_rms,
+           ctx->safety_mute ? " [MUTE]" : "",
+           ctx->ramp_cnt > 0 ? " [RAMP]" : "",
+           MIC_PRE_GAIN, ctx->callback_count);
+    printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
+           ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
+           ctx->ref_rms, cfg_mic_gain);
+    printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
+           ctx->err_rms, ctx->anti_est_rms);
+    if (ctx->fb_active)
+        printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx->fb_rms);
+    if (ctx->hw.active_count > 0 || ctx->hw.dominant_db > HW_THRESH_DB * 0.7f)
+        printf("       HW:  f=%.0fHz peak=%.1fdB notches=%d%s\n",
+               ctx->hw.dominant_freq, ctx->hw.dominant_db,
+               ctx->hw.active_count,
+               ctx->hw.active_count > 0 ? " [NOTCH]" : "");
+}
+
+static void check_wc_divergence(rt_ctx_t *ctx) {
+    float wc_max = 0;
+    for (int i = 0; i < S*L; i++) {
+        float a = fabsf(ctx->fx.wc[i]);
+        if (a > wc_max) wc_max = a;
+    }
+    if (wc_max > ctx->sc.stub_rms * 5.0f) {
+        if (!ctx->fx.freeze_lms && !ctx->freeze_permanent) {
+            ctx->fx.freeze_lms = 1;
+            ctx->freeze_timer = 60;
+            printf("[WARN] Wc diverged! max|Wc|=%.3f "
+                   "> 5×stub(%.3f), LMS frozen (60s retry)\n",
+                   wc_max, ctx->sc.stub_rms);
+        }
+    } else if (ctx->fx.freeze_lms && ctx->freeze_timer > 0 && !ctx->freeze_permanent) {
+        ctx->freeze_timer--;
+        if (ctx->freeze_timer <= 0) {
+            ctx->fx.freeze_lms = 0;
+            ctx->freeze_timer = -3;
+            printf("[INFO] Wc freeze retry — LMS unfrozen, watching 3s...\n");
+        }
+    } else if (!ctx->fx.freeze_lms && ctx->freeze_timer < 0) {
+        ctx->freeze_timer++;
+        if (ctx->freeze_timer >= 0)
+            printf("[INFO] Wc stable after unfreeze, normal operation resumed\n");
+    }
+    if (ctx->freeze_timer < 0 && wc_max > ctx->sc.stub_rms * 5.0f) {
+        ctx->fx.freeze_lms = 1;
+        ctx->freeze_permanent = 1;
+        ctx->freeze_timer = 0;
+        printf("[WARN] Wc diverged again during watch period! "
+               "LMS permanently frozen until scene switch\n");
+    }
+}
+
+static void check_convergence(rt_ctx_t *ctx) {
+    if (ctx->nr_level > 3.0f && !ctx->safety_mute) {
+        ctx->converged_frames++;
+        if (ctx->converged_frames >= 3) {
+            memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+            ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
+            ctx->converged_frames = 0;
+        }
+    } else {
+        ctx->converged_frames = 0;
+    }
+}
+
+static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
+                               float cos_sim, float *probs) {
+    if (cos_sim >= 0.8f || new_scene == ctx->cur_scene_id) return;
+
+    /* 保存旧场景的当前 Wc */
+    memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+    ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
+
+    /* 新场景: 有记忆就用记忆, 否则用 CNN 通用 Wc */
+    if (ctx->scene_wc_valid[new_scene]) {
+        memcpy(ctx->wc_cur, ctx->scene_wc[new_scene], S*L*sizeof(float));
+        printf("  -> RESET s%d→s%d (restored adapted Wc)\n",
+               ctx->cur_scene_id, new_scene);
+    } else {
+        ctx->scene_wc_valid[new_scene] = 1;
+        printf("  -> RESET s%d→s%d (new scene, CNN preset)\n",
+               ctx->cur_scene_id, new_scene);
+    }
+
+    memcpy(ctx->wc_old, ctx->fx.wc, S*L*sizeof(float));
+    ctx->fx.freeze_lms = 0; ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
+    memcpy(ctx->anchor_probs, probs, 8*sizeof(float));
+    ctx->fade_cnt   = FADE_LEN;
+    ctx->mute_hold  = MUTE_HOLD_SAMPLES;
+    ctx->cur_scene_id = new_scene;
+    ctx->converged_frames = 0;
+}
+
+static void cfg_load_env(void) {
+    const char *s;
+    if ((s = getenv("GFANC_MIC_GAIN")))  cfg_mic_gain = (float)atof(s);
+    if ((s = getenv("GFANC_STEP")))      cfg_step     = (float)atof(s);
+    if ((s = getenv("GFANC_RAMP_MS")))   cfg_ramp_ms  = atoi(s);
+    if ((s = getenv("GFANC_MUTE_MS")))   cfg_mute_ms  = atoi(s);
+    LOG_INFO("Runtime config: gain=%.1f step=%.6f ramp=%dms mute=%dms",
+             cfg_mic_gain, cfg_step, cfg_ramp_ms, cfg_mute_ms);
+}
+
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
+    cfg_load_env();
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 
@@ -329,8 +462,10 @@ int main(void) {
     printf("  OK L=%d\n", sub_len / (15*2));
 
     /* 初始化 ANC 模块 */
+    int ret = 0;
+    PaStream *stream = NULL;
     rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
-    if (!ctx) { fprintf(stderr, "OOM\n"); return 1; }
+    if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
     g_ctx = ctx;
     ctx->running = 1; ctx->first_sec = 1;
@@ -338,14 +473,19 @@ int main(void) {
 
     ctx->bp_fir.coeffs = bp_coeff; ctx->bp_fir.n_taps = BP_LEN;
     ctx->bp_fir.delay_line = (double *)calloc(BP_LEN, sizeof(double));
+    if (!ctx->bp_fir.delay_line) { fprintf(stderr, "OOM: bp_fir\n"); ret = 1; goto cleanup; }
     for (int e = 0; e < E; e++) {
         ctx->bp_err[e].coeffs = bp_coeff; ctx->bp_err[e].n_taps = BP_LEN;
         ctx->bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
+        if (!ctx->bp_err[e].delay_line) { fprintf(stderr, "OOM: bp_err[%d]\n", e); ret = 1; goto cleanup; }
     }
 
     int sp = SEC_LEN + DSP_DELAY;
     ctx->sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
     ctx->sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
+    if (!ctx->sec_firs || !ctx->sec_coeffs) {
+        fprintf(stderr, "OOM: sec_firs/coeffs\n"); ret = 1; goto cleanup;
+    }
     for (int e = 0; e < E; e++)
         for (int s = 0; s < S; s++) {
             int idx = e*S+s;
@@ -353,6 +493,9 @@ int main(void) {
             ctx->sec_firs[idx].coeffs = ctx->sec_coeffs + idx*sp;
             ctx->sec_firs[idx].n_taps = sp;
             ctx->sec_firs[idx].delay_line = (double *)calloc(sp, sizeof(double));
+            if (!ctx->sec_firs[idx].delay_line) {
+                fprintf(stderr, "OOM: sec_firs[%d]\n", idx); ret = 1; goto cleanup;
+            }
         }
 
     /* 反馈抵消: 逐扬声器加载 FIR (需先运行 calibrate_feedback.exe, F-G修复) */
@@ -383,24 +526,31 @@ int main(void) {
     }
 #endif
 
-    scene_ctrl_init(&ctx->sc, centroids, sub_filters, L);
+    if (scene_ctrl_init(&ctx->sc, centroids, sub_filters, L) != 0) {
+        fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); ret = 1; goto cleanup;
+    }
     howling_init(&ctx->hw, HOWLING_ENABLED);
-    fxnlms_init(&ctx->fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
+    if (fxnlms_init(&ctx->fx, E, S, L, cfg_step, 1e-6f) != 0) {
+        fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
+    }
 
     /* 缓冲 */
     ctx->ref_buf = (float *)malloc(FS_HW * sizeof(float));
     ctx->anti_buf = (float *)malloc(FS_HW * S * sizeof(float));
     ctx->err_buf = (float *)malloc(FS_HW * E * sizeof(float));
+    if (!ctx->ref_buf || !ctx->anti_buf || !ctx->err_buf) {
+        fprintf(stderr, "OOM: buffers\n"); ret = 1; goto cleanup;
+    }
     printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
     /* 打开 PortAudio 流 */
     PaStreamParams in_p = { in_dev, 6, 0x00000001, 0.01, NULL };  /* paFloat32 */
     PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.01, NULL };
-    PaStream *stream = NULL;
+    stream = NULL;
     int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, ctx);
     if (err != 0) {
         fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err));
-        return 1;
+        ret = 1; goto cleanup;
     }
 
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
@@ -412,121 +562,65 @@ int main(void) {
     p_Pa_StartStream(stream);
     printf("Running...\n");
 
-    /* 主循环: 只做 CNN (每秒一次) */
+    /* 主循环: CNN 场景分类 1Hz, 驱动 Wc 更新和场景切换 */
     while (ctx->running) {
         Sleep(100);
-        {
-            LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
-            if (ready >= 0) {
-            float probs[8];
-            int new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, probs);
+        LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
+        if (ready < 0) continue;
 
-            if (ctx->first_sec) {
-                /* 首次 INIT: 使用 CNN 通用 Wc, 标记该场景已有记忆 */
-                fxnlms_set_wc(&ctx->fx, ctx->wc_cur);
-                ctx->fx.freeze_lms = 0;  /* INIT 清除冻结 */
-                memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
-                ctx->scene_wc_valid[new_scene] = 1;
-                ctx->cur_scene_id = new_scene;
-                memcpy(ctx->anchor_probs, probs, 8*sizeof(float));  /* S-1锚点 */
-                ctx->ramp_cnt  = RAMP_SAMPLES;  /* 冷启动 ramp */
-                ctx->mute_hold = MUTE_HOLD_SAMPLES;
-                printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
-                       new_scene, probs[new_scene], COLDSTART_MS, MUTE_HOLD_MS);
-                ctx->first_sec = 0;
-            } else {
-                /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
-                float dot = 0, np = 0, nc = 0;
-                for (int k = 0; k < 8; k++) {
-                    dot += ctx->anchor_probs[k] * probs[k];
-                    np  += ctx->anchor_probs[k] * ctx->anchor_probs[k];
-                    nc  += probs[k] * probs[k];
-                }
-                float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
+        float probs[8];
+        int new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, probs);
 
-                printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1fdB anti=%.4f%s%s gain=%.0fx cb=%d\n",
-                       new_scene, probs[new_scene], cos_sim,
-                       ctx->nr_level, ctx->anti_rms,
-                       ctx->safety_mute ? " [MUTE]" : "",
-                       ctx->ramp_cnt > 0 ? " [RAMP]" : "",
-                       MIC_PRE_GAIN, ctx->callback_count);
-                printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f)\n",
-                       ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
-                       ctx->ref_rms);
-                printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
-                       ctx->err_rms, ctx->anti_est_rms);
-                if (ctx->fb_active)
-                    printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx->fb_rms);
-                if (ctx->hw.active_count > 0 || ctx->hw.dominant_db > HW_THRESH_DB * 0.7f)
-                    printf("       HW:  f=%.0fHz peak=%.1fdB notches=%d%s\n",
-                           ctx->hw.dominant_freq, ctx->hw.dominant_db,
-                           ctx->hw.active_count,
-                           ctx->hw.active_count > 0 ? " [NOTCH]" : "");
-
-                /* Wc 发散检测: max|Wc| > 5×stub_rms → 冻结梯度 */
-                {   float wc_max = 0;
-                    for (int i = 0; i < S*L; i++) {
-                        float a = fabsf(ctx->fx.wc[i]);
-                        if (a > wc_max) wc_max = a;
-                    }
-                    if (wc_max > ctx->sc.stub_rms * 5.0f) {
-                        if (!ctx->fx.freeze_lms) {
-                            ctx->fx.freeze_lms = 1;
-                            printf("[WARN] Wc diverged! max|Wc|=%.3f "
-                                   "> 5×stub(%.3f), LMS frozen\n",
-                                   wc_max, ctx->sc.stub_rms);
-                        }
-                    }
-                }
-
-                /* 收敛检测: 连续 3 帧 NR>3dB → 保存当前场景的已收敛 Wc */
-                if (ctx->nr_level > 3.0f && !ctx->safety_mute) {
-                    ctx->converged_frames++;
-                    if (ctx->converged_frames >= 3) {
-                        memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
-                        ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
-                        ctx->converged_frames = 0;  /* 保存后重置, 避免每帧都写 */
-                    }
-                } else {
-                    ctx->converged_frames = 0;
-                }
-
-                /* 场景切换检测 (cos<0.8 且场景确实变了才触发) */
-                if (cos_sim < 0.8f && new_scene != ctx->cur_scene_id) {
-                    /* 保存旧场景的当前 Wc (最新的收敛状态) */
-                    memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
-                    ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
-
-                    /* 新场景: 有记忆就用记忆, 否则用 CNN 通用 Wc */
-                    if (ctx->scene_wc_valid[new_scene]) {
-                        memcpy(ctx->wc_cur, ctx->scene_wc[new_scene], S*L*sizeof(float));
-                        printf("  -> RESET s%d→s%d (restored adapted Wc)\n",
-                               ctx->cur_scene_id, new_scene);
-                    } else {
-                        /* 首次遇到该场景, wc_cur 已是 CNN 通用值 */
-                        ctx->scene_wc_valid[new_scene] = 1;
-                        printf("  -> RESET s%d→s%d (new scene, CNN preset)\n",
-                               ctx->cur_scene_id, new_scene);
-                    }
-
-                    memcpy(ctx->wc_old, ctx->fx.wc, S*L*sizeof(float));
-                    ctx->fx.freeze_lms = 0;  /* 场景切换清除冻结 */
-                    memcpy(ctx->anchor_probs, probs, 8*sizeof(float));  /* S-1锚点 */
-                    ctx->fade_cnt   = FADE_LEN;
-                    ctx->mute_hold  = MUTE_HOLD_SAMPLES;
-                    ctx->cur_scene_id = new_scene;
-                    ctx->converged_frames = 0;
-                }
+        if (ctx->first_sec) {
+            /* 首次 INIT: CNN 通用 Wc → 标记场景 → 冷启动 ramp */
+            fxnlms_set_wc(&ctx->fx, ctx->wc_cur);
+            ctx->fx.freeze_lms = 0; ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
+            memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
+            ctx->scene_wc_valid[new_scene] = 1;
+            ctx->cur_scene_id = new_scene;
+            memcpy(ctx->anchor_probs, probs, 8*sizeof(float));
+            ctx->ramp_cnt  = RAMP_SAMPLES;
+            ctx->mute_hold = MUTE_HOLD_SAMPLES;
+            printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
+                   new_scene, probs[new_scene], COLDSTART_MS, MUTE_HOLD_MS);
+            ctx->first_sec = 0;
+        } else {
+            /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
+            float dot = 0, np = 0, nc = 0;
+            for (int k = 0; k < 8; k++) {
+                dot += ctx->anchor_probs[k] * probs[k];
+                np  += ctx->anchor_probs[k] * ctx->anchor_probs[k];
+                nc  += probs[k] * probs[k];
             }
-            memcpy(ctx->sc.prev_probs, probs, 8*sizeof(float));
-            }
+            float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
+
+            print_diagnostics(ctx, new_scene, cos_sim, probs);
+            check_wc_divergence(ctx);
+            check_convergence(ctx);
+            check_scene_switch(ctx, new_scene, cos_sim, probs);
         }
+        memcpy(ctx->sc.prev_probs, probs, 8*sizeof(float));
     }
 
     printf("\nStopping...\n");
     p_Pa_StopStream(stream);
     p_Pa_CloseStream(stream);
+
+cleanup:
+    if (ctx) {
+        free(ctx->bp_fir.delay_line);
+        for (int e = 0; e < E; e++) free(ctx->bp_err[e].delay_line);
+        if (ctx->sec_firs) {
+            for (int i = 0; i < E*S; i++) free(ctx->sec_firs[i].delay_line);
+            free(ctx->sec_firs);
+        }
+        free(ctx->sec_coeffs);
+        for (int s = 0; s < 2; s++) free(ctx->fb_fir[s].delay_line);
+        fxnlms_free(&ctx->fx);
+        free(ctx->ref_buf); free(ctx->anti_buf); free(ctx->err_buf);
+        free(ctx);
+    }
     p_Pa_Terminate();
-    printf("Done.\n");
-    return 0;
+    if (ret == 0) printf("Done.\n");
+    return ret;
 }

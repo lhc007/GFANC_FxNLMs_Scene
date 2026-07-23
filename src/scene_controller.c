@@ -2,6 +2,7 @@
  *
  * 对应 Python: gfanc/SceneController.py
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -9,7 +10,7 @@
 
 extern int cnn_m5_forward(const float *audio, float *logits);
 
-void scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
+int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
                      const float *sub_filters, int filter_len)
 {
     sc->centroids   = centroids;
@@ -21,6 +22,7 @@ void scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     /* stub RMS: 所有子滤波器等权求和 → RMS */
     int S = SC_S, C = SC_C, L = filter_len;
     float *stub = (float *)calloc(S * L, sizeof(float));
+    if (!stub) return -1;
     for (int c = 0; c < C; c++)
         for (int s = 0; s < S; s++)
             for (int l = 0; l < L; l++)
@@ -29,6 +31,7 @@ void scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     for (int i = 0; i < S * L; i++) ss += stub[i] * stub[i];
     sc->stub_rms = sqrtf(ss / (S * L));
     free(stub);
+    return 0;
 }
 
 int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,

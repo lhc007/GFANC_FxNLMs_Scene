@@ -185,11 +185,15 @@ int main(int argc, char **argv)
 
     /* 2d. Scene Controller */
     scene_ctrl_t sc;
-    scene_ctrl_init(&sc, centroids, sub_filters, L);
+    if (scene_ctrl_init(&sc, centroids, sub_filters, L) != 0) {
+        fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); return 1;
+    }
 
     /* 2e. FxNLMS */
     fxnlms_mimo_t fx;
-    fxnlms_init(&fx, E, S, L, 0.0001f, 1e-6f);  /* leak 已从 step_size 解耦 */
+    if (fxnlms_init(&fx, E, S, L, 0.0001f, 1e-6f) != 0) {
+        fprintf(stderr, "ERROR: fxnlms_init OOM\n"); return 1;
+    }
     printf("  System ready (CNN loaded).\n");
 
     /* ── 3. 读取 WAV ── */

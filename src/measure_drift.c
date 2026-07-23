@@ -1,6 +1,6 @@
 /** measure_drift — 测两个 USB 设备的时钟漂移 (基于已验证的 calibrate_feedback.c)
  *
- * 编译: gcc -O2 -Iinclude src/measure_drift.c src/fir_filter.c src/binary_loader.c -lm -o measure_drift.exe
+ * 编译: gcc -O2 -Iinclude src/measure_drift.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -o measure_drift.exe
  *
  * 与 calibrate_feedback.exe 使用完全相同的 PortAudio 初始化 — 已验证可跨设备全双工.
  * 区别: 播放脉冲而非白噪声, 互相关找延迟, 重复10轮检测漂移.
@@ -11,40 +11,11 @@
 #include <math.h>
 #include <windows.h>
 
-typedef struct { double inputBufferAdcTime, currentTime, outputBufferDacTime; } PaCbTimeInfo;  /* 回调参数类型 */
+#include "pa_loader.h"  /* 共享 PA DLL 加载层, CR-5 修复 */
 
 #define ROUNDS      10
 #define REC_SEC     1.5f         /* 每轮录制时长 */
 #define PULSE_WID   300          /* 脉冲宽度 */
-
-/* ═══════════ PortAudio DLL (与 calibrate_feedback.c 完全相同) ═══════════ */
-typedef int PaError; typedef void PaStream;
-#define paFloat32 0x00000001
-#define paNoFlag  0
-#define paNoError 0
-static HMODULE pa_dll;
-static PaError (*p_Pa_Initialize)(void);
-static PaError (*p_Pa_Terminate)(void);
-static PaError (*p_Pa_OpenStream)(PaStream **, const void *, const void *, double, unsigned long, unsigned long, void *, void *);
-static PaError (*p_Pa_StartStream)(PaStream *);
-static PaError (*p_Pa_StopStream)(PaStream *);
-static PaError (*p_Pa_CloseStream)(PaStream *);
-static int    (*p_Pa_GetDeviceCount)(void);
-static const void *(*p_Pa_GetDeviceInfo)(int);
-static const char *(*p_Pa_GetErrorText)(int);
-typedef struct { int device, channelCount, sampleFormat; double suggestedLatency; void *hostApiSpecificStreamInfo; } PaStreamParams;
-typedef struct { int structVersion; const char *name; int hostApi, maxInputChannels, maxOutputChannels; double defLowInLat, defLowOutLat, defHighInLat, defHighOutLat, defaultSampleRate; } PaDeviceInfo2;
-#define PA_LOAD(fn) p_##fn = (void*)GetProcAddress(pa_dll, #fn)
-static int pa_init(void) {
-    pa_dll = LoadLibraryA("libportaudio64bit-asio.dll");
-    if (!pa_dll) return -1;
-    PA_LOAD(Pa_Initialize); PA_LOAD(Pa_Terminate);
-    PA_LOAD(Pa_OpenStream); PA_LOAD(Pa_StartStream);
-    PA_LOAD(Pa_StopStream); PA_LOAD(Pa_CloseStream);
-    PA_LOAD(Pa_GetDeviceCount); PA_LOAD(Pa_GetDeviceInfo);
-    PA_LOAD(Pa_GetErrorText);
-    return 0;
-}
 
 /* ═══════════ 数据 ═══════════ */
 typedef struct {

@@ -23,6 +23,7 @@
 #define HW_RELEASE       8       /* 啸叫消失后延迟释放帧数 */
 #define HW_NOTCH_R       0.96f   /* 陷波器带宽 (越接近1越窄, 0.9-0.99) */
 #define HW_MAX_NOTCHES   2       /* 最多同时陷波数 */
+#define HW_MIN_HOLD      32      /* 陷波最小保持帧数 (32帧≈512ms, 防释放死循环) */
 #define HW_S             2       /* 扬声器数 (每个扬声器独立 IIR 状态) */
 
 typedef struct {
@@ -37,6 +38,7 @@ typedef struct {
     int    candidate_count;     /* 连续出现帧数 */
     float  active_freqs[HW_MAX_NOTCHES];  /* 已确认啸叫频率 */
     int    active_count;        /* 当前激活的陷波数 */
+    int    notch_age[HW_MAX_NOTCHES];  /* 每个陷波器的帧龄 (≥HW_MIN_HOLD才能释放) */
     int    release_timer;       /* 啸叫消失后延迟释放计时 */
 
     /* IIR 陷波器状态 (每扬声器 × 每频率独立, 避免跨通道串扰) */

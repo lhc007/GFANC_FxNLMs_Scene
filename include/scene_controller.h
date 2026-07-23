@@ -19,8 +19,8 @@ typedef struct {
     float  prev_probs[SC_K];
 } scene_ctrl_t;
 
-void scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
-                     const float *sub_filters, int filter_len);
+int  scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
+                     const float *sub_filters, int filter_len);  /* 返回0=成功, -1=OOM */
 int  scene_ctrl_process(scene_ctrl_t *sc, const float *audio_1s,
                         float *wc_out, float *probs_out);
 void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out);
