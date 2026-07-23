@@ -72,6 +72,7 @@ typedef struct {
     int    scene_wc_valid[SC_K];  /* 1=该场景已有收敛好的 Wc */
     int    cur_scene_id;
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
+    float  anchor_probs[SC_K];    /* 进入当前场景时的probs锚点 (S-1修复) */
 
     /* 48k 重采样缓冲 */
     float *ref_buf, *anti_buf, *err_buf; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
@@ -427,16 +428,18 @@ int main(void) {
                 memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
                 ctx->scene_wc_valid[new_scene] = 1;
                 ctx->cur_scene_id = new_scene;
-                ctx->ramp_cnt  = RAMP_SAMPLES;
+                memcpy(ctx->anchor_probs, probs, 8*sizeof(float));  /* S-1锚点 */
+                ctx->ramp_cnt  = RAMP_SAMPLES;  /* 冷启动 ramp */
                 ctx->mute_hold = MUTE_HOLD_SAMPLES;
                 printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
                        new_scene, probs[new_scene], COLDSTART_MS, MUTE_HOLD_MS);
                 ctx->first_sec = 0;
             } else {
+                /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
                 float dot = 0, np = 0, nc = 0;
                 for (int k = 0; k < 8; k++) {
-                    dot += ctx->sc.prev_probs[k] * probs[k];
-                    np  += ctx->sc.prev_probs[k] * ctx->sc.prev_probs[k];
+                    dot += ctx->anchor_probs[k] * probs[k];
+                    np  += ctx->anchor_probs[k] * ctx->anchor_probs[k];
                     nc  += probs[k] * probs[k];
                 }
                 float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
@@ -508,8 +511,8 @@ int main(void) {
 
                     memcpy(ctx->wc_old, ctx->fx.wc, S*L*sizeof(float));
                     ctx->fx.freeze_lms = 0;  /* 场景切换清除冻结 */
+                    memcpy(ctx->anchor_probs, probs, 8*sizeof(float));  /* S-1锚点 */
                     ctx->fade_cnt   = FADE_LEN;
-                    ctx->ramp_cnt   = RAMP_SAMPLES;
                     ctx->mute_hold  = MUTE_HOLD_SAMPLES;
                     ctx->cur_scene_id = new_scene;
                     ctx->converged_frames = 0;
