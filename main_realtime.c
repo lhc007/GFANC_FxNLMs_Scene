@@ -441,26 +441,27 @@ int main(void) {
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 
-    /* 查找 WASAPI host API (Windows 系统->声音 显示的设备) */
-    int wasapi_api = -1;
-    for (int i = 0; ; i++) {
-        const PaHostApiInfo2 *info = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(i);
-        if (!info) break;
-        if (strstr(info->name, "WASAPI")) { wasapi_api = i; break; }
-    }
-    if (wasapi_api < 0) wasapi_api = p_Pa_GetDefaultHostApi();  /* fallback */
-    const PaHostApiInfo2 *api = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(wasapi_api);
-
-    /* 列出设备 (仅 WASAPI 端点, 对应 Windows 系统->声音 中显示的设备) */
+    /* 列出设备 (跳过 MME/DirectSound, 只显示 ASIO/WASAPI/WDM-KS) */
     int nd = p_Pa_GetDeviceCount();
-    printf("\n=== Audio Devices (WASAPI) ===\n");
-    for (int i = 0; i < nd; i++) {
-        const PaDeviceInfo2 *info = (const PaDeviceInfo2 *)p_Pa_GetDeviceInfo(i);
-        if (info && info->hostApi == wasapi_api)
-            printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
-                i, info->name, info->maxInputChannels, info->maxOutputChannels, info->defaultSampleRate);
+    int napi = 0;
+    printf("\n=== Audio Devices ===\n");
+    for (int api_idx = 0; ; api_idx++) {
+        const PaHostApiInfo2 *api = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(api_idx);
+        if (!api) break;
+        if (strstr(api->name, "MME") || strstr(api->name, "DirectSound")) continue;
+        napi++;
+        int has_dev = 0;
+        for (int i = 0; i < nd; i++) {
+            const PaDeviceInfo2 *info = (const PaDeviceInfo2 *)p_Pa_GetDeviceInfo(i);
+            if (info && info->hostApi == api_idx) {
+                if (!has_dev) { printf("\n[%s]\n", api->name); has_dev = 1; }
+                printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
+                    i, info->name, info->maxInputChannels,
+                    info->maxOutputChannels, info->defaultSampleRate);
+            }
+        }
     }
-    printf("Host API: %s\n", api ? api->name : "default");
+    if (napi == 0) { fprintf(stderr, "PA: no host APIs found\n"); return 1; }
 
     int in_dev, out_dev;
     printf("\nInput device ID: "); fflush(stdout); scanf("%d", &in_dev);
