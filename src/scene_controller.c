@@ -107,12 +107,11 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out
             wc_out[s * L + l] = v;
         }
 
-    /* RMS 对齐 stub + 取反 */
+    /* 取反 (S-4修复: 不再强制对齐stub_rms, LMS功率归一化自动适应增益) */
     float rms_sq = 0;
     for (int i = 0; i < S * L; i++) rms_sq += wc_out[i] * wc_out[i];
     float wc_rms = sqrtf(rms_sq / (S * L));
     if (wc_rms < 1e-6f) {
-        /* Wc 退化: 所有 blend 权重接近零 → 反噪声失效 (可能为 centroid 全零/全负) */
         static int warn_cnt = 0;
         if (warn_cnt < 3) {
             fprintf(stderr, "[WARN] Wc RMS=%.6f near zero for scene=%d, ANC may be silent\n",
@@ -120,6 +119,5 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out
             warn_cnt++;
         }
     }
-    float scale = (rms_sq > 1e-10f) ? sc->stub_rms / wc_rms : 1.0f;
-    for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i] * scale;
+    for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i];
 }
