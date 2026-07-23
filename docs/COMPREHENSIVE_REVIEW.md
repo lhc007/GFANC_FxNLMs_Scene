@@ -15,7 +15,7 @@
 
 ## 问题总览表
 
-> **图例**: ✅ 已修复 · 🔶 需前置条件 · ⚠️ 待修复(设计问题) · ❌ 未实现 · 🟡 待实验 · 🚫 误报(FALSE) · — 可忽略
+> **图例**: ✅ 已修复 · 🔶 需前置条件 · ⚠️ 待处理(需测试/验证) · ❌ 未实现 · 🟡 待实验/调查 · 🚫 误报(FALSE) · — 可忽略/无需修改
 >
 > 来源标记: [CR]=本文档审查新发现 · [W]=WINDOW_ANC_SUPPLEMENT · 其他=UPGRADE_ROADMAP 已有
 
@@ -53,7 +53,7 @@
 | 🚫 | S-5 | — | MinMax不减min与训练不匹配 | 无, Python公式一致 | FALSE |
 | — | S-6 | 🟢 低 | CNN输入延迟~1.0s (1s窗口设计特性) | 平稳场景无影响 | main_realtime.c |
 | 🔶 | TODO-1 | 🟡 中 | Blend max归一化放大伪峰 (centroid离群值) | 子滤波器权重失真 | scene_controller.c |
-| ⚠️ | CR-18 | 🟢 低 | MinMaxScaler逐帧归一化 vs 训练集全局归一化 | 低音量噪声可能误分类 | scene_controller.c [CR] |
+| ✅ | CR-18 | 🟢 低 | 安静环境底噪被逐帧归一化放大→误分类污染scene_wc | 已改denom阈值: 1e-6→0.01, 弱信号跳过CNN保持当前场景 | scene_controller.c (已修复 2026-07-23) |
 | 🟡 | CR-19 | 🟡 中 | CNN训练数据与窗户噪声场景覆盖度未知 | 场景分类退化 | data/scene_defs.bin [CR] |
 | 🟡 | W-10 | 🟡 中 | 8类场景对窗户典型噪声(交通/施工/风声)的覆盖度待验证 | Wc初始值质量 | data/ [W] |
 
@@ -65,8 +65,8 @@
 | 🔶 | P-2 | 🟡 中 | 16k→48k ZOH无抗镜像 | 16k/32k镜像送扬声器 | main_realtime.c |
 | 🚫 | P-3 | — | 限幅±1.0非±0.5 (DAC满幅=±1.0) | 无 | FALSE |
 | — | P-4 | — | 带通FIR群延迟32ms (线性相位FIR固有) | 物理事实, 非bug | main_realtime.c |
-| ⚠️ | CR-1 | 🟡 中 | MIMO梯度未按E通道数归一化 (有效步长放大√E≈1.7×) | E改变时需重调step_size | fxnlms_mimo.c [CR] |
-| ⚠️ | CR-3 | 🟢 低 | NR显示用Ŝ模型估计 ≠ 真实声学NR | 监控值偏差, Ŝ≠real_S时 | main_realtime.c [CR] |
+| — | CR-1 | 🟡 中 | MIMO梯度未按E通道数归一化 (有效步长放大√E≈1.7×) | E=3固定不变, step_size已补偿, 改了反而要重调参 | fxnlms_mimo.c (无需修改) |
+| — | CR-3 | 🟢 低 | NR显示用Ŝ模型估计 ≠ 真实声学NR | 物理事实: Ŝ≠real_S时显示值≠真实值, 代码无法消除, 需声级计验证 | main_realtime.c (无需修改) |
 
 ### E. 线程/性能 (§系列)
 
@@ -89,8 +89,8 @@
 |------|----|--------|------|------|-----------|
 | ✅ | FB | — | 双FIR逐扬声器校准+运行时抵消 | 反馈衰减~34dB | calibrate_feedback.c + main_realtime.c |
 | 🔶 | TODO-2 | 🟡 中 | fb相位符号未验证 (减法可能变加法) | 需FIR峰值符号测量 | main_realtime.c |
-| ⚠️ | CR-15 | 🟢 低 | fb_fir输入为上一轮anti值 (1样本延迟, 62.5μs) | 256tap中可忽略 | main_realtime.c [CR] |
-| ⚠️ | B4 | 🟢 低 | 在线自适应反馈抵消 (补偿温度漂移) | 声学路径微变时退化 | 升级方案 [CR] |
+| — | CR-15 | 🟢 低 | fb_fir输入为上一轮anti值 (1样本延迟, 62.5μs) | 256tap中占比0.4%, 声学上不可测 | main_realtime.c (无需修改) |
+| — | B4 | 🟢 低 | 在线自适应反馈抵消 (补偿温度漂移) | 窗户ANC几何固定, 离线校准已足够; 此需求适用于耳机ANC(麦-扬声器距离可变) | 升级方案 (窗户场景不适用) |
 
 ### G. 代码质量/可维护性
 
@@ -102,7 +102,7 @@
 | ⚠️ | CR-7 | 🟢 低 | cnn_m5_free空函数 (CNN权重永不释放~600KB) | OTA更新阻塞 | cnn_m5_forward.c [CR] |
 | ✅ | CR-8 | 🟡 中 | fxnlms_init/scene_ctrl_init不返回错误码 (calloc无NULL检查) | 已改void→int, 失败时清理部分分配并返回-1 | fxnlms_mimo.c, scene_controller.c (已修复 2026-07-23) |
 | ✅ | CR-9 | 🟡 中 | main_realtime.c初始化路径无失败回滚 (已分配资源泄漏) | 已加goto cleanup统一回滚, 所有资源NULL-safe释放 | main_realtime.c (已修复 2026-07-23) |
-| ⚠️ | CR-10 | 🟢 低 | 采样率硬编码(FS_HW=48000) vs 设备查询 | 44100Hz设备需改代码 | main_realtime.c [CR] |
+| — | CR-10 | 🟢 低 | 采样率硬编码(FS_HW=48000) vs 设备查询 | WASAPI设备几乎都是48k; 44100→16000非整数比增加复杂度>收益 | main_realtime.c (无需修改) |
 | ⚠️ | CR-16 | 🟢 低 | 离线/实时接口重复 (_rt后缀, 共用xd_roll但路径不同) | 代码重复, 扩展困难 | fxnlms_mimo.c [CR] |
 | ⚠️ | CR-17 | 🟡 中 | 零单元测试 (FIR/CNN/FxNLMS/Howling均无) | 回归靠手动 | 全局 [CR] |
 | ✅ | CR-20 | 🟢 低 | 无分级日志框架 (全部printf) | 已加LOG_ERROR/WARN/INFO/DEBUG宏于gfanc_types.h | gfanc_types.h (已修复 2026-07-23) |
@@ -114,7 +114,7 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | FIR-DBL | — | FIR延迟线double+系数float32混合精度 | 1024tap舍入误差降低10³倍 | fir_filter.c |
-| ⚠️ | CR-14 | 🟢 低 | IIR陷波float32状态在r→0.99时极限环风险 | 当前r=0.96安全, 更窄时需DF2T | howling_detect.c [CR] |
+| — | CR-14 | 🟢 低 | IIR陷波float32状态在r→0.99时极限环风险 | 当前r=0.96安全; 仅当未来改HW_NOTCH_R>0.99时才需DF2T或double | howling_detect.c (当前无需修改) |
 | ✅ | CR-2 | 🟡 中 | 啸叫检测硬释放振荡 (见B-2b) | 已加512ms最小保持+逐频率独立释放 (同B-2b) | howling_detect.c (已修复 2026-07-23) |
 
 ### I. 窗户ANC专项 (W系列)
@@ -167,7 +167,7 @@
 | 🟢 | P2-4 | 🟡 中 | 硬件看门狗 (独立硬件监控, 异常断电) | 量产必需 | 硬件设计 |
 | 🟢 | P2-5 | 🟢 低 | 通道间时延精确补偿 (当前固定DSP_DELAY=16) | 亚样本对齐精度 | main_realtime.c |
 | 🟡 | P2-6 | 🟡 中 | 窗户ANC声学实验 (参考麦伸窗外, 验证开放空间NR提升) | 预期NR 10-15dB | 实验 |
-| ⚠️ | CR-11 | 🟢 低 | CrossFader期间梯度冻结 (Wc_old快照不再更新, 100ms无自适应) | 设计选择, 非bug | main_realtime.c [CR] |
+| — | CR-11 | 🟢 低 | CrossFader期间梯度冻结 (Wc_old快照不再更新, 100ms无自适应) | 正确设计: 过渡期用混合Wc做梯度更新会导致旧场景梯度污染新Wc | main_realtime.c (无需修改) |
 
 ---
 
@@ -1133,7 +1133,7 @@ float fb_err = ref_sample - (ref_raw_bp + fb_est) * MIC_PRE_GAIN; // 仅反馈�
 
 | 编号 | 问题 | 后果 | 修复 |
 |------|------|------|------|
-| FIX-1 | MinMax scaler 阈值 1e-10 → 静默输入爆炸 | CNN 输入 Inf → NaN → Wc 随机 | 1e-6 阈值 + 零填充 |
+| FIX-1 | MinMax scaler 阈值 1e-10 → 静默输入爆炸 | CNN 输入 Inf → NaN → Wc 随机 | 1e-6→0.01阈值 + 弱信号跳过CNN(保持场景) |
 | FIX-2 | cnn_m5_forward 返回值未检查 | malloc 失败后 Wc 用垃圾数据 | 检查回退到上一帧场景 |
 | FIX-3 | NaN/Inf 无声传播至 DAC | 可能损坏硬件 | isfinite 保护 |
 | FIX-4 | Wc 退化至零无告警 | ANC 静默时无法排查 | stderr 告警 (限 3 次) |

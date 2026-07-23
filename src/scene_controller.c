@@ -46,11 +46,23 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
         if (audio[i] < mn) mn = audio[i];
     }
     float denom = mx - mn;
+
+    /* 信号太弱 (<1%满幅峰峰值) → 不值得分类, 保持当前场景不切换
+       避免深夜底噪被逐帧归一化放大后引发误分类污染 scene_wc */
+    if (denom <= 0.01f) {
+        if (sc->cur_scene >= 0) {
+            scene_ctrl_construct_wc(sc, sc->cur_scene, wc_out);
+            memcpy(probs_out, sc->prev_probs, K * sizeof(float));
+            return sc->cur_scene;
+        }
+        memset(probs_out, 0, K * sizeof(float));
+        probs_out[0] = 1.0f;
+        scene_ctrl_construct_wc(sc, 0, wc_out);
+        return 0;
+    }
+
     float *cnn_in = (float *)malloc(16000 * sizeof(float));
-    if (denom > 1e-6f)
-        for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
-    else
-        memset(cnn_in, 0, 16000 * sizeof(float));  /* 静音 → 全零, 不传噪声 */
+    for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
 
     /* CNN 前向 */
     float logits[SC_K];
