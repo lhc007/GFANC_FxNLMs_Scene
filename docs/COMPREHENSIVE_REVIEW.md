@@ -97,13 +97,13 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | CR-4 | 🟡 中 | 主循环~110行耦合5种逻辑 (CNN/发散/收敛/切换/统计) | 已拆为5个static函数: print_diagnostics/check_wc_divergence/check_convergence/check_scene_switch/cfg_load_env | main_realtime.c (已修复 2026-07-23) |
-| ✅ | CR-5 | 🟢 低 | measure_drift.c重复PA加载代码(~30行) | 已复用pa_loader.h, Makefile已加drift目标 | measure_drift.c (已修复 2026-07-23) |
+| ✅ | CR-5 | 🟢 低 | measure_drift.c重复PA加载代码(~30行) | 已删除. 单ASIO设备共时钟无漂移, 工具使命已结束 | measure_drift.c (已删除 2026-07-23) |
 | — | CR-6 | 🟢 低 | gfanc_types.h太单薄, 核心类型散落各头文件 | C项目标准模式, 各模块头文件自包含, 已合理 | include/ (无需修改) |
 | ⚠️ | CR-7 | 🟢 低 | cnn_m5_free空函数 (CNN权重永不释放~600KB) | OTA更新阻塞 | cnn_m5_forward.c [CR] |
 | ✅ | CR-8 | 🟡 中 | fxnlms_init/scene_ctrl_init不返回错误码 (calloc无NULL检查) | 已改void→int, 失败时清理部分分配并返回-1 | fxnlms_mimo.c, scene_controller.c (已修复 2026-07-23) |
 | ✅ | CR-9 | 🟡 中 | main_realtime.c初始化路径无失败回滚 (已分配资源泄漏) | 已加goto cleanup统一回滚, 所有资源NULL-safe释放 | main_realtime.c (已修复 2026-07-23) |
 | — | CR-10 | 🟢 低 | 采样率硬编码(FS_HW=48000) vs 设备查询 | WASAPI设备几乎都是48k; 44100→16000非整数比增加复杂度>收益 | main_realtime.c (无需修改) |
-| ⚠️ | CR-16 | 🟢 低 | 离线/实时接口重复 (_rt后缀, 共用xd_roll但路径不同) | 代码重复, 扩展困难 | fxnlms_mimo.c [CR] |
+| — | CR-16 | 🟢 低 | 离线/实时接口梯度更新段重复(~15行) | 两条路径anti输出/误差来源根本不同, 重复仅梯度+power+leak 15行, 提取反而牺牲独立演化能力 | fxnlms_mimo.c (无需修改) |
 | ⚠️ | CR-17 | 🟡 中 | 零单元测试 (FIR/CNN/FxNLMS/Howling均无) | 回归靠手动 | 全局 [CR] |
 | ✅ | CR-20 | 🟢 低 | 无分级日志框架 (全部printf) | 已加LOG_ERROR/WARN/INFO/DEBUG宏于gfanc_types.h | gfanc_types.h (已修复 2026-07-23) |
 | ✅ | CRC-1 | 🟢 低 | 无运行时参数调整接口 (全部编译期#define) | 已加GFANC_MIC_GAIN/GFANC_STEP/GFANC_RAMP_MS/GFANC_MUTE_MS环境变量覆盖 | main_realtime.c (已修复 2026-07-23) |
@@ -147,11 +147,11 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ❌ | A1 | 🟢 低 | 离线/实时接口统一 (提取共用原语, 消除_rt后缀) | 代码重复 | fxnlms_mimo.c [CR] |
-| ❌ | A2 | 🟢 低 | 参数集中管理 (gfanc_config_t替代分散#define) | 调参不便 | 全局 [CR] |
+| ✅ | A2 | 🟢 低 | 参数集中管理 (gfanc_config_t替代分散#define) | 已实现: gfanc_config_t + GFANC_CONFIG_DEFAULT + gfanc_config_load_env | gfanc_types.h + main*.c (已修复 2026-07-23) |
 | ❌ | A3 | 🟡 中 | 显式状态机 (STATE_INIT/FADING/SETTLING/CONVERGED等) | 可维护性差 | main_realtime.c [CR] |
 | ❌ | B1 | 🟢 低 | 可变步长NLMS (误差自相关驱动μ动态调整) | 收敛速度次优 | fxnlms_mimo.c [CR] |
 | ❌ | B3 | 🟢 低 | CNN在线微调 (实际环境样本→fine-tune最后一层) | 场景分类退化 | cnn_m5_forward.c [CR] |
-| ❌ | C1 | 🟢 低 | 分级日志+运行时统计记录 | 诊断困难 | 全局 [CR] |
+| ✅ | C1 | 🟢 低 | 分级日志+运行时统计记录 | 已实现: gfanc_log.csv (每秒NR/场景行 + 切换/发散事件) | main_realtime.c (已修复 2026-07-23) |
 | ❌ | C2 | 🟢 低 | 运行时参数调整 (命令行/命名管道/共享内存) | 调参需重编译 | 全局 [CR] |
 | ⚪ | — | — | 增益标定 (NLMS已补偿) | 不实施 | — |
 | ⚪ | — | — | 子带处理 (延迟吃因果裕度, CNN预设已消除收敛需求) | 不实施 | — |
@@ -789,7 +789,6 @@ FS_HW=48000, FS_ANC=16000 是硬编码的 `#define`。如果切换到 44100Hz �
 | 离线 WAV 处理 | ✅ | main.c, 7 种混合噪声 56s 测试, 平均 NR 15dB |
 | 实时音频流 | ✅ | ASIO 声卡实测, NR 4-9dB (窗户开口) |
 | 反馈抵消校准 | ✅ | calibrate_feedback.exe 自检输出 RMS |
-| 时钟漂移 | ✅ | measure_drift.exe 互相关测试 |
 | 啸叫检测 | ⚠️ | DFT+陷波已实现, 无系统化的合成啸叫测试 |
 | Wc 发散保护 | ⚠️ | 阈值检测已实现, 未测试触发和恢复路径 |
 | 场景切换平滑度 | ⚠️ | CrossFader 已实现, 未测量切换期间的 NR 瞬态 |

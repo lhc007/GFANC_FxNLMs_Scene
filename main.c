@@ -132,6 +132,8 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 int main(int argc, char **argv)
 {
     SetConsoleOutputCP(CP_UTF8);
+    gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
+    gfanc_config_load_env(&cfg);
     if (argc < 2) {
         printf("GFANC FxNLMS — Offline WAV ANC Demo\n\n");
         printf("Usage: %s <noise.wav>\n\n", argv[0]);
@@ -191,7 +193,7 @@ int main(int argc, char **argv)
 
     /* 2e. FxNLMS */
     fxnlms_mimo_t fx;
-    if (fxnlms_init(&fx, E, S, L, 0.0001f, 1e-6f) != 0) {
+    if (fxnlms_init(&fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); return 1;
     }
     printf("  System ready (CNN loaded).\n");

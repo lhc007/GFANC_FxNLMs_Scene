@@ -154,8 +154,8 @@ int main(void) {
     }
 
     int in_dev, out_dev;
-    printf("\nInput device ID (YDM6MIC): "); fflush(stdout); scanf("%d", &in_dev);
-    printf("Output device ID (USB Speaker): "); fflush(stdout); scanf("%d", &out_dev);
+    printf("\nInput device ID (ASIO MIC): "); fflush(stdout); scanf("%d", &in_dev);
+    printf("Output device ID (ASIO Speaker): "); fflush(stdout); scanf("%d", &out_dev);
 
     /* 预生成 16kHz 白噪声 — ZOH×3 播放, 与运行时输出路径一致 (F-F修复) */
     int total_hw = FS_HW * CAL_SEC;

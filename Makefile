@@ -3,7 +3,6 @@
 #   make            → 编译离线版 main.exe
 #   make realtime   → 编译实时版 gfanc_realtime.exe
 #   make calibrate  → 编译反馈路径校准程序 calibrate_feedback.exe
-#   make drift      → 编译时钟漂移测量程序 measure_drift.exe
 #   make all        → 全部编译
 #   make clean      → 清理编译产物
 
@@ -18,9 +17,9 @@ MODULES = src/scene_controller.c src/fxnlms_mimo.c \
           src/howling_detect.c
 CAL_MODULES = src/fir_filter.c src/binary_loader.c src/pa_loader.c
 
-.PHONY: all realtime calibrate drift clean
+.PHONY: all realtime calibrate clean
 
-all: main.exe realtime calibrate drift
+all: main.exe realtime calibrate
 
 main.exe: main.c $(MODULES)
 	$(CC) $(CFLAGS) main.c $(MODULES) $(LDFLAGS) -o $@
@@ -33,9 +32,5 @@ calibrate_feedback.exe: src/calibrate_feedback.c $(CAL_MODULES)
 	$(CC) $(CFLAGS_RT) src/calibrate_feedback.c $(CAL_MODULES) $(LDFLAGS_RT) -o $@
 calibrate: calibrate_feedback.exe
 
-measure_drift.exe: src/measure_drift.c $(CAL_MODULES)
-	$(CC) $(CFLAGS_RT) src/measure_drift.c $(CAL_MODULES) $(LDFLAGS_RT) -o $@
-drift: measure_drift.exe
-
 clean:
-	rm -f main.exe gfanc_realtime.exe calibrate_feedback.exe measure_drift.exe anti_out.wav error_out.wav
+	rm -f main.exe gfanc_realtime.exe calibrate_feedback.exe anti_out.wav error_out.wav

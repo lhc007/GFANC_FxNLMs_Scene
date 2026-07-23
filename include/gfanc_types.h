@@ -1,8 +1,9 @@
-/** 核心类型 + 分级日志 — 被所有模块共用. */
+/** 核心类型 + 分级日志 + 集中参数 — 被所有模块共用. */
 #ifndef GFANC_TYPES_H
 #define GFANC_TYPES_H
 
 #include <stdio.h>
+#include <stdlib.h>
 
 typedef float gfanc_float_t;
 
@@ -19,5 +20,58 @@ typedef struct {
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...)  printf(  "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) /* disabled in release */ ((void)0)
+
+/* ── 集中参数 (A2): 所有可调参数一处管理 ── */
+typedef struct {
+    /* 音频链 */
+    int   fs_hw, fs_anc;         /* 硬件/处理采样率 */
+    float mic_pre_gain;          /* 输入数字预增益 */
+    float mic_clip_max;          /* 软限幅阈值 */
+    int   dsp_delay;             /* DSP 缓冲延迟 (样本@16k) */
+
+    /* ANC 自适应 */
+    float step_size;             /* LMS 步长 μ */
+    float leak;                  /* 泄漏因子 */
+    int   fade_len;              /* CrossFader 过渡样本数 */
+    int   ramp_ms;               /* 冷启动 ramp 时长 ms */
+    int   mute_hold_ms;          /* safety_mute 抑制时长 ms */
+
+    /* 安全保护 */
+    float freeze_ratio;          /* max|Wc| > ratio×stub_rms → 冻结 */
+    float switch_threshold;      /* cos_sim 场景切换阈值 */
+    float nr_converge_db;        /* 收敛判定 NR 阈值 dB */
+    int   freeze_retry_sec;      /* freeze 后尝试解冻的秒数 */
+
+    /* 啸叫检测 */
+    float hw_thresh_db;          /* 峰均值比阈值 */
+    int   hw_persist;            /* 确认帧数 */
+    int   hw_release;            /* 释放帧数 */
+    float hw_notch_r;            /* 陷波带宽 */
+    int   hw_min_hold;           /* 陷波最小保持帧数 */
+} gfanc_config_t;
+
+/* 默认配置 (与当前 #define 一致) */
+#define GFANC_CONFIG_DEFAULT { \
+    48000, 16000,      /* fs_hw, fs_anc */ \
+    10.0f, 1.0f,       /* mic_pre_gain, mic_clip_max */ \
+    16,                 /* dsp_delay */ \
+    0.0001f, 1e-6f,    /* step_size, leak */ \
+    1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
+    5.0f, 0.8f, 3.0f,  /* freeze_ratio, switch_threshold, nr_converge_db */ \
+    60,                 /* freeze_retry_sec */ \
+    15.0f, 4, 8, 0.96f, /* hw_thresh_db, hw_persist, hw_release, hw_notch_r */ \
+    32                  /* hw_min_hold */ \
+}
+
+/* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
+static void gfanc_config_load_env(gfanc_config_t *cfg) {
+    const char *s;
+    if ((s = getenv("GFANC_MIC_GAIN")))  cfg->mic_pre_gain = (float)atof(s);
+    if ((s = getenv("GFANC_STEP")))      cfg->step_size    = (float)atof(s);
+    if ((s = getenv("GFANC_RAMP_MS")))   cfg->ramp_ms      = atoi(s);
+    if ((s = getenv("GFANC_MUTE_MS")))   cfg->mute_hold_ms = atoi(s);
+    if ((s = getenv("GFANC_FADE_LEN")))  cfg->fade_len     = atoi(s);
+    if ((s = getenv("GFANC_LEAK")))      cfg->leak         = (float)atof(s);
+}
 
 #endif

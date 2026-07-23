@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <windows.h>
 
 #include "fir_filter.h"
@@ -36,11 +37,8 @@
 #define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
 #define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
 
-/* ── 运行时参数 (CRC-1): 环境变量 GFANC_* 可覆盖编译期 #define ── */
-static float   cfg_mic_gain  = MIC_PRE_GAIN;
-static float   cfg_step      = 0.0001f;
-static int     cfg_ramp_ms   = COLDSTART_MS;
-static int     cfg_mute_ms   = MUTE_HOLD_MS;
+/* ── 集中参数 (A2): 单一配置入口, 环境变量可覆盖 ── */
+static gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
@@ -83,6 +81,7 @@ typedef struct {
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
     volatile int peak_mute;       /* 峰值快检测触发静音 */
+    FILE  *log_file;              /* 运行时统计日志 (C1: NR/场景切换/发散事件) */
 
     /* 48k 重采样缓冲 */
     float *ref_buf, *anti_buf, *err_buf; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
@@ -141,7 +140,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 if (ctx->fb_fir[s].coeffs)
                     fb_est += fir_tick(&ctx->fb_fir[s], anti_spk[s]);
         }
-        float ref_sample  = (ref_raw - fb_est) * cfg_mic_gain;
+        float ref_sample  = (ref_raw - fb_est) * cfg.mic_pre_gain;
         /* 输入软限幅: tanh 防止吹气/冲击导致 FIR 饱和 → 非线性失真 → 发散 */
         if      (ref_sample >  MIC_CLIP_MAX) ref_sample =  tanhf(ref_sample);
         else if (ref_sample < -MIC_CLIP_MAX) ref_sample = -tanhf(-ref_sample);
@@ -178,7 +177,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
         float err_meas[E];
         for (int e = 0; e < E; e++) {
-            float es = ctx->err_buf[n*3+e] * cfg_mic_gain;
+            float es = ctx->err_buf[n*3+e] * cfg.mic_pre_gain;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
@@ -320,7 +319,7 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
            MIC_PRE_GAIN, ctx->callback_count);
     printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
            ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
-           ctx->ref_rms, cfg_mic_gain);
+           ctx->ref_rms, cfg.mic_pre_gain);
     printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
            ctx->err_rms, ctx->anti_est_rms);
     if (ctx->fb_active)
@@ -338,19 +337,22 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         float a = fabsf(ctx->fx.wc[i]);
         if (a > wc_max) wc_max = a;
     }
-    if (wc_max > ctx->sc.stub_rms * 5.0f) {
+    if (wc_max > ctx->sc.stub_rms * cfg.freeze_ratio) {
         if (!ctx->fx.freeze_lms && !ctx->freeze_permanent) {
             ctx->fx.freeze_lms = 1;
-            ctx->freeze_timer = 60;
+            ctx->freeze_timer = cfg.freeze_retry_sec;
+            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc diverged max=%.3f stub=%.3f\n",
+                                       wc_max, ctx->sc.stub_rms);
             printf("[WARN] Wc diverged! max|Wc|=%.3f "
-                   "> 5×stub(%.3f), LMS frozen (60s retry)\n",
-                   wc_max, ctx->sc.stub_rms);
+                   "> %.0f×stub(%.3f), LMS frozen (%ds retry)\n",
+                   wc_max, cfg.freeze_ratio, ctx->sc.stub_rms, cfg.freeze_retry_sec);
         }
     } else if (ctx->fx.freeze_lms && ctx->freeze_timer > 0 && !ctx->freeze_permanent) {
         ctx->freeze_timer--;
         if (ctx->freeze_timer <= 0) {
             ctx->fx.freeze_lms = 0;
             ctx->freeze_timer = -3;
+            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry\n");
             printf("[INFO] Wc freeze retry — LMS unfrozen, watching 3s...\n");
         }
     } else if (!ctx->fx.freeze_lms && ctx->freeze_timer < 0) {
@@ -358,10 +360,11 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         if (ctx->freeze_timer >= 0)
             printf("[INFO] Wc stable after unfreeze, normal operation resumed\n");
     }
-    if (ctx->freeze_timer < 0 && wc_max > ctx->sc.stub_rms * 5.0f) {
+    if (ctx->freeze_timer < 0 && wc_max > ctx->sc.stub_rms * cfg.freeze_ratio) {
         ctx->fx.freeze_lms = 1;
         ctx->freeze_permanent = 1;
         ctx->freeze_timer = 0;
+        if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc freeze PERMANENT\n");
         printf("[WARN] Wc diverged again during watch period! "
                "LMS permanently frozen until scene switch\n");
     }
@@ -383,6 +386,10 @@ static void check_convergence(rt_ctx_t *ctx) {
 static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
                                float cos_sim, float *probs) {
     if (cos_sim >= 0.8f || new_scene == ctx->cur_scene_id) return;
+
+    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: scene switch %d→%d cos=%.3f restored=%d\n",
+                               ctx->cur_scene_id, new_scene, cos_sim,
+                               ctx->scene_wc_valid[new_scene]);
 
     /* 保存旧场景的当前 Wc */
     memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
@@ -408,19 +415,11 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
     ctx->converged_frames = 0;
 }
 
-static void cfg_load_env(void) {
-    const char *s;
-    if ((s = getenv("GFANC_MIC_GAIN")))  cfg_mic_gain = (float)atof(s);
-    if ((s = getenv("GFANC_STEP")))      cfg_step     = (float)atof(s);
-    if ((s = getenv("GFANC_RAMP_MS")))   cfg_ramp_ms  = atoi(s);
-    if ((s = getenv("GFANC_MUTE_MS")))   cfg_mute_ms  = atoi(s);
-    LOG_INFO("Runtime config: gain=%.1f step=%.6f ramp=%dms mute=%dms",
-             cfg_mic_gain, cfg_step, cfg_ramp_ms, cfg_mute_ms);
-}
-
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
-    cfg_load_env();
+    gfanc_config_load_env(&cfg);
+    LOG_INFO("Runtime config: gain=%.1f step=%.6f leak=%.0e ramp=%dms mute=%dms",
+             cfg.mic_pre_gain, cfg.step_size, cfg.leak, cfg.ramp_ms, cfg.mute_hold_ms);
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 
@@ -530,7 +529,7 @@ int main(void) {
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); ret = 1; goto cleanup;
     }
     howling_init(&ctx->hw, HOWLING_ENABLED);
-    if (fxnlms_init(&ctx->fx, E, S, L, cfg_step, 1e-6f) != 0) {
+    if (fxnlms_init(&ctx->fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
     }
 
@@ -562,7 +561,17 @@ int main(void) {
     p_Pa_StartStream(stream);
     printf("Running...\n");
 
+    /* 运行时统计日志 (C1) */
+    ctx->log_file = fopen("gfanc_log.csv", "a");
+    if (ctx->log_file) {
+        time_t now = time(NULL);
+        fprintf(ctx->log_file, "# GFANC session start: %s", ctime(&now));
+        fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event\n");
+        fflush(ctx->log_file);
+    }
+
     /* 主循环: CNN 场景分类 1Hz, 驱动 Wc 更新和场景切换 */
+    int log_sec = 0;
     while (ctx->running) {
         Sleep(100);
         LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
@@ -595,6 +604,17 @@ int main(void) {
             float cos_sim = dot / (sqrtf(np)*sqrtf(nc) + 1e-10f);
 
             print_diagnostics(ctx, new_scene, cos_sim, probs);
+
+            /* 运行时统计日志 (C1) */
+            if (ctx->log_file) {
+                fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s\n",
+                        log_sec++, new_scene, probs[new_scene], cos_sim,
+                        ctx->nr_level, ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
+                        ctx->safety_mute ? "MUTE" : "",
+                        ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "");
+                fflush(ctx->log_file);
+            }
+
             check_wc_divergence(ctx);
             check_convergence(ctx);
             check_scene_switch(ctx, new_scene, cos_sim, probs);
@@ -621,6 +641,11 @@ cleanup:
         free(ctx);
     }
     p_Pa_Terminate();
+    if (ctx && ctx->log_file) {
+        time_t now = time(NULL);
+        fprintf(ctx->log_file, "# GFANC session end: %s\n", ctime(&now));
+        fclose(ctx->log_file);
+    }
     if (ret == 0) printf("Done.\n");
     return ret;
 }

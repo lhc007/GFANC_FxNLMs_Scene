@@ -155,8 +155,7 @@ GFANC_FxNLMs_Scene/
 │   ├── howling_detect.c   啸叫 DFT 检测 + IIR 陷波（逐扬声器独立状态）
 │   ├── binary_loader.c    从文件加载模型参数
 │   ├── pa_loader.c        PortAudio 运行时 DLL 加载
-│   ├── calibrate_feedback.c  反馈路径校准（逐扬声器, 16k ZOH×3）
-│   └── measure_drift.c    时钟漂移测量工具
+│   └── calibrate_feedback.c  反馈路径校准（逐扬声器, 16k ZOH×3）
 │
 ├── data/                  模型参数文件（运行时加载）
 │   ├── *.bin              二进制权重（滤波器系数、神经网络权重）
