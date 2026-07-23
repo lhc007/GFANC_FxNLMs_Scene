@@ -73,13 +73,13 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | §6.1 | 🔴 高 | fir_tick取模idiv占142%回调预算 | 回调预算217%, 嵌入式丢帧 | fir_filter.c |
-| ✅ | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 已修: wc_shadow+wc_seq影子缓冲, fade_cnt/ramp_cnt/mute_hold加volatile (ARM须TODO-5) | main_realtime.c (已修复 2026-07-23) |
+| ✅ | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 已修: wc_shadow+wc_seq影子缓冲 + fade_cnt/ramp_cnt/mute_hold/freeze_lms→LONG+Interlocked API | main_realtime.c + fxnlms_mimo.h (已修复 2026-07-23) |
 | ✅ | §6.3 | 🟢 低 | CNN每秒calloc 4×1MB | 堆碎片化 | cnn_m5_forward.c |
 | 🚫 | §6.4 | — | 功率正则被/(E·L)缩小 | 无, 数学推导证明eps未缩小 | FALSE |
 | ✅ | §6.5 | 🟡 中 | 无Wc发散防线 | 系数暴涨无保护 | main_realtime.c |
 | ✅ | §6.6 | 🟢 低 | rt_ctx_t ~211KB在main栈上 | 嵌入式栈<256KB危险 | main_realtime.c |
 | ✅ | TODO-4 | 🟡 中 | 功率epsilon=1e-10边界 (信号~1e-8时有效步长3000) | 已改1e-6, 钳位有效步长≤100 | fxnlms_mimo.c (已修复 2026-07-23) |
-| 🔶 | TODO-5 | 🟢 低 | volatile非原子 (10个监控变量) | 极低概率监控数据撕裂 | main_realtime.c |
+| ✅ | TODO-5 | 🟡 中 | volatile非原子 + fade_cnt等计数器缺ARM内存屏障 | 已修: 4计数器改LONG+InterlockedExchange/Decrement. 监控float保持volatile(显示撕裂无害) | main_realtime.c + fxnlms_mimo.h (已修复 2026-07-23) |
 | ✅ | CR-12 | 🟡 中 | safety_mute评估粒度1秒 (前100ms发散需等900ms) | 已加快检测通道: 连续10样本>0.95→0.6ms触发 | main_realtime.c (已修复 2026-07-23) |
 | ✅ | CR-13 | 🟡 中 | Wc freeze无自动恢复 (瞬时扰动触发后永久冻结) | 已加60s超时重试+3s观察期+永久冻结机制 | main_realtime.c (已修复 2026-07-23) |
 
@@ -88,7 +88,7 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | FB | — | 双FIR逐扬声器校准+运行时抵消 | 反馈衰减~34dB | calibrate_feedback.c + main_realtime.c |
-| 🔶 | TODO-2 | 🟡 中 | fb相位符号未验证 (减法可能变加法) | 需FIR峰值符号测量 | main_realtime.c |
+| — | TODO-2 | 🟡 中 | fb相位符号未验证 (减法可能变加法) | NLMS辨识完整声学冲激响应, FIR系数自动编码极性, ref_raw-fb_est恒为抵消 | calibrate_feedback.c (无需修改) |
 | — | CR-15 | 🟢 低 | fb_fir输入为上一轮anti值 (1样本延迟, 62.5μs) | 256tap中占比0.4%, 声学上不可测 | main_realtime.c (无需修改) |
 | — | B4 | 🟢 低 | 在线自适应反馈抵消 (补偿温度漂移) | 窗户ANC几何固定, 离线校准已足够; 此需求适用于耳机ANC(麦-扬声器距离可变) | 升级方案 (窗户场景不适用) |
 
@@ -107,7 +107,7 @@
 | ⚠️ | CR-17 | 🟡 中 | 零单元测试 (FIR/CNN/FxNLMS/Howling均无) | 回归靠手动 | 全局 [CR] |
 | ✅ | CR-20 | 🟢 低 | 无分级日志框架 (全部printf) | 已加LOG_ERROR/WARN/INFO/DEBUG宏于gfanc_types.h | gfanc_types.h (已修复 2026-07-23) |
 | ✅ | CRC-1 | 🟢 低 | 无运行时参数调整接口 (全部编译期#define) | 已加GFANC_MIC_GAIN/GFANC_STEP/GFANC_RAMP_MS/GFANC_MUTE_MS环境变量覆盖 | main_realtime.c (已修复 2026-07-23) |
-| ❌ | CRC-2 | 🟢 低 | 无自动化校准流水线 (校准分散在多个exe) | 校准流程手动 | 全局 [CR] |
+| ❌ | CRC-2 | 🟡 中 | 无自动化校准流水线 (校准分散在多个exe) | 量产工厂校准须一键完成(Ŝ+Fb+Pri), 当前手动分步 | 全局 [CR] |
 
 ### H. 数值精度/稳定性
 
@@ -164,10 +164,27 @@
 | 🟢 | P2-1 | 🟢 低 | 双讲检测 (语音/音乐时冻结LMS, 防ANC干扰期望信号) | 窗户ANC次要(无近端语音) | — |
 | 🟢 | P2-2 | 🟢 低 | 舒适噪声注入 (成形噪声掩盖ANC伪影) | 改善静音时主观感受 | — |
 | 🟢 | P2-3 | 🟢 低 | 输入过载保护增强 (已实现tanh基础, 可加限幅计数器+过载标志位) | 极端声压场景 | main_realtime.c |
-| 🟢 | P2-4 | 🟡 中 | 硬件看门狗 (独立硬件监控, 异常断电) | 量产必需 | 硬件设计 |
+| 🟢 | P2-4 | 🔴 高 | 硬件看门狗 (独立硬件监控, 异常断电) | 量产必需, 硬件设计阶段纳入 | 硬件设计 |
 | 🟢 | P2-5 | 🟢 低 | 通道间时延精确补偿 (当前固定DSP_DELAY=16) | 亚样本对齐精度 | main_realtime.c |
 | 🟡 | P2-6 | 🟡 中 | 窗户ANC声学实验 (参考麦伸窗外, 验证开放空间NR提升) | 预期NR 10-15dB | 实验 |
 | — | CR-11 | 🟢 低 | CrossFader期间梯度冻结 (Wc_old快照不再更新, 100ms无自适应) | 正确设计: 过渡期用混合Wc做梯度更新会导致旧场景梯度污染新Wc | main_realtime.c (无需修改) |
+
+### 量产阻塞项 (从最终量产目标倒推)
+
+以下 8 项是当前已知的、要么阻塞量产要么严重影响量产的未解决问题：
+
+| # | ID | 阻塞什么 | 谁来解决 |
+|---|----|---------|---------|
+| 1 | W-1 | 2S+3E架构是否成立 — 若空间采样不够，硬件须改版 | 声学测量 |
+| 2 | W-2/W-3 | 有效带宽上限 + NR瓶颈归因 — 确定优化方向 | 声学测量 |
+| 3 | F-B/W-14 | 次级路径未实测 — Ŝ不准 → LMS退化 → NR上限被压 | ASIO校准(git revert) |
+| 4 | §6.2/TODO-5 | ~~ARM内存模型 — 计数器需atomic~~ ✅ 已修复: Interlocked API跨x86/ARM正确 | ~~ARM移植时~~ 完成 |
+| 5 | W-11 | QCC5181定点化 — 梯度截断/量化噪声可能让ANC失效 | 定点仿真验证 |
+| 6 | CRC-2/W-15 | 工厂校准流程 — 每台设备须一键完成Ŝ+Fb+Pri校准 | 工具链开发 |
+| 7 | P2-4 | 硬件看门狗 — 量产设备异常断电后须自动恢复 | 硬件设计 |
+| 8 | CR-17 | 自动化回归测试 — 任何改动后验证NR不退化 | 测试框架 |
+
+其余表内条目要么已修复、要么是优化项不阻塞量产、要么经分析后确认无需修改。
 
 ---
 
@@ -1191,24 +1208,17 @@ float fb_err = ref_sample - (ref_raw_bp + fb_est) * MIC_PRE_GAIN; // 仅反馈�
 - **候选方案**: A) bmax 下限保护 B) softmax 替代 max C) L2 归一化
 - **位置**: `src/scene_controller.c:94-96`
 
-#### TODO-2: 反馈抵消符号未验证 🔶
-- **严重度**: 🟡 中
-- **后果**: `ref_sample = (ref_raw - fb_est) * MIC_PRE_GAIN` 假设扬声器正信号→参考麦正响应. 声学反相时减法变加法
-- **前置条件**: 校准后检查 FIR 首峰值符号 + 对比启用/禁用 fb 时的 ref_rms
-- **建议方案**: 反相时改减法为加法, 或运行时自动检测
-- **位置**: `main_realtime.c:134`
+#### TODO-2: 反馈抵消符号未验证 — (无需修改)
+- **分析**: NLMS 辨识的是完整声学冲激响应 (扬声器→参考麦). FIR 系数自动编码正确极性, `ref_raw - fb_est` 恒为抵消. 无论声学路径是否反相, fb_est 始终是参考麦实际收到的反馈分量
+- **位置**: `calibrate_feedback.c`
 
-#### TODO-3: 离线/在线 MIC_PRE_GAIN 不一致 🔶
-- **严重度**: 🟡 中
-- **后果**: `main.c: MIC_PRE_GAIN=1.0` vs `main_realtime.c: MIC_PRE_GAIN=10.0`. 离线调优参数不可直接用于在线
-- **前置条件**: 用 main.c 分别在 GAIN=1.0 和 10.0 跑同一噪声文件, 对比 NR
+#### TODO-3: 离线/在线 MIC_PRE_GAIN 不一致 — (无需修改)
+- **分析**: 离线处理峰值归一化的 WAV 文件 (GAIN=1.0), 在线处理真实 mic 信号 (GAIN=10.0). 两者信号链不同是天生的, LMS 功率归一化自动补偿增益差异. 离线调参结果不直接等同于在线, 但这不是 bug
 - **位置**: `main.c:126`, `main_realtime.c:29`
 
-#### TODO-4: 功率归一化 epsilon 边界调优 🔶
-- **严重度**: 🟡 中
-- **后果**: epsilon=1e-10. 信号功率 1e-8 级别时有效步长 `0.0001×3e7=3000`, 巨大单步更新可能触发瞬时发散
-- **前置条件**: 在线记录 `power[s]` 最小值和典型范围
-- **位置**: `src/fxnlms_mimo.c:76-84`
+#### TODO-4: 功率归一化 epsilon 边界调优 ✅ (已修复 2026-07-23)
+- **修复**: `power[s]` 初始值 1e-10 → 1e-6, 钳位有效步长上限 ≤ 100. 正常信号 power >> 1e-6 不受影响
+- **位置**: `src/fxnlms_mimo.c` (fxnlms_tick + fxnlms_tick_rt 两处)
 
 #### B-1: 固定反馈 IIR 环路不存在 ❌
 - **严重度**: 🟡 中

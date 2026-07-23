@@ -37,7 +37,7 @@ typedef struct {
     float  candidate_freq;      /* 候选啸叫频率 (Hz) */
     int    candidate_count;     /* 连续出现帧数 */
     float  active_freqs[HW_MAX_NOTCHES];  /* 已确认啸叫频率 */
-    int    active_count;        /* 当前激活的陷波数 */
+    volatile int active_count;  /* 当前激活的陷波数 (回调写, 主线程读) */
     int    notch_age[HW_MAX_NOTCHES];  /* 每个陷波器的帧龄 (≥HW_MIN_HOLD才能释放) */
     int    release_timer;       /* 啸叫消失后延迟释放计时 */
 

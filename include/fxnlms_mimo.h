@@ -11,7 +11,7 @@ typedef struct {
     int          E, S, L;
     float        step_size;
     float        leak;
-    volatile int freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 */
+    volatile long freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 (long=LONG, Interlocked兼容) */
 } fxnlms_mimo_t;
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
