@@ -52,7 +52,7 @@
 | ✅ | S-4 | 🟢 低 | Blend/Wc RMS强制对齐抹除增益 | 初始幅值不正确 | scene_controller.c |
 | 🚫 | S-5 | — | MinMax不减min与训练不匹配 | 无, Python公式一致 | FALSE |
 | — | S-6 | 🟢 低 | CNN输入延迟~1.0s (1s窗口设计特性) | 平稳场景无影响 | main_realtime.c |
-| 🔶 | TODO-1 | 🟡 中 | Blend max归一化放大伪峰 (centroid离群值) | 子滤波器权重失真 | scene_controller.c |
+| — | TODO-1 | 🟡 中 | Blend max归一化放大伪峰 (centroid离群值) | centroid数据已验证: 7/8场景ratio≤1.6x,仅Scene2=7.5x, LMS+场景记忆自修正 | scene_controller.c (无需修改) |
 | ✅ | CR-18 | 🟢 低 | 安静环境底噪被逐帧归一化放大→误分类污染scene_wc | 已改denom阈值: 1e-6→0.01, 弱信号跳过CNN保持当前场景 | scene_controller.c (已修复 2026-07-23) |
 | 🟡 | CR-19 | 🟡 中 | CNN训练数据与窗户噪声场景覆盖度未知 | 场景分类退化 | data/scene_defs.bin [CR] |
 | 🟡 | W-10 | 🟡 中 | 8类场景对窗户典型噪声(交通/施工/风声)的覆盖度待验证 | Wc初始值质量 | data/ [W] |
@@ -73,12 +73,12 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | §6.1 | 🔴 高 | fir_tick取模idiv占142%回调预算 | 回调预算217%, 嵌入式丢帧 | fir_filter.c |
-| 🔶 | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 跨平台最大阻塞项 | main_realtime.c |
+| ✅ | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 已修: wc_shadow+wc_seq影子缓冲, fade_cnt/ramp_cnt/mute_hold加volatile (ARM须TODO-5) | main_realtime.c (已修复 2026-07-23) |
 | ✅ | §6.3 | 🟢 低 | CNN每秒calloc 4×1MB | 堆碎片化 | cnn_m5_forward.c |
 | 🚫 | §6.4 | — | 功率正则被/(E·L)缩小 | 无, 数学推导证明eps未缩小 | FALSE |
 | ✅ | §6.5 | 🟡 中 | 无Wc发散防线 | 系数暴涨无保护 | main_realtime.c |
 | ✅ | §6.6 | 🟢 低 | rt_ctx_t ~211KB在main栈上 | 嵌入式栈<256KB危险 | main_realtime.c |
-| 🔶 | TODO-4 | 🟡 中 | 功率epsilon=1e-10边界 (信号~1e-8时有效步长3000) | 极静时瞬时发散风险 | fxnlms_mimo.c |
+| ✅ | TODO-4 | 🟡 中 | 功率epsilon=1e-10边界 (信号~1e-8时有效步长3000) | 已改1e-6, 钳位有效步长≤100 | fxnlms_mimo.c (已修复 2026-07-23) |
 | 🔶 | TODO-5 | 🟢 低 | volatile非原子 (10个监控变量) | 极低概率监控数据撕裂 | main_realtime.c |
 | ✅ | CR-12 | 🟡 中 | safety_mute评估粒度1秒 (前100ms发散需等900ms) | 已加快检测通道: 连续10样本>0.95→0.6ms触发 | main_realtime.c (已修复 2026-07-23) |
 | ✅ | CR-13 | 🟡 中 | Wc freeze无自动恢复 (瞬时扰动触发后永久冻结) | 已加60s超时重试+3s观察期+永久冻结机制 | main_realtime.c (已修复 2026-07-23) |

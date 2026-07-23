@@ -95,7 +95,7 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
     /* 5. 功率归一化 */
     float power[S];
     for (int s = 0; s < S; s++) {
-        power[s] = 1e-10f;
+        power[s] = 1e-6f;  /* TODO-4: 钳位有效步长上限, 极静时步长仍≤100 */
         for (int e = 0; e < E; e++)
             for (int k = 0; k < L; k++)
                 power[s] += fx->xd[(e * S + s) * L + k] * fx->xd[(e * S + s) * L + k];
@@ -153,7 +153,7 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     /* 3. 功率归一化 (基于滤波参考 Xd) */
     float power[S];
     for (int s = 0; s < S; s++) {
-        power[s] = 1e-10f;
+        power[s] = 1e-6f;  /* TODO-4: 钳位有效步长上限, 极静时步长仍≤100 */
         for (int e = 0; e < E; e++)
             for (int k = 0; k < L; k++)
                 power[s] += fx->xd[(e * S + s) * L + k] * fx->xd[(e * S + s) * L + k];

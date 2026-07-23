@@ -58,12 +58,17 @@ typedef struct {
     /* 啸叫检测 */
     howling_detect_t hw;           /* DFT 频谱检测 + IIR 陷波 */
 
+    /* §6.2 跨线程: 影子缓冲+原子序号, 主线程不直接写 fx.wc */
+    float  wc_shadow[S*L];      /* 主线程写的待生效 Wc */
+    volatile LONG wc_seq;       /* 主线程写完递增+2 */
+    LONG   wc_seq_last;         /* 回调上次看到的序号 */
+
     /* 跨回调状态 */
     float  wc_old[S*L], wc_cur[S*L];
     float  anti_spk_prev[S]; /* 上一回调末anti值, 反馈抵消跨回调连续性 */
-    int    fade_cnt;
-    int    ramp_cnt;        /* 输出渐变: RAMP_SAMPLES → 0, anti_out 0→1 */
-    int    mute_hold;       /* safety_mute 抑制: MUTE_HOLD_SAMPLES → 0, 覆盖首次 RMS */
+    volatile int fade_cnt;
+    volatile int ramp_cnt;    /* 输出渐变: RAMP_SAMPLES → 0, anti_out 0→1 */
+    volatile int mute_hold;   /* safety_mute 抑制: MUTE_HOLD_SAMPLES → 0, 覆盖首次 RMS */
     /* CNN 双缓冲: 回调填一块→原子标记就绪→切到另一块, 无数据竞争零样本丢失 */
     float  cnn_buf[2][FS_ANC];
     int    cnn_fill_idx;      /* 当前填充块 (0/1), 仅回调访问 */
@@ -127,6 +132,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     /* ── ANC @ 16kHz ── */
     float anti_spk[S];
+    /* §6.2: 检查主线程是否提交了新 Wc → 原子应用 */
+    {   LONG seq = ctx->wc_seq;
+        if (seq != ctx->wc_seq_last) {
+            memcpy(ctx->fx.wc, ctx->wc_shadow, S*L*sizeof(float));
+            ctx->wc_seq_last = seq;
+        }
+    }
+
     anti_spk[0] = ctx->anti_spk_prev[0];  /* 跨回调连续性, 首个样本用上一轮回调的末值 */
     anti_spk[1] = ctx->anti_spk_prev[1];
     for (int n = 0; n < c16k; n++) {
@@ -582,7 +595,9 @@ int main(void) {
 
         if (ctx->first_sec) {
             /* 首次 INIT: CNN 通用 Wc → 标记场景 → 冷启动 ramp */
-            fxnlms_set_wc(&ctx->fx, ctx->wc_cur);
+            /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
+            memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
+            InterlockedExchangeAdd(&ctx->wc_seq, 2);
             ctx->fx.freeze_lms = 0; ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
             ctx->scene_wc_valid[new_scene] = 1;
