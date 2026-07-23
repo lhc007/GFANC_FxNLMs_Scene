@@ -225,7 +225,7 @@ MinMax 溢出等）会无声传播至 `anti_spk`。更严重的是，输出钳�
 
 ### 待修复项（需要实际测量或数据分析后修改）
 
-#### 🔶 TODO-1: Wc Max 归一化低权重时可能放大伪峰
+#### 🔶 TODO-1: Wc Max 归一化低权重时可能放大伪峰 【需前置: centroid数据分布】
 
 **问题**：[src/scene_controller.c:94-96](src/scene_controller.c#L94-L96) 的 max 归一化 `blend[i] / bmax` 将
 blend 最大值强制映射为 1.0。当 centroid 中存在训练噪声/离群分量时，该分量会主导 Wc 构造，
@@ -244,7 +244,7 @@ blend 最大值强制映射为 1.0。当 centroid 中存在训练噪声/离群�
 
 **建议**：先用 `printf` 在运行时打印各 scene centroid 的统计特征（min/max/mean/std），根据实际数据分布选择方案。
 
-#### 🔶 TODO-2: 反馈抵消符号假设未验证
+#### 🔶 TODO-2: 反馈抵消符号假设未验证 【需前置: FIR峰值相位测量】
 
 **问题**：[main_realtime.c:159](main_realtime.c#L159) `ref_sample = (ref_raw - fb_est) * MIC_PRE_GAIN` 假设
 NLMS 辨识的 FIR 相位正确（扬声器正信号 → 参考麦正响应）。如果声学路径有反相（取决于
@@ -257,7 +257,7 @@ NLMS 辨识的 FIR 相位正确（扬声器正信号 → 参考麦正响应）�
 **修复方向**：若确认反相，将减法改为加法：`ref_sample = (ref_raw + fb_est) * MIC_PRE_GAIN`；
 或更稳健的做法：运行时检测反馈抵消效果，自动选择符号。
 
-#### 🔶 TODO-3: 离线/在线 MIC_PRE_GAIN 不一致
+#### 🔶 TODO-3: 离线/在线 MIC_PRE_GAIN 不一致 【需前置: 对比实验】
 
 **问题**：[main.c:126](main.c#L126) `MIC_PRE_GAIN=1.0` vs [main_realtime.c:29](main_realtime.c#L29)
 `MIC_PRE_GAIN=10.0`。离线验证和在线部署使用不同增益，导致：
@@ -270,7 +270,7 @@ NLMS 辨识的 FIR 相位正确（扬声器正信号 → 参考麦正响应）�
 
 **修复方向**：统一为同一值，或至少文档说明差异原因和影响。
 
-#### 🔶 TODO-4: FxNLMS 功率归一化 epsilon 边界调优
+#### 🔶 TODO-4: FxNLMS 功率归一化 epsilon 边界调优 【需前置: 在线power记录】
 
 **问题**：[src/fxnlms_mimo.c:79](src/fxnlms_mimo.c#L79) 功率计算的 epsilon（1e-10）在信号功率处于
 1e-8 级别（极小但不是零）时，`inv_pwr` 可达 3e7。如果此时误差信号因其他原因非零
