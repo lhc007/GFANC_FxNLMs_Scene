@@ -58,8 +58,9 @@ typedef struct {
     /* 啸叫检测 */
     howling_detect_t hw;           /* DFT 频谱检测 + IIR 陷波 */
 
-    /* §6.2 跨线程: 影子缓冲+原子序号, 主线程不直接写 fx.wc */
-    float  wc_shadow[S*L];      /* 主线程写的待生效 Wc */
+    /* §6.2 跨线程: 影子缓冲, 主线程不直接写/读 fx.wc */
+    float  wc_shadow[S*L];      /* 主线程写→回调应用 (Wc更新) */
+    float  wc_snapshot[S*L];    /* 回调每帧写→主线程读 (诊断/快照/切换) */
     volatile LONG wc_seq;       /* 主线程写完递增+2 */
     LONG   wc_seq_last;         /* 回调上次看到的序号 */
 
@@ -291,6 +292,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     ctx->anti_spk_prev[0] = anti_spk[0];  /* 保存末值, 供下一回调首样本反馈抵消 */
     ctx->anti_spk_prev[1] = anti_spk[1];
 
+    /* 快照 fx.wc → wc_snapshot: 主线程安全读取 (ARM float原子, 无撕裂) */
+    memcpy(ctx->wc_snapshot, ctx->fx.wc, S*L*sizeof(float));
+
     /* 内插 + 输出 (ch0=spk0, ch1=spk1) */
     int oi = 0;
     for (int n = 0; n < c16k; n++) {
@@ -347,7 +351,7 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
 static void check_wc_divergence(rt_ctx_t *ctx) {
     float wc_max = 0;
     for (int i = 0; i < S*L; i++) {
-        float a = fabsf(ctx->fx.wc[i]);
+        float a = fabsf(ctx->wc_snapshot[i]);
         if (a > wc_max) wc_max = a;
     }
     if (wc_max > ctx->sc.stub_rms * cfg.freeze_ratio) {
@@ -387,7 +391,7 @@ static void check_convergence(rt_ctx_t *ctx) {
     if (ctx->nr_level > 3.0f && !ctx->safety_mute) {
         ctx->converged_frames++;
         if (ctx->converged_frames >= 3) {
-            memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+            memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->wc_snapshot, S*L*sizeof(float));
             ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
             ctx->converged_frames = 0;
         }
@@ -405,7 +409,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
                                ctx->scene_wc_valid[new_scene]);
 
     /* 保存旧场景的当前 Wc */
-    memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->fx.wc, S*L*sizeof(float));
+    memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->wc_snapshot, S*L*sizeof(float));
     ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
 
     /* 新场景: 有记忆就用记忆, 否则用 CNN 通用 Wc */
@@ -419,7 +423,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
                ctx->cur_scene_id, new_scene);
     }
 
-    memcpy(ctx->wc_old, ctx->fx.wc, S*L*sizeof(float));
+    memcpy(ctx->wc_old, ctx->wc_snapshot, S*L*sizeof(float));
     InterlockedExchange(&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_probs, probs, 8*sizeof(float));

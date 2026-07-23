@@ -73,7 +73,7 @@
 | 状态 | ID | 严重度 | 问题 | 影响 | 位置/来源 |
 |------|----|--------|------|------|-----------|
 | ✅ | §6.1 | 🔴 高 | fir_tick取模idiv占142%回调预算 | 回调预算217%, 嵌入式丢帧 | fir_filter.c |
-| ✅ | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 已修: wc_shadow+wc_seq影子缓冲 + fade_cnt/ramp_cnt/mute_hold/freeze_lms→LONG+Interlocked API | main_realtime.c + fxnlms_mimo.h (已修复 2026-07-23) |
+| ✅ | §6.2 | 🔴 高 | 主线程/回调对fx.wc等无同步 (x86概率性安全, ARM必崩) | 已修: wc_shadow(写侧)+wc_snapshot(读侧)+atomic计数器+volatile补齐, fx.wc不再被主线程直接访问 | main_realtime.c + fxnlms_mimo.h + howling_detect.h (已修复 2026-07-23) |
 | ✅ | §6.3 | 🟢 低 | CNN每秒calloc 4×1MB | 堆碎片化 | cnn_m5_forward.c |
 | 🚫 | §6.4 | — | 功率正则被/(E·L)缩小 | 无, 数学推导证明eps未缩小 | FALSE |
 | ✅ | §6.5 | 🟡 中 | 无Wc发散防线 | 系数暴涨无保护 | main_realtime.c |
@@ -178,7 +178,7 @@
 | 1 | W-1 | 2S+3E架构是否成立 — 若空间采样不够，硬件须改版 | 声学测量 |
 | 2 | W-2/W-3 | 有效带宽上限 + NR瓶颈归因 — 确定优化方向 | 声学测量 |
 | 3 | F-B/W-14 | 次级路径未实测 — Ŝ不准 → LMS退化 → NR上限被压 | ASIO校准(git revert) |
-| 4 | §6.2/TODO-5 | ~~ARM内存模型 — 计数器需atomic~~ ✅ 已修复: Interlocked API跨x86/ARM正确 | ~~ARM移植时~~ 完成 |
+| 4 | §6.2/TODO-5 | ~~ARM内存模型~~ ✅ 已修复: fx.wc读写全隔离+atomic计数器+volatile补齐 | 完成 |
 | 5 | W-11 | QCC5181定点化 — 梯度截断/量化噪声可能让ANC失效 | 定点仿真验证 |
 | 6 | CRC-2/W-15 | 工厂校准流程 — 每台设备须一键完成Ŝ+Fb+Pri校准 | 工具链开发 |
 | 7 | P2-4 | 硬件看门狗 — 量产设备异常断电后须自动恢复 | 硬件设计 |
@@ -676,13 +676,12 @@ float x1[HW_S][HW_MAX_NOTCHES], x2[...], y1[...], y2[...];
 
 | 变量 | 访问模式 | x86 安全？ | ARM 安全？ |
 |------|---------|-----------|-----------|
-| `fx.wc[2048]` | 主线程: memcpy 读/写, 回调: 逐元素读/写 | ⚠️ 概率性 | ❌ 可能崩 |
-| `fx.freeze_lms` | 主线程: 写, 回调: 读 | ⚠️ 概率性 | ❌ |
+| `fx.wc` → wc_shadow/wc_snapshot | 主线程: 写wc_shadow/读wc_snapshot, 回调: 读写fx.wc+写snapshot | ✅ 已修 | ✅ 已修 |
+| `fx.freeze_lms` | InterlockedExchange 写, volatile long 读 | ✅ | ✅ |
 | `cnn_buf_ready` | 主线程: InterlockedExchange, 回调: InterlockedExchange | ✅ | ✅ |
-| `fade_cnt` | 主线程: 写, 回调: 读 | ⚠️ 概率性 | ❌ |
-| `ramp_cnt` | 主线程: 写, 回调: 读 | ⚠️ 概率性 | ❌ |
-| `safety_mute` | 回调: 写, 主线程: 读 | ⚠️ 概率性 | ⚠️ |
-| `nr_level` 等 volatile | 回调: 写, 主线程: 读 | ⚠️ 概率性 | ⚠️ |
+| `fade_cnt/ramp_cnt/mute_hold` | InterlockedExchange/Decrement, volatile LONG | ✅ | ✅ |
+| `safety_mute/peak_mute` | 回调: 写, 主线程: 读 (volatile, display-only) | ⚠️ 可接受 | ⚠️ 可接受 |
+| `nr_level` 等 volatile float | 回调: 写, 主线程: 读 (display-only) | ⚠️ 可接受 | ⚠️ 可接受 |
 
 **详细分析**：
 
