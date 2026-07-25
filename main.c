@@ -239,8 +239,8 @@ int main(int argc, char **argv)
     float sum_db_band = 0, sum_db_full = 0;
     clock_t t0 = clock();
 
-    printf("\n%4s | %25s | %10s | %10s | %s\n", "Sec", "Top-3 Scenes", "dB(Band)", "dB(Full)", "Action");
-    for (int i = 0; i < 85; i++) printf("-"); printf("\n");
+    printf("\n%4s | %5s | %25s | %-55s | %8s | %8s | %s\n", "Sec", "Scene", "Top-3", "Full Probs (0~K-1)", "dB(Band)", "dB(Full)", "Action");
+    for (int i = 0; i < 120; i++) printf("-"); printf("\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
@@ -298,6 +298,12 @@ int main(int argc, char **argv)
         char scene_str[40];
         snprintf(scene_str, sizeof(scene_str), "%d:%.2f,%d:%.2f,%d:%.2f",
                  top3[0], probs[top3[0]], top3[1], probs[top3[1]], top3[2], probs[top3[2]]);
+
+        /* 诊断: 完整概率分布 (0~K-1) */
+        char prob_full[120];
+        int off = 0;
+        for (int i = 0; i < K && off < (int)sizeof(prob_full) - 4; i++)
+            off += snprintf(prob_full + off, sizeof(prob_full) - off, "%d:%.2f ", i, probs[i]);
 
         /* 4e. 滞回检测 + CrossFader */
         static int first_sec = 1;
@@ -383,7 +389,7 @@ int main(int argc, char **argv)
         float db_band = 10.0f * log10f(dis_pwr_band / (err_pwr + 1e-12f));
         float db_full = 10.0f * log10f(dis_pwr_full / (err_pwr + 1e-12f));
 
-        printf("%4d | %25s | %9.2f dB | %9.2f dB | %s", sec + 1, scene_str, db_band, db_full, action);
+        printf("%4d | %5d | %22s | %-40s | %8.2f dB | %8.2f dB | %s", sec + 1, new_scene, scene_str, prob_full, db_band, db_full, action);
         if (sec == 0) printf("  [FxRMS=%.4f]", sqrtf(fx_pwr_diag / (len * E * S)));
         printf("\n");
 
