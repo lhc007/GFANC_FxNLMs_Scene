@@ -1,6 +1,8 @@
 /** SceneController — CNN + Blend + Wc 构造.
  *
  * 对应 Python: gfanc/SceneController.py
+ *
+ * K 从 scene_defs.bin 自动推导: K = n_centroids / (S * C)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,18 +13,27 @@
 extern int cnn_m5_forward(const float *audio, float *logits);
 
 int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
-                     const float *sub_filters, int filter_len)
+                     const float *sub_filters, int filter_len,
+                     int n_centroids)
 {
+    int S = SC_S, C = SC_C;
+    sc->K = n_centroids / (S * C);
+    if (sc->K < 1 || sc->K > SC_K_MAX) {
+        fprintf(stderr, "[ERROR] Invalid K=%d (n_centroids=%d, S=%d, C=%d)\n",
+                sc->K, n_centroids, S, C);
+        return -1;
+    }
     sc->centroids   = centroids;
     sc->sub_filters = sub_filters;
     sc->L           = filter_len;
     sc->cur_scene   = -1;
-    memset(sc->prev_probs, 0, sizeof(sc->prev_probs));
+    sc->prev_probs  = (float *)calloc(sc->K, sizeof(float));
+    if (!sc->prev_probs) return -1;
 
     /* stub RMS: 所有子滤波器等权求和 → RMS */
-    int S = SC_S, C = SC_C, L = filter_len;
+    int L = filter_len;
     float *stub = (float *)calloc(S * L, sizeof(float));
-    if (!stub) return -1;
+    if (!stub) { free(sc->prev_probs); return -1; }
     for (int c = 0; c < C; c++)
         for (int s = 0; s < S; s++)
             for (int l = 0; l < L; l++)
@@ -34,10 +45,16 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     return 0;
 }
 
+void scene_ctrl_free(scene_ctrl_t *sc)
+{
+    free(sc->prev_probs);
+    sc->prev_probs = NULL;
+}
+
 int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
                         float *wc_out, float *probs_out)
 {
-    int K = SC_K, S = SC_S, C = SC_C, L = sc->L;
+    int K = sc->K, S = SC_S, C = SC_C, L = sc->L;
 
     /* minmaxscaler (阈值 1e-6 防止静默信号过度放大 → CNN 输入爆炸) */
     float mx = audio[0], mn = audio[0];
@@ -65,7 +82,7 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
 
     /* CNN 前向 */
-    float logits[SC_K];
+    float logits[SC_K_MAX];
     int cnn_ret = cnn_m5_forward(cnn_in, logits);
     free(cnn_in);
 
@@ -97,6 +114,7 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     scene_ctrl_construct_wc(sc, scene_id, wc_out);
 
     sc->cur_scene = scene_id;
+    memcpy(sc->prev_probs, probs_out, K * sizeof(float));
     return scene_id;
 }
 

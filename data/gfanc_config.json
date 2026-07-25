@@ -1,0 +1,15 @@
+{
+  "fs": 16000,
+  "E": 3,
+  "S": 2,
+  "C": 15,
+  "K": 6,
+  "filter_len": 1024,
+  "pri_len": 1024,
+  "sec_len": 1024,
+  "input_len": 16000,
+  "bp_len": 1024,
+  "dsp_delay": 16,
+  "fade_len": 16,
+  "sc_dim": 30
+}

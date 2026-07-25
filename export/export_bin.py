@@ -10,20 +10,57 @@ import scipy.io as sio
 import torch
 from pathlib import Path
 
-SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = SCRIPT_DIR.parent / 'data'
-PY_PROJ = Path(r'd:/VSCodeRepository/GFANC_Scene')
-MODELS_DIR = PY_PROJ / 'models'
-PATHS_DIR = PY_PROJ / 'Primary and Secondary Path'
+# ═══════════════════════════════════════════════════════════════
+# 路径配置 — 按你的实际情况修改
+# ═══════════════════════════════════════════════════════════════
+PY_PROJ    = Path(r'D:\VSCodeRepository\GFANC_Scene')
 
-K, S, C, E = 8, 2, 15, 3
+# CNN 模型
+CNN_MODEL  = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
+
+# 子滤波器 (.mat)
+SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat'
+
+# 场景定义 (centroids)
+SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
+
+# 主/次声学路径
+PRI_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'primary_path.npy'
+SEC_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'secondary_path.npy'
+
+# 带通 FIR
+BP_FIR     = PY_PROJ / 'models' / 'bandpass_filter_20_1500Hz.mat'
+
+# 输出目录
+SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR    = SCRIPT_DIR.parent / 'data'
 OUT_DIR.mkdir(exist_ok=True)
+
+# 系统参数 (S/C/E 固定, K 从场景定义自动读取)
+S, C, E = 2, 15, 3   # S=扬声器, C=子滤波器数, E=误差麦克风数
+
+# ── 自动读取场景数 K ──
+with open(SCENE_DEF) as f:
+    scene_doc = json.load(f)
+K = len([k for k in scene_doc['scenes']])
+print(f'K = {K} scenes (auto-detected from {SCENE_DEF.name})')
+
+# 校验 CNN checkpoint 与 K 匹配
+ckpt = torch.load(str(CNN_MODEL), map_location='cpu', weights_only=True)
+ckpt_k = ckpt['linear.weight'].shape[0]
+if ckpt_k != K:
+    raise SystemExit(
+        f'ERROR: K mismatch — {SCENE_DEF.name} has {K} scenes, '
+        f'but {CNN_MODEL.name} linear layer expects {ckpt_k}. '
+        f'Check your SCENE_DEF / CNN_MODEL paths.'
+    )
+print(f'CNN checkpoint K={ckpt_k} OK')
 
 def write_bin(name, arr):
     arr = np.asarray(arr, dtype=np.float32)
     path = OUT_DIR / f'{name}.bin'
     arr.tofile(path)
-    return len(arr)
+    return arr.size  # 总元素数 (不是 len, 多维数组 len 只返回第一维)
 
 def write_json(name, data):
     with open(OUT_DIR / name, 'w') as f:
@@ -35,8 +72,7 @@ sys.path.insert(0, str(PY_PROJ))
 from gfanc.Network import m5_scene
 
 model = m5_scene(K=K, dropout=0.3)
-state = torch.load(str(MODELS_DIR / 'MIMO_M5_Scene_Real.pth'), map_location='cpu', weights_only=True)
-model.load_state_dict(state)
+model.load_state_dict(ckpt)    # ckpt 已在上面校验环节加载过
 model.eval()
 
 sd = model.state_dict()
@@ -106,7 +142,7 @@ print(f'  cnn_info.json saved')
 
 # ── 2. 子滤波器 ──
 print('Exporting sub-filters...')
-Wc_v = sio.loadmat(str(MODELS_DIR / 'MIMO_Pretrained_Control_filters_broadband.mat'))['Wc_v']
+Wc_v = sio.loadmat(str(SUB_FILTER))['Wc_v']
 write_bin('sub_filters', Wc_v)
 sub_info = {'C': C, 'S': S, 'filter_len': int(Wc_v.shape[2])}
 write_json('sub_filters_info.json', sub_info)
@@ -114,8 +150,8 @@ print(f'  sub_filters.bin: shape={list(Wc_v.shape)}')
 
 # ── 3. 声学路径 ──
 print('Exporting acoustic paths...')
-Pri = np.load(str(PATHS_DIR / 'primary_path_angle_0deg_left_3mic.npy'))
-Sec = np.load(str(PATHS_DIR / 'secondary_path_measured.npy'))
+Pri = np.load(str(PRI_PATH))
+Sec = np.load(str(SEC_PATH))
 write_bin('primary_path', Pri)
 write_bin('secondary_path', Sec)
 print(f'  primary_path.bin: {list(Pri.shape)}')
@@ -123,15 +159,13 @@ print(f'  secondary_path.bin: {list(Sec.shape)}')
 
 # ── 4. 场景定义 ──
 print('Exporting scene definitions...')
-with open(MODELS_DIR / 'scene_definitions_real.json') as f:
-    scene_doc = json.load(f)
 centroids = np.array([scene_doc['scenes'][str(k)]['centroid'] for k in range(K)], dtype=np.float32)
 write_bin('scene_defs', centroids)
 print(f'  scene_defs.bin: {list(centroids.shape)}')
 
 # ── 5. 带通 FIR ──
 print('Exporting bandpass FIR...')
-bp = sio.loadmat(str(MODELS_DIR / 'bandpass_filter_20_1500Hz.mat'))
+bp = sio.loadmat(str(BP_FIR))
 bp_coeff = bp['fir_bandpass_coeff'].flatten().astype(np.float32)
 write_bin('bandpass_fir', bp_coeff)
 print(f'  bandpass_fir.bin: {len(bp_coeff)} taps')

@@ -78,11 +78,11 @@ typedef struct {
     int    first_sec;
 
     /* 每场景记忆: 保存已收敛的 Wc, 下次切回时直接恢复 */
-    float  scene_wc[SC_K][S*L];
-    int    scene_wc_valid[SC_K];  /* 1=该场景已有收敛好的 Wc */
+    float  scene_wc[SC_K_MAX][S*L];
+    int    scene_wc_valid[SC_K_MAX];  /* 1=该场景已有收敛好的 Wc */
     int    cur_scene_id;
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
-    float  anchor_probs[SC_K];    /* 进入当前场景时的probs锚点 (S-1修复) */
+    float  anchor_probs[SC_K_MAX];    /* 进入当前场景时的probs锚点 (S-1修复) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
@@ -474,10 +474,11 @@ int main(void) {
     float *sec_path, *sub_filters, *centroids, *bp_coeff;
     bin_load_float("data/secondary_path.bin", &sec_path);
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
-    bin_load_float("data/scene_defs.bin", &centroids);
+    int n_scene = bin_load_float("data/scene_defs.bin", &centroids);
     bin_load_float("data/bandpass_fir.bin", &bp_coeff);
-    extern int cnn_m5_init(void); cnn_m5_init();
-    printf("  OK L=%d\n", sub_len / (15*2));
+    extern int cnn_m5_init(void); extern int cnn_m5_get_K(void);
+    cnn_m5_init();
+    printf("  OK K=%d L=%d\n", cnn_m5_get_K(), sub_len / (15*2));
 
     /* 初始化 ANC 模块 */
     int ret = 0;
@@ -544,7 +545,7 @@ int main(void) {
     }
 #endif
 
-    if (scene_ctrl_init(&ctx->sc, centroids, sub_filters, L) != 0) {
+    if (scene_ctrl_init(&ctx->sc, centroids, sub_filters, L, n_scene) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); ret = 1; goto cleanup;
     }
     howling_init(&ctx->hw, HOWLING_ENABLED);

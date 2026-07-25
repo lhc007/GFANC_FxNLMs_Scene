@@ -117,7 +117,6 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define E       3
 #define S       2
 #define C       15
-#define K       8
 #define FS      16000
 #define BP_LEN  1024
 #define PRI_LEN 1024
@@ -151,7 +150,7 @@ int main(int argc, char **argv)
     int n_scene  = bin_load_float("data/scene_defs.bin", &centroids);
     int L = sub_len / (C * S); /* 1024 */
     printf("  OK: sec=%d pri=%d sub=%d bp=%d L=%d\n", sec_len, pri_len, sub_len, bp_len, L);
-    (void)pri_len; (void)n_scene;
+    (void)pri_len;
 
     /* ── 2. 初始化组件 ── */
     /* CNN 必须先初始化 (加载权重) */
@@ -187,7 +186,7 @@ int main(int argc, char **argv)
 
     /* 2d. Scene Controller */
     scene_ctrl_t sc;
-    if (scene_ctrl_init(&sc, centroids, sub_filters, L) != 0) {
+    if (scene_ctrl_init(&sc, centroids, sub_filters, L, n_scene) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); return 1;
     }
 
@@ -279,8 +278,9 @@ int main(int argc, char **argv)
         dis_pwr_band /= (len * E); dis_pwr_full /= (len * E);
 
         /* 4d. CNN 场景分类 (输入: noise_bp + minmaxscaler) */
-        float probs[K];
+        float probs[SC_K_MAX];
         int old_scene = sc.cur_scene;
+        int K = sc.K;
         int new_scene = scene_ctrl_process(&sc, noise_bp + start, wc_cur, probs);
 
         /* Top-3 */
@@ -319,7 +319,7 @@ int main(int argc, char **argv)
                 snprintf(action, sizeof(action), "RESET");
             }
         }
-        memcpy(sc.prev_probs, probs, K * sizeof(float));
+        memcpy(sc.prev_probs, probs, sc.K * sizeof(float));
         wc_fx = fx.wc; /* 指向 FxNLMS 内部 Wc */
 
         /* 首秒诊断 */
@@ -406,6 +406,7 @@ int main(int argc, char **argv)
     /* ── 6. 清理 ── */
     free(anti_out); free(err_out); free(noise_bp);
     fxnlms_free(&fx);
+    scene_ctrl_free(&sc);
     for (int i = 0; i < E * S; i++) free(sec_firs[i].delay_line);
     free(sec_firs); free(sec_coeffs);
     for (int e = 0; e < E; e++) free(pri_firs[e].delay_line);

@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include "binary_loader.h"
 
-#define K        8
 #define CH       64
 #define INPUT_LEN 16000
 #define STEM_K   80
@@ -60,6 +59,9 @@ typedef struct {
 } cnn_m5_t;
 
 static cnn_m5_t g_cnn;
+static int g_K = 0;  /* 运行时从 linear_weight 文件大小推导 */
+
+int cnn_m5_get_K(void) { return g_K; }
 
 /* ── 加载 ── */
 static int load_conv(const char *tag, conv_layer_t *c, int oc, int ic, int k, int s, int p) {
@@ -113,9 +115,16 @@ int cnn_m5_init(void)
         if (load_bn(tag, &r->bn2, CH)) return -1;
     }
 
-    /* FC */
-    if (bin_load_float("data/cnn_linear_weight.bin", &g_cnn.fc_weight) < 0) return -1;
-    if (bin_load_float("data/cnn_linear_bias.bin", &g_cnn.fc_bias) < 0) return -1;
+    /* FC — K 从 linear_weight 文件大小推导: n = K*CH → K = n/CH */
+    int n_w = bin_load_float("data/cnn_linear_weight.bin", &g_cnn.fc_weight);
+    int n_b = bin_load_float("data/cnn_linear_bias.bin", &g_cnn.fc_bias);
+    if (n_w < 0 || n_b < 0) return -1;
+    g_K = n_w / CH;
+    if (g_K < 1 || g_K > 16) {
+        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats)\n", g_K, n_w);
+        return -1;
+    }
+    (void)n_b;
 
     return 0;
 }
@@ -269,7 +278,7 @@ int cnn_m5_forward(const float *audio, float *logits)
     }
 
     /* Linear */
-    for (int o = 0; o < K; o++) {
+    for (int o = 0; o < g_K; o++) {
         float sum = g_cnn.fc_bias ? g_cnn.fc_bias[o] : 0.0f;
         for (int i = 0; i < CH; i++)
             sum += gap[i] * g_cnn.fc_weight[o * CH + i];

@@ -41,7 +41,25 @@ cd GFANC_FxNLMs_Scene
 
 项目目录中的 `data/` 文件夹包含了训练好的模型权重，不需要额外下载。
 
-### 2. 编译
+### 2. 导出权重（仅需做过训练后执行）
+
+如果你在 Python 项目 [GFANC_Scene](../GFANC_Scene) 中重新训练了 CNN 模型或子滤波器，需要重新导出为 C 可用的 `.bin` 文件：
+
+```bash
+pip install numpy scipy torch   # 一次性依赖
+python export/export_bin.py     # 读取 GFANC_Scene 的模型和路径，写入 data/
+```
+
+默认自动查找同级目录的 `GFANC_Scene`，也可以手动指定：
+
+```bash
+set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
+python export/export_bin.py
+```
+
+导出内容：CNN 权重（58 个 `.bin`）、子滤波器、场景 centroids、主/次路径、带通 FIR、配置 JSON。
+
+### 3. 编译
 
 打开终端（PowerShell 或 Git Bash），在项目目录下执行：
 
@@ -65,7 +83,7 @@ make all      # 两个都编译
 make clean    # 清理
 ```
 
-### 3. 运行
+### 4. 运行
 
 **离线版** — 处理一段噪声录音：
 ```bash
@@ -81,7 +99,7 @@ make clean    # 清理
 ./gfanc_realtime.exe
 ```
 
-运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `22` 和 `18`），然后开始实时降噪。按 `Ctrl+C` 停止。
+运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `23`），然后开始实时降噪。按 `Ctrl+C` 停止。
 
 ## 运行示例
 
