@@ -125,10 +125,10 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     /* 声道拆分 + 抽取 (ch0=ref, ch1-3=err) */
     for (int n = 0; n < c16k; n++) {
-        ctx->ref_buf[n] = in[(n*3)*6 + 0];  /* 最近邻抽取: 每3个取1个 */
-        ctx->err_buf[n*3+0] = in[(n*3)*6 + 1];
-        ctx->err_buf[n*3+1] = in[(n*3)*6 + 2];
-        ctx->err_buf[n*3+2] = in[(n*3)*6 + 3];
+        ctx->ref_buf[n] = in[(n*3)*4 + 0];  /* 最近邻抽取: 每3个取1个 */
+        ctx->err_buf[n*3+0] = in[(n*3)*4 + 1];
+        ctx->err_buf[n*3+1] = in[(n*3)*4 + 2];
+        ctx->err_buf[n*3+2] = in[(n*3)*4 + 3];
     }
 
     /* ── ANC @ 16kHz ── */
@@ -563,7 +563,7 @@ int main(void) {
     printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
     /* 打开 PortAudio 流 */
-    PaStreamParams in_p = { in_dev, 6, 0x00000001, 0.01, NULL };  /* paFloat32 */
+    PaStreamParams in_p = { in_dev, 4, 0x00000001, 0.01, NULL };  /* paFloat32 */
     PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.01, NULL };
     stream = NULL;
     int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, ctx);

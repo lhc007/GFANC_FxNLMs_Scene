@@ -8,6 +8,7 @@ build/
 anti_out.wav
 error_out.wav
 out.txt
+gfanc_log.csv
 
 # IDE
 .vscode/
