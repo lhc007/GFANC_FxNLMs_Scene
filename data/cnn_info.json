@@ -1,5 +1,5 @@
 {
-  "K": 6,
+  "K": 4,
   "input_len": 16000,
   "stem_out": 64,
   "stem_kernel": 80,
@@ -16,6 +16,6 @@
   "pool_kernel": 4,
   "pool_stride": 4,
   "fc_in": 64,
-  "fc_out": 6,
+  "fc_out": 4,
   "bn_eps": 1e-05
 }
