@@ -426,7 +426,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
     memcpy(ctx->wc_old, ctx->wc_snapshot, S*L*sizeof(float));
     InterlockedExchange(&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
-    memcpy(ctx->anchor_probs, probs, 8*sizeof(float));
+    memcpy(ctx->anchor_probs, probs, ctx->sc.K * sizeof(float));
     InterlockedExchange(&ctx->fade_cnt, FADE_LEN);
     InterlockedExchange(&ctx->mute_hold, MUTE_HOLD_SAMPLES);
     ctx->cur_scene_id = new_scene;
@@ -597,12 +597,13 @@ int main(void) {
         LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
         if (ready < 0) continue;
 
-        float probs[8];
+        float probs[SC_K_MAX] = {0};
         int new_scene;
+        const int K = ctx->sc.K;
 
         /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
         if (ctx->fade_cnt > 0) {
-            memcpy(probs, ctx->sc.prev_probs, 8*sizeof(float));
+            memcpy(probs, ctx->sc.prev_probs, K * sizeof(float));
             new_scene = ctx->cur_scene_id;
         } else {
             new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, probs);
@@ -618,7 +619,7 @@ int main(void) {
             memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));
             ctx->scene_wc_valid[new_scene] = 1;
             ctx->cur_scene_id = new_scene;
-            memcpy(ctx->anchor_probs, probs, 8*sizeof(float));
+            memcpy(ctx->anchor_probs, probs, K * sizeof(float));
             InterlockedExchange(&ctx->ramp_cnt, RAMP_SAMPLES);
             InterlockedExchange(&ctx->mute_hold, MUTE_HOLD_SAMPLES);
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
@@ -627,7 +628,7 @@ int main(void) {
         } else {
             /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
             float dot = 0, np = 0, nc = 0;
-            for (int k = 0; k < 8; k++) {
+            for (int k = 0; k < K; k++) {
                 dot += ctx->anchor_probs[k] * probs[k];
                 np  += ctx->anchor_probs[k] * ctx->anchor_probs[k];
                 nc  += probs[k] * probs[k];
@@ -650,7 +651,7 @@ int main(void) {
             check_convergence(ctx);
             check_scene_switch(ctx, new_scene, cos_sim, probs);
         }
-        memcpy(ctx->sc.prev_probs, probs, 8*sizeof(float));
+        memcpy(ctx->sc.prev_probs, probs, K * sizeof(float));
     }
 
     printf("\nStopping...\n");
