@@ -122,8 +122,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define PRI_LEN 1024
 #define SEC_LEN 1024
 #define DSP_DELAY 16
-#define MIC_PRE_GAIN  1.0f    /* 输入预增益 (离线已做峰值归一化, 默认1.0; >1.0模拟硬件前放) */
-#define FADE_LEN  1600  /* Wc切换CrossFader时长 (100ms @16k, =20Hz×2周期) */
+/* R-9: 增益/渐变参数统一由 cfg 管理, GFANC_MIC_GAIN / GFANC_FADE_LEN 等 env 变量可覆盖 */
 
 /* ══════════════════════════════════════════════════════════
    主函数
@@ -282,7 +281,7 @@ int main(int argc, char **argv)
         /* 4a. ref_filt = bandpass(noise_bp) × pre_gain */
         float *ref_filt = (float *)malloc(chunk * sizeof(float));
         for (int i = 0; i < len; i++)
-            ref_filt[i] = fir_tick(&bp_fir, noise_bp[start + i]) * MIC_PRE_GAIN;
+            ref_filt[i] = fir_tick(&bp_fir, noise_bp[start + i]) * cfg.mic_pre_gain;
 
         /* 4b. Dis_band = Pri(ref_filt), Dis_full = Pri(noise_bp) */
         float *dis_buf  = (float *)calloc(E * len, sizeof(float));
@@ -361,7 +360,7 @@ int main(int argc, char **argv)
             }
             if (dot / (sqrtf(np) * sqrtf(nc) + 1e-10f) < 0.8f) {
                 memcpy(wc_old, fx.wc, S * L * sizeof(float));
-                fade_cnt = FADE_LEN;
+                fade_cnt = cfg.fade_len;
                 snprintf(action, sizeof(action), "RESET");
             }
         }
@@ -387,7 +386,7 @@ int main(int argc, char **argv)
 
             /* CrossFader: 混合 Wc */
             if (fade_cnt > 0) {
-                float a = (float)fade_cnt / FADE_LEN;
+                float a = (float)fade_cnt / cfg.fade_len;
                 for (int i = 0; i < S * L; i++)
                     fx.wc[i] = a * wc_old[i] + (1.0f - a) * wc_cur[i];
                 fade_cnt--;

@@ -25,9 +25,7 @@ typedef struct {
 typedef struct {
     /* 音频链 */
     int   fs_hw, fs_anc;         /* 硬件/处理采样率 */
-    float mic_pre_gain;          /* 输入数字预增益 */
-    float mic_clip_max;          /* 软限幅阈值 */
-    int   dsp_delay;             /* DSP 缓冲延迟 (样本@16k) */
+    float mic_pre_gain;          /* 输入数字预增益 (env: GFANC_MIC_GAIN) */
 
     /* ANC 自适应 */
     float step_size;             /* LMS 步长 μ */
@@ -53,8 +51,7 @@ typedef struct {
 /* 默认配置 (与当前 #define 一致) */
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
-    10.0f, 1.0f,       /* mic_pre_gain, mic_clip_max */ \
-    16,                 /* dsp_delay */ \
+    10.0f,              /* mic_pre_gain */ \
     0.0001f, 1e-6f,    /* step_size, leak */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
     5.0f, 0.8f, 3.0f,  /* freeze_ratio, switch_threshold, nr_converge_db */ \

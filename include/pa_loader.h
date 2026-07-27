@@ -42,10 +42,14 @@ typedef struct {
     double inputBufferAdcTime, currentTime, outputBufferDacTime;
 } PaCbTimeInfo;
 
+/* R-26: 按 portaudio.h 正确布局 — 原版 name/type 错位, x64 巧合工作但 32-bit 必崩 */
 typedef struct {
     int         structVersion;
+    int         type;            /* PaHostApiTypeId (原错放在 name 之后) */
     const char *name;
-    int         type, deviceCount, defaultInputDevice, defaultOutputDevice;
+    int         deviceCount;
+    int         defaultInputDevice;
+    int         defaultOutputDevice;
 } PaHostApiInfo2;
 
 typedef struct {

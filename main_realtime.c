@@ -26,13 +26,9 @@
 #define BP_LEN   1024
 #define SEC_LEN  1024
 #define DSP_DELAY 16
-#define FADE_LEN 1600  /* Wc切换CrossFader时长 (100ms @16k, =20Hz×2周期, ≥FIR长度) */
-#define MIC_PRE_GAIN  10.0f    /* 输入数字预增益 (噪声源良好耦合时 8-10x 足够) */
+/* R-9: 以下参数统一由 cfg (gfanc_config_t) 管理, env 变量可直接生效
+   GFANC_RAMP_MS / GFANC_MUTE_MS / GFANC_FADE_LEN / GFANC_MIC_GAIN */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */
-#define COLDSTART_MS  400     /* 冷启动 ramp 时长 ms (anti_out 0→1) */
-#define RAMP_SAMPLES   ((FS_ANC * COLDSTART_MS) / 1000)
-#define MUTE_HOLD_MS  1500    /* safety_mute 抑制时长 ms (需 >1s 覆盖下一次 RMS 评估) */
-#define MUTE_HOLD_SAMPLES ((FS_ANC * MUTE_HOLD_MS) / 1000)
 #define FB_LEN       256     /* 反馈路径 FIR 长度 */
 #define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
 #define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
@@ -179,7 +175,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
         /* CrossFader */
         if (ctx->fade_cnt > 0) {
-            float a = (float)ctx->fade_cnt / FADE_LEN;
+            float a = (float)ctx->fade_cnt / cfg.fade_len;
             for (int i = 0; i < S*L; i++)
                 ctx->fx.wc[i] = a * ctx->wc_old[i] + (1.0f - a) * ctx->wc_cur[i];
             if (InterlockedDecrement(&ctx->fade_cnt) == 0)
@@ -298,7 +294,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
         /* 冷启动 ramp: INIT/RESET 后 anti_out 从 0 平滑渐入 */
         if (ctx->ramp_cnt > 0) {
-            float ramp = 1.0f - (float)ctx->ramp_cnt / RAMP_SAMPLES;
+            float ramp = 1.0f - (float)ctx->ramp_cnt / (FS_ANC * cfg.ramp_ms / 1000);
             anti_spk[0] *= ramp;
             anti_spk[1] *= ramp;
             InterlockedDecrement(&ctx->ramp_cnt);
@@ -357,7 +353,7 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
            ctx->nr_level, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
            ctx->ramp_cnt > 0 ? " [RAMP]" : "",
-           MIC_PRE_GAIN, ctx->callback_count);
+           cfg.mic_pre_gain, ctx->callback_count);
     printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
            ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
            ctx->ref_rms, cfg.mic_pre_gain);
@@ -460,8 +456,8 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
     InterlockedExchange(&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_probs, probs, ctx->sc.K * sizeof(float));
-    InterlockedExchange(&ctx->fade_cnt, FADE_LEN);
-    InterlockedExchange(&ctx->mute_hold, MUTE_HOLD_SAMPLES);
+    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
+    InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
     ctx->cur_scene_id = new_scene;
     ctx->converged_frames = 0;
 }
@@ -552,7 +548,7 @@ int main(void) {
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
     g_ctx = ctx;
     ctx->running = 1; ctx->first_sec = 1;
-    InterlockedExchange(&ctx->mute_hold, MUTE_HOLD_SAMPLES);  /* 启动抑制 safety_mute, 覆盖第一秒 Wc=0 期 */
+    InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));  /* 启动抑制 safety_mute */
 
     ctx->bp_fir.coeffs = bp_coeff; ctx->bp_fir.n_taps = BP_LEN;
     ctx->bp_fir.delay_line = (double *)calloc(BP_LEN, sizeof(double));
@@ -690,10 +686,10 @@ int main(void) {
             ctx->scene_wc_valid[new_scene] = 1;
             ctx->cur_scene_id = new_scene;
             memcpy(ctx->anchor_probs, probs, K * sizeof(float));
-            InterlockedExchange(&ctx->ramp_cnt, RAMP_SAMPLES);
-            InterlockedExchange(&ctx->mute_hold, MUTE_HOLD_SAMPLES);
+            InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
+            InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
-                   new_scene, probs[new_scene], COLDSTART_MS, MUTE_HOLD_MS);
+                   new_scene, probs[new_scene], cfg.ramp_ms, cfg.mute_hold_ms);
             ctx->first_sec = 0;
         } else {
             /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
@@ -740,6 +736,7 @@ int main(void) {
 
 cleanup:
     if (ctx) {
+        FILE *lf = ctx->log_file;  /* R-10: free(ctx) 前取出, 避免 use-after-free */
         free(ctx->bp_fir.delay_line);
         for (int e = 0; e < E; e++) free(ctx->bp_err[e].delay_line);
         if (ctx->sec_firs) {
@@ -751,13 +748,14 @@ cleanup:
         fxnlms_free(&ctx->fx);
         free(ctx->ref_buf); free(ctx->anti_buf); free(ctx->err_buf);
         free(ctx);
+        ctx = NULL;
+        if (lf) {
+            time_t now = time(NULL);
+            fprintf(lf, "# GFANC session end: %s\n", ctime(&now));
+            fclose(lf);
+        }
     }
     p_Pa_Terminate();
-    if (ctx && ctx->log_file) {
-        time_t now = time(NULL);
-        fprintf(ctx->log_file, "# GFANC session end: %s\n", ctime(&now));
-        fclose(ctx->log_file);
-    }
     if (ret == 0) printf("Done.\n");
     return ret;
 }
