@@ -17,6 +17,31 @@
 #include "fxnlms_mimo.h"
 #include "howling_detect.h"
 
+/* R-14: 2阶 Butterworth 低通 biquad (48kHz侧抗混叠, fc≈6kHz) */
+typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
+
+static void biquad_init_lpf(biquad_t *f, float fc, float fs)
+{
+    float w0 = 2.0f * 3.14159265f * fc / fs;
+    float c = cosf(w0), s = sinf(w0);
+    float alpha = s / (2.0f * 0.70710678f);  /* Q=1/√2 Butterworth */
+    float a0 = 1.0f + alpha;
+    f->b0 = (1.0f - c) / (2.0f * a0);
+    f->b1 = (1.0f - c) / a0;
+    f->b2 = f->b0;
+    f->a1 = -2.0f * c / a0;
+    f->a2 = (1.0f - alpha) / a0;
+    f->z1 = f->z2 = 0.0f;
+}
+
+static float biquad_tick(biquad_t *f, float x)
+{
+    float y = f->b0 * x + f->z1;
+    f->z1 = f->b1 * x - f->a1 * y + f->z2;
+    f->z2 = f->b2 * x - f->a2 * y;
+    return y;
+}
+
 /* ══════════════════════════════════════════════════════════ */
 #define FS_HW    48000
 #define FS_ANC   16000
@@ -86,13 +111,13 @@ typedef struct {
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
     int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
     int      cnn_drop_cnt;      /* R-20: CNN 缓冲覆盖计数 (主线程超1s未消费) */
+    biquad_t aa_filt[4];        /* R-14: 48k输入抗混叠低通 (ch0=ref, ch1-3=err, fc≈6kHz) */
     FILE  *log_file;              /* 运行时统计日志 (C1: NR/场景切换/发散事件) */
 
     /* 48k 重采样缓冲 */
     float *ref_buf, *anti_buf, *err_buf; /* 堆分配 (main初始化), 存16k速率数据, 名_48k为历史遗留 */
-    int    dec_phase;
-
-    /* 统计 */
+    int    dec_phase;       /* 输入 3:1 抽取相位 (0/1/2) */
+    int    out_phase;       /* R-15: 输出 1:3 内插相位 (0/1/2) */
     volatile float nr_level, ref_rms, err_rms, dist_rms;
     volatile float ch_rms[4];    /* 原始声道 RMS: ch0=ref, ch1-3=err */
     volatile float anti_rms;     /* 反噪声 RMS */
@@ -122,16 +147,22 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     if (!ctx->running) { memset(out, 0, c48k * 2 * sizeof(float)); return 1; }
 
-    /* R-5: 3:1 抽取 + 跨回调相位保持 — WASAPI/WDM-KS 可变帧长不再破坏相位连续性 */
+    /* R-5: 3:1 抽取 + 跨回调相位保持 — WASAPI/WDM-KS 可变帧长不再破坏相位连续性
+       R-14: 抽取前 2阶 Butterworth 低通抗混叠 (fc≈6kHz, 防止>8kHz折叠入通带) */
     int c16k = 0;
     {
         int p = ctx->dec_phase;
         for (int i = 0; i < c48k; i++) {
+            /* 抗混叠: 全 48k 样本滤波 (每通道 ~5 MAC, 4通道总计 ~1920 MAC/回调 << 0.5% 预算) */
+            float ch0 = biquad_tick(&ctx->aa_filt[0], in[i*4 + 0]);
+            float ch1 = biquad_tick(&ctx->aa_filt[1], in[i*4 + 1]);
+            float ch2 = biquad_tick(&ctx->aa_filt[2], in[i*4 + 2]);
+            float ch3 = biquad_tick(&ctx->aa_filt[3], in[i*4 + 3]);
             if (p == 0) {
-                ctx->ref_buf[c16k]    = in[i*4 + 0];  /* ch0=ref */
-                ctx->err_buf[c16k*3+0] = in[i*4 + 1];  /* ch1-3=err */
-                ctx->err_buf[c16k*3+1] = in[i*4 + 2];
-                ctx->err_buf[c16k*3+2] = in[i*4 + 3];
+                ctx->ref_buf[c16k]    = ch0;
+                ctx->err_buf[c16k*3+0] = ch1;
+                ctx->err_buf[c16k*3+1] = ch2;
+                ctx->err_buf[c16k*3+2] = ch3;
                 c16k++;
             }
             p = (p == 2) ? 0 : p + 1;
@@ -151,6 +182,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
     anti_spk[0] = ctx->anti_spk_prev[0];  /* 跨回调连续性, 首个样本用上一轮回调的末值 */
     anti_spk[1] = ctx->anti_spk_prev[1];
+    float prev_anti_spk[2] = { ctx->anti_spk_prev[0], ctx->anti_spk_prev[1] }; /* R-15: 保存上回调末值供输出内插 */
     for (int n = 0; n < c16k; n++) {
         float ref_raw     = ctx->ref_buf[n];             /* 原始电平 (用于 RMS 显示) */
         /* R-8: 输入 isfinite 防护 — 驱动毛刺/热插拔 NaN 进入延迟线则永久中毒 */
@@ -328,22 +360,31 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     /* 快照 fx.wc → wc_snapshot: 主线程安全读取 (ARM float原子, 无撕裂) */
     memcpy(ctx->wc_snapshot, ctx->fx.wc, S*L*sizeof(float));
 
-    /* R-5: ZOH×3 内插 + 输出 — 保证恰好写入 c48k*2 floats, 无尾部残留 */
+    /* R-5+R-15: 相位追踪线性内插 ×3 → 48k — 替代 ZOH, 镜像压制 ~25dB
+       状态机保证恰好写入 c48k*2 floats, 跨回调相位连续 */
     {
-        int oi = 0;
-        for (int n = 0; n < c16k; n++) {
-            float a0 = ctx->anti_buf[n], a1 = ctx->anti_buf[n + c16k];
-            if (!isfinite(a0)) a0 = 0.0f;
-            if (!isfinite(a1)) a1 = 0.0f;
-            if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
-            if (a1 > 1.0f) a1 = 1.0f; if (a1 < -1.0f) a1 = -1.0f;
-            for (int r = 0; r < 3; r++) { out[oi++] = a0; out[oi++] = a1; }
+        int oi = 0, anti_idx = 0;
+        int p = ctx->out_phase;  /* R-15: 跨回调输出相位 */
+        float a0p = prev_anti_spk[0], a1p = prev_anti_spk[1];  /* 上回调末值 */
+        for (; oi < c48k * 2; p = (p == 2) ? 0 : p + 1) {
+            float a0, a1;
+            if (anti_idx < c16k) {
+                float a0c = ctx->anti_buf[anti_idx];
+                float a1c = ctx->anti_buf[anti_idx + c16k];
+                if (!isfinite(a0c)) a0c = 0.0f;
+                if (!isfinite(a1c)) a1c = 0.0f;
+                if (a0c > 1.0f) a0c = 1.0f; if (a0c < -1.0f) a0c = -1.0f;
+                if (a1c > 1.0f) a1c = 1.0f; if (a1c < -1.0f) a1c = -1.0f;
+                float t = (float)p / 3.0f;
+                a0 = a0p + t * (a0c - a0p);
+                a1 = a1p + t * (a1c - a1p);
+                if (p == 2) { a0p = a0c; a1p = a1c; anti_idx++; }
+            } else {
+                a0 = a0p; a1 = a1p;  /* hold last */
+            }
+            out[oi++] = a0; out[oi++] = a1;
         }
-        /* 补齐尾部: c16k×6 可能 < c48k×2 (WASAPI 帧长非3倍数时) */
-        while (oi < c48k * 2) {
-            out[oi++] = ctx->anti_spk_prev[0];
-            out[oi++] = ctx->anti_spk_prev[1];
-        }
+        ctx->out_phase = p;  /* 保存相位供下个回调 */
     }
 
     InterlockedIncrement(&ctx->callback_count);
@@ -572,6 +613,8 @@ int main(void) {
     rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
     if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
+    /* R-14: 初始化 4 通道抗混叠低通 (fc=6.5kHz @48k, 2阶 Butterworth) */
+    for (int c = 0; c < 4; c++) biquad_init_lpf(&ctx->aa_filt[c], 6500.0f, 48000.0f);
     g_ctx = ctx;
     ctx->running = 1; ctx->first_sec = 1;
     InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));  /* 启动抑制 safety_mute */
