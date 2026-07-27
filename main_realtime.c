@@ -87,6 +87,8 @@ typedef struct {
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
     volatile int peak_mute;       /* 峰值快检测触发静音 */
+    int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
+    int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
     FILE  *log_file;              /* 运行时统计日志 (C1: NR/场景切换/发散事件) */
 
     /* 48k 重采样缓冲 */
@@ -145,6 +147,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     anti_spk[1] = ctx->anti_spk_prev[1];
     for (int n = 0; n < c16k; n++) {
         float ref_raw     = ctx->ref_buf[n];             /* 原始电平 (用于 RMS 显示) */
+        /* R-8: 输入 isfinite 防护 — 驱动毛刺/热插拔 NaN 进入延迟线则永久中毒 */
+        if (!isfinite(ref_raw)) { ref_raw = 0.0f; ctx->nan_in_cnt++; }
 
         /* 反馈抵消: 估计扬声器→参考麦的反馈分量并减去 */
         float fb_est = 0;
@@ -191,7 +195,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
         float err_meas[E];
         for (int e = 0; e < E; e++) {
-            float es = ctx->err_buf[n*3+e] * cfg.mic_pre_gain;
+            float es = ctx->err_buf[n*3+e];
+            if (!isfinite(es)) { es = 0.0f; ctx->nan_in_cnt++; }
+            es *= cfg.mic_pre_gain;
             if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
             else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
@@ -203,11 +209,28 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         else
             fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
 
-        /* NaN/Inf 保护 + 输出钳位 (防止 FxNLMS 计算值远超 ±1.0 导致硬截断失真) */
+        /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
+           驱动毛刺 → NaN 进入 FIR 延迟线 → 永久 NaN 输出 (延迟线无自恢复能力)
+           看门狗: 连续 >1s NaN 输出 → 复位全部 FIR 延迟线 (memset+指针归零, <10μs) */
+        int nan_anti = 0;
         for (int s = 0; s < S; s++) {
-            if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
+            if (!isfinite(anti_spk[s])) { anti_spk[s] = 0.0f; nan_anti = 1; }
             if (anti_spk[s] > 1.0f) anti_spk[s] = 1.0f;
             if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
+        }
+        if (nan_anti) {
+            ctx->nan_out_hold++;
+            if (ctx->nan_out_hold > FS_ANC) {
+                fir_reset(&ctx->bp_fir);
+                for (int e = 0; e < E; e++) fir_reset(&ctx->bp_err[e]);
+                for (int i = 0; i < E*S; i++) fir_reset(&ctx->sec_firs[i]);
+                for (int s = 0; s < 2; s++)
+                    if (ctx->fb_fir[s].coeffs) fir_reset(&ctx->fb_fir[s]);
+                ctx->nan_out_hold = 0;
+                ctx->nan_in_cnt = -(ctx->nan_in_cnt + 1);  /* 负哨兵通知主线程 */
+            }
+        } else {
+            ctx->nan_out_hold = 0;
         }
 
         /* 峰值快检测: 连续10样本|anti|>0.95 → 立即静音 (CR-12, 0.6ms响应 vs 原1秒) */
@@ -682,6 +705,16 @@ int main(void) {
                         ctx->safety_mute ? "MUTE" : "",
                         ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "");
                 fflush(ctx->log_file);
+            }
+
+            /* R-8: NaN 看门狗日志 — 负哨兵值表示回调已触发 FIR 复位 */
+            if (ctx->nan_in_cnt < 0) {
+                int total = -(ctx->nan_in_cnt + 1);
+                fprintf(stderr, "[WATCHDOG] t=%ds NaN persist >1s → FIR delay lines reset, nan_in=%d\n",
+                        log_sec, total);
+                if (ctx->log_file)
+                    fprintf(ctx->log_file, "# EVENT: WATCHDOG NaN FIR reset nan_in=%d\n", total);
+                ctx->nan_in_cnt = 0;
             }
 
             check_wc_divergence(ctx);
