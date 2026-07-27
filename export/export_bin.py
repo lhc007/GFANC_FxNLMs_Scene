@@ -11,9 +11,13 @@ import torch
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════
-# 路径配置 — 按你的实际情况修改
+# 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则默认同级目录
 # ═══════════════════════════════════════════════════════════════
-PY_PROJ    = Path(r'D:\VSCodeRepository\GFANC_Scene')
+_env_proj = os.environ.get('GFANC_PYTHON_PROJ', '')
+if _env_proj:
+    PY_PROJ = Path(_env_proj)
+else:
+    PY_PROJ = Path(r'D:\VSCodeRepository\GFANC_Scene')  # 默认路径
 
 # CNN 模型
 CNN_MODEL  = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
@@ -176,7 +180,7 @@ config = {
     'filter_len': int(Wc_v.shape[2]),
     'pri_len': int(Pri.shape[2]), 'sec_len': int(Sec.shape[2]),
     'input_len': 16000, 'bp_len': int(len(bp_coeff)),
-    'dsp_delay': 16, 'fade_len': 16, 'sc_dim': S * C,
+    'dsp_delay': 16, 'fade_len': 1600, 'sc_dim': S * C,
 }
 write_json('gfanc_config.json', config)
 

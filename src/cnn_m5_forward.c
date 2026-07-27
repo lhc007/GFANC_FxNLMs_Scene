@@ -103,7 +103,10 @@ int cnn_m5_init(void)
         char tag[32];
         resblock_t *r = &g_cnn.res[i];
         r->in_ch = CH;
-        r->proj_weight = NULL;  /* 64→64, no projection needed */
+        /* R-35: 尝试加载 projection 权重 (in_ch≠out_ch 时需要, 当前64→64无投影) */
+        snprintf(tag, sizeof(tag), "data/cnn_res%d_proj_weight.bin", i);
+        r->proj_weight = NULL;
+        bin_load_float(tag, &r->proj_weight);  /* 文件不存在返回-1 → NULL, 正确降级 */
 
         snprintf(tag, sizeof(tag), "res%d_conv1", i);
         if (load_conv(tag, &r->conv1, CH, CH, RES_K, RES_S, RES_P)) return -1;

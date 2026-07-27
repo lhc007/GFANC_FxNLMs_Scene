@@ -10,6 +10,6 @@
   "input_len": 16000,
   "bp_len": 1024,
   "dsp_delay": 16,
-  "fade_len": 16,
+  "fade_len": 1600,
   "sc_dim": 30
 }
