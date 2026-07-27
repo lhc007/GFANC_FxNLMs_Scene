@@ -47,10 +47,15 @@ static int wav_read_mono(const char *path, wav_t *w)
         if (fread(id, 1, 4, f) < 4) break;
         unsigned int sz; fread(&sz, 4, 1, f);
         if (!strcmp(id, "fmt ")) {
-            short afmt, nch; int sr;
+            short afmt, nch; int sr; short bps;
             fread(&afmt, 2, 1, f); fread(&nch, 2, 1, f);
             fread(&sr, 4, 1, f); fseek(f, 6, SEEK_CUR);
-            short bps; fread(&bps, 2, 1, f);
+            fread(&bps, 2, 1, f);
+            /* R-18: 仅支持 16-bit PCM (24/32-bit 需预先转换) */
+            if (afmt != 1 || bps != 16) {
+                fprintf(stderr, "ERROR: Only 16-bit PCM WAV supported (got fmt=%d bps=%d)\n", afmt, bps);
+                fclose(f); return -1;
+            }
             w->sr = sr; w->ch = nch;
             if (sz > 16) fseek(f, sz - 16, SEEK_CUR);
             fmt_done = 1;
@@ -99,15 +104,26 @@ static void wav_write(const char *path, const float *data, int n, int ch, int sr
 
 static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, int *n_out)
 {
+    /* R-18: 下采样前简易抗混叠 (2样本移动平均, 截止 ~fs/4) */
+    float *filt = NULL;
+    if (sr_in > sr_out) {
+        filt = (float *)malloc(n_in * sizeof(float));
+        filt[0] = in[0] * 0.5f;
+        for (int i = 1; i < n_in; i++)
+            filt[i] = (in[i-1] + in[i]) * 0.5f;
+    }
+    const float *src = filt ? filt : in;
+
     *n_out = (int)((long long)n_in * sr_out / sr_in);
     float *out = (float *)malloc(*n_out * sizeof(float));
     for (int i = 0; i < *n_out; i++) {
         double pos = (double)i * sr_in / sr_out;
         int i0 = (int)pos; double frac = pos - i0;
-        if (i0 + 1 < n_in) out[i] = (float)(in[i0] * (1.0 - frac) + in[i0 + 1] * frac);
-        else if (i0 < n_in) out[i] = in[i0];
+        if (i0 + 1 < n_in) out[i] = (float)(src[i0] * (1.0 - frac) + src[i0 + 1] * frac);
+        else if (i0 < n_in) out[i] = src[i0];
         else out[i] = 0.0f;
     }
+    free(filt);
     return out;
 }
 
@@ -200,12 +216,15 @@ int main(int argc, char **argv)
         }
 
     /* 2c. 初级路径 FIR (仅 R=0, 无延迟) */
-    fir_filter_t pri_firs[E];
+    fir_filter_t pri_firs[E], pri_full_firs[E];  /* R-18: 分离带限/全频路径 */
     for (int e = 0; e < E; e++) {
         pri_firs[e].coeffs = pri_path + e * 2 * PRI_LEN; /* R=0 */
         pri_firs[e].n_taps = PRI_LEN;
         pri_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
         pri_firs[e].ptr = 0;
+        pri_full_firs[e] = pri_firs[e];  /* 同系数, 独立延迟线 */
+        pri_full_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
+        pri_full_firs[e].ptr = 0;
     }
 
     /* 2d. Scene Controller */
@@ -292,12 +311,9 @@ int main(int argc, char **argv)
                 dis_buf[e * len + n] = fir_tick(&pri_tmp, ref_filt[n]);
             pri_firs[e].ptr = pri_tmp.ptr; /* sync ptr back */
 
-            fir_filter_t pri_tmp2 = pri_firs[e];
-            pri_tmp2.delay_line = (double *)calloc(PRI_LEN, sizeof(double));
-            pri_tmp2.ptr = 0;
+            /* R-18: 使用持久延迟线, 消除每秒启动瞬态 */
             for (int n = 0; n < len; n++)
-                full_buf[e * len + n] = fir_tick(&pri_tmp2, noise_bp[start + n]);
-            free(pri_tmp2.delay_line);
+                full_buf[e * len + n] = fir_tick(&pri_full_firs[e], noise_bp[start + n]);
         }
 
         /* 4c. 参考能量 (所有 Mic 平均) */
@@ -454,7 +470,7 @@ int main(int argc, char **argv)
     scene_ctrl_free(&sc);
     for (int i = 0; i < E * S; i++) free(sec_firs[i].delay_line);
     free(sec_firs); free(sec_coeffs);
-    for (int e = 0; e < E; e++) free(pri_firs[e].delay_line);
+    for (int e = 0; e < E; e++) { free(pri_firs[e].delay_line); free(pri_full_firs[e].delay_line); }
     free(bp_fir.delay_line);
     free(wav.data); if (ref_resampled) free(ref_resampled);
     bin_free(sec_path); bin_free(pri_path); bin_free(sub_filters);
