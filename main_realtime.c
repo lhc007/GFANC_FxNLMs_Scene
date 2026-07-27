@@ -85,6 +85,7 @@ typedef struct {
     volatile int peak_mute;       /* 峰值快检测触发静音 */
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
     int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
+    int      cnn_drop_cnt;      /* R-20: CNN 缓冲覆盖计数 (主线程超1s未消费) */
     FILE  *log_file;              /* 运行时统计日志 (C1: NR/场景切换/发散事件) */
 
     /* 48k 重采样缓冲 */
@@ -116,17 +117,26 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     rt_ctx_t *ctx = (rt_ctx_t *)user;
     const float *in = (const float *)input;
     float *out = (float *)output;
-    int c48k = (int)fcount, c16k = c48k / 3;
+    int c48k = (int)fcount;
     (void)ti; (void)flags;
 
-    if (!ctx->running) { memset(out, 0, fcount * 2 * sizeof(float)); return 1; }
+    if (!ctx->running) { memset(out, 0, c48k * 2 * sizeof(float)); return 1; }
 
-    /* 声道拆分 + 抽取 (ch0=ref, ch1-3=err) */
-    for (int n = 0; n < c16k; n++) {
-        ctx->ref_buf[n] = in[(n*3)*4 + 0];  /* 最近邻抽取: 每3个取1个 */
-        ctx->err_buf[n*3+0] = in[(n*3)*4 + 1];
-        ctx->err_buf[n*3+1] = in[(n*3)*4 + 2];
-        ctx->err_buf[n*3+2] = in[(n*3)*4 + 3];
+    /* R-5: 3:1 抽取 + 跨回调相位保持 — WASAPI/WDM-KS 可变帧长不再破坏相位连续性 */
+    int c16k = 0;
+    {
+        int p = ctx->dec_phase;
+        for (int i = 0; i < c48k; i++) {
+            if (p == 0) {
+                ctx->ref_buf[c16k]    = in[i*4 + 0];  /* ch0=ref */
+                ctx->err_buf[c16k*3+0] = in[i*4 + 1];  /* ch1-3=err */
+                ctx->err_buf[c16k*3+1] = in[i*4 + 2];
+                ctx->err_buf[c16k*3+2] = in[i*4 + 3];
+                c16k++;
+            }
+            p = (p == 2) ? 0 : p + 1;
+        }
+        ctx->dec_phase = p;
     }
 
     /* ── ANC @ 16kHz ── */
@@ -167,6 +177,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         if (ctx->cnn_cnt < FS_ANC) {
             ctx->cnn_buf[ctx->cnn_fill_idx][ctx->cnn_cnt++] = ref_filt;
             if (ctx->cnn_cnt >= FS_ANC) {
+                /* R-20: 检测主线程超1s未消费 → 记录丢帧 */
+                if (ctx->cnn_buf_ready >= 0) ctx->cnn_drop_cnt++;
                 InterlockedExchange(&ctx->cnn_buf_ready, ctx->cnn_fill_idx);
                 ctx->cnn_fill_idx ^= 1;
                 ctx->cnn_cnt = 0;
@@ -242,12 +254,13 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             }
         }
 
-        /* 啸叫检测 + 陷波 (钳位后, 统计前) */
+        /* R-17: 啸叫检测取三通道瞬时功率最大者, 避免单通道啸叫被平均稀释 ~5dB */
         {
-            float err_avg = 0;
-            for (int e = 0; e < E; e++) err_avg += err_meas[e];
-            err_avg /= (float)E;
-            howling_tick(&ctx->hw, err_avg, anti_spk, S);
+            float err_sel = err_meas[0];
+            float best = fabsf(err_meas[0]);
+            for (int e = 1; e < E; e++)
+                if (fabsf(err_meas[e]) > best) { best = fabsf(err_meas[e]); err_sel = err_meas[e]; }
+            howling_tick(&ctx->hw, err_sel, anti_spk, S);
         }
 
         /* 累积功率: 原始声道 + 滤波参考 + 误差 + 反噪声 */
@@ -315,15 +328,22 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     /* 快照 fx.wc → wc_snapshot: 主线程安全读取 (ARM float原子, 无撕裂) */
     memcpy(ctx->wc_snapshot, ctx->fx.wc, S*L*sizeof(float));
 
-    /* 内插 + 输出 (ch0=spk0, ch1=spk1) */
-    int oi = 0;
-    for (int n = 0; n < c16k; n++) {
-        float a0 = ctx->anti_buf[n], a1 = ctx->anti_buf[n + c16k];
-        if (!isfinite(a0)) a0 = 0.0f;
-        if (!isfinite(a1)) a1 = 0.0f;
-        if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
-        if (a1 > 1.0f) a1 = 1.0f; if (a1 < -1.0f) a1 = -1.0f;
-        for (int r = 0; r < 3; r++) { out[oi++] = a0; out[oi++] = a1; }
+    /* R-5: ZOH×3 内插 + 输出 — 保证恰好写入 c48k*2 floats, 无尾部残留 */
+    {
+        int oi = 0;
+        for (int n = 0; n < c16k; n++) {
+            float a0 = ctx->anti_buf[n], a1 = ctx->anti_buf[n + c16k];
+            if (!isfinite(a0)) a0 = 0.0f;
+            if (!isfinite(a1)) a1 = 0.0f;
+            if (a0 > 1.0f) a0 = 1.0f; if (a0 < -1.0f) a0 = -1.0f;
+            if (a1 > 1.0f) a1 = 1.0f; if (a1 < -1.0f) a1 = -1.0f;
+            for (int r = 0; r < 3; r++) { out[oi++] = a0; out[oi++] = a1; }
+        }
+        /* 补齐尾部: c16k×6 可能 < c48k×2 (WASAPI 帧长非3倍数时) */
+        while (oi < c48k * 2) {
+            out[oi++] = ctx->anti_spk_prev[0];
+            out[oi++] = ctx->anti_spk_prev[1];
+        }
     }
 
     InterlockedIncrement(&ctx->callback_count);
@@ -348,12 +368,18 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 
 static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
                               const float *probs) {
-    printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1fdB anti=%.4f%s%s gain=%.0fx cb=%d\n",
+    printf("[CNN] s=%d max=%.2f cos=%.2f NR=%.1fdB anti=%.4f%s%s gain=%.0fx cb=%d%s\n",
            new_scene, probs[new_scene], cos_sim,
            ctx->nr_level, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
            ctx->ramp_cnt > 0 ? " [RAMP]" : "",
-           cfg.mic_pre_gain, ctx->callback_count);
+           cfg.mic_pre_gain, ctx->callback_count,
+           ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
+    if (ctx->cnn_drop_cnt > 0) {
+        printf("       ⚠ CNN buffer dropped %d frame(s) (main thread >1s blocked?)\n",
+               ctx->cnn_drop_cnt);
+        ctx->cnn_drop_cnt = 0;
+    }
     printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
            ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
            ctx->ref_rms, cfg.mic_pre_gain);
