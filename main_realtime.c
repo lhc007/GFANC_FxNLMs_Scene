@@ -203,11 +203,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
         }
 
-        /* FxNLMS 实时路径: anti=Wc⊗ref, 梯度用err_meas直接驱动 (不合成err) */
-        if (ctx->fade_cnt <= 0)
-            fxnlms_tick_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
-        else
+        /* FxNLMS 实时路径: anti=Wc⊗ref, 梯度用err_meas直接驱动 (不合成err)
+           R-6: 静音/peak_mute/fade 期间冻结梯度, 防止开环空转污染 Wc */
+        if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute)
             fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
+        else
+            fxnlms_tick_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
 
         /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
            驱动毛刺 → NaN 进入 FIR 延迟线 → 永久 NaN 输出 (延迟线无自恢复能力)
@@ -390,10 +391,19 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     } else if (ctx->fx.freeze_lms && ctx->freeze_timer > 0 && !ctx->freeze_permanent) {
         ctx->freeze_timer--;
         if (ctx->freeze_timer <= 0) {
+            /* R-7: 解冻前回滚到已知良好 Wc — 以发散 Wc 解冻则注定永久冻结 */
+            if (ctx->scene_wc_valid[ctx->cur_scene_id]) {
+                memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
+                printf("[INFO] Wc freeze retry — rollback to scene_wc[%d]\n", ctx->cur_scene_id);
+            } else {
+                scene_ctrl_construct_wc(&ctx->sc, ctx->cur_scene_id, ctx->wc_shadow);
+                printf("[INFO] Wc freeze retry — rollback to CNN preset scene=%d\n", ctx->cur_scene_id);
+            }
+            InterlockedExchangeAdd(&ctx->wc_seq, 2);
             InterlockedExchange(&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = -3;
-            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry\n");
-            printf("[INFO] Wc freeze retry — LMS unfrozen, watching 3s...\n");
+            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry (rolled back)\n");
+            printf("[INFO] Wc unfrozen, watching 3s...\n");
         }
     } else if (!ctx->fx.freeze_lms && ctx->freeze_timer < 0) {
         ctx->freeze_timer++;
