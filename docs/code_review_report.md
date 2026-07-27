@@ -280,6 +280,7 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
   memcpy(ctx->sc.prev_probs, probs, K*sizeof(float));        /* :653 */
   ```
 - **验证方法**：① sanitizer 验证——MSYS2/MinGW gcc 不支持 ASan，用 **WSL/Linux gcc `-fsanitize=address`**（或 Windows 上 clang-cl ASan / gflags PageHeap）编译实时版：修复前运行 10 秒必报 :653 heap-buffer-overflow，修复后无报告；② 构造 K=10 的伪造 scene_defs/cnn_linear 权重（export_bin.py 改 K），验证无栈破坏；③ 单测：K=6 下 cos_sim(anchor,probs) 与手算值一致到 1e-6。
+- **修复状态**：✅ **已修复** (2026-07-27, commit `523b692`) — 6 处硬编码 `8` 全部改为运行时 `ctx->sc.K`，`probs[SC_K_MAX]={0}` 清零，完全按照上述方案实施。实测验证：`cos=-nan(ind)` 消除、场景跳变消失。
 
 #### R-2 离线末块 CNN 输入越界读 · **严重** · [Phase-1]
 
@@ -765,7 +766,7 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 
 | 序 | 项 | 工作量 |
 |----|----|--------|
-| 1 | **R-1** K 残留硬编码 8（活跃堆溢出） | 0.5 天（含 ASan 验证） |
+| 1 | ~~**R-1** K 残留硬编码 8（活跃堆溢出）~~ ✅ 已修复 (2026-07-27, `523b692`) | 0.5 天 |
 | 2 | **R-3** 加载校验 + **R-4** K 交叉校验 | 0.5 天 |
 | 3 | **R-2** 离线末块越界 | 0.2 天 |
 | 4 | **R-8** 输入 isfinite + FIR 中毒看门狗 | 0.5 天 |
@@ -798,13 +799,13 @@ Phase-3 评估:  芯片选型 (§5.3 表) → R-23/R-22/R-24/R-25 → 定点化�
 > 对 UPGRADE_ROADMAP / COMPREHENSIVE_REVIEW 全部登记项在当前代码（7e37499）上的逐条复核。
 
 **已修复且复核成立（代码证据确凿）**：
-F-A（fxnlms_tick_rt 独立路径，fxnlms_mimo.c:139-175）· F-D（leak 解耦 1e-6，:113,172）· F-E（anti_spk_prev，:69,144,292-293）· F-F（16k ZOH×3 校准激励，calibrate_feedback.c:56-58）· F-G（逐扬声器双 FIR，:174-216 + main_realtime.c:520-546）· B-2/B-2b/CR-2（陷波逐扬声器状态+最小保持，howling_detect.c 全量复核）· S-1（anchor_probs，:85,429,621,630-635）· S-2/S-3（ramp 仅 INIT、FADE_LEN=1600）· S-4（construct_wc 仅取反，scene_controller.c:143-155）· §6.1（fir_tick 双段零取模，fir_filter.c:38-47）· §6.2（wc_shadow/wc_snapshot 双向隔离，复核见 R-19）· §6.3（CNN 静态缓冲）· §6.5（freeze_lms，fxnlms_mimo.h:14）· §6.6（rt_ctx_t 堆分配，:486）· TODO-4（power epsilon 1e-6，fxnlms_mimo.c:98,156）· TODO-5（计数器 Interlocked 化）· CR-8/CR-9（错误码+goto cleanup）· CR-12（峰值快检测，:213-223）· CR-13（freeze 60s 重试——机制有效但见 R-7）· CR-18（denom 0.01 弱信号跳过）· CR-20（分级日志宏）· C1（gfanc_log.csv）· A2（gfanc_config_t——但见 R-9 死字段）· F-I（acc_anti 移至 mute/ramp 后，:287）
+F-A（fxnlms_tick_rt 独立路径，fxnlms_mimo.c:139-175）· F-D（leak 解耦 1e-6，:113,172）· F-E（anti_spk_prev，:69,144,292-293）· F-F（16k ZOH×3 校准激励，calibrate_feedback.c:56-58）· F-G（逐扬声器双 FIR，:174-216 + main_realtime.c:520-546）· B-2/B-2b/CR-2（陷波逐扬声器状态+最小保持，howling_detect.c 全量复核）· S-1（anchor_probs，:85,429,621,630-635）· S-2/S-3（ramp 仅 INIT、FADE_LEN=1600）· S-4（construct_wc 仅取反，scene_controller.c:143-155）· §6.1（fir_tick 双段零取模，fir_filter.c:38-47）· §6.2（wc_shadow/wc_snapshot 双向隔离，复核见 R-19）· §6.3（CNN 静态缓冲）· §6.5（freeze_lms，fxnlms_mimo.h:14）· §6.6（rt_ctx_t 堆分配，:486）· TODO-4（power epsilon 1e-6，fxnlms_mimo.c:98,156）· TODO-5（计数器 Interlocked 化）· CR-8/CR-9（错误码+goto cleanup）· CR-12（峰值快检测，:213-223）· CR-13（freeze 60s 重试——机制有效但见 R-7）· CR-18（denom 0.01 弱信号跳过）· CR-20（分级日志宏）· C1（gfanc_log.csv）· A2（gfanc_config_t——但见 R-9 死字段）· F-I（acc_anti 移至 mute/ramp 后，:287）· **R-1（K 残留堆溢出，commit `523b692`，2026-07-27）**
 
 **复核为 FALSE/物理事实（维持原结论）**：F-C（tanh 断点三层 FIR 平滑后不可测）· S-5（minmax 与训练一致）· P-3（±1.0 限幅正确）· P-4（群延迟是 FIR 物理属性——但其位置成为瓶颈见 R-13）· §6.4（epsilon 未缩小）· CR-1（步长按 E=3 标定，扩展时见 R-30）· TODO-2（NLMS 辨识含极性，减法恒为抵消）· TODO-3（离线/在线 GAIN 差异是信号链差异非 bug）· CR-11（fade 期冻结梯度是正确设计）· CR-14（r=0.96 安全）· CR-15（fb 输入 1 样本延迟无害）
 
 **仍开放（本报告对应项）**：F-B→R-16 · P-1→R-14 · P-2→R-15 · TODO-1（centroid 数据已验证低风险，维持不改）· TODO-5 监控量→R-19 · B-1 反馈 IIR 环路（未实现，窗户场景影响有限，维持排队）· B-3 remove_notch 死代码（保留）· CR-7→R-33 · CR-17→R-31 · CRC-2/W-15 校准流水线（开放）· A1/A3/B1/B3/C2（升级建议，排队）· W-1~W-16 窗户声学/量产实验项（非代码，维持）· CR-19/W-10 场景覆盖度（训练侧，无法在本仓库验证）
 
-**新发现（本报告首发）**：R-1（K 残留堆溢出）· R-2（离线末块越界）· R-3/R-4（加载与 K 校验）· R-5（fcount%3）· R-6（静音开环）· R-7（freeze 无回滚）· R-8（输入 NaN 中毒）· R-9（cfg 死字段）· R-10（UAF）· R-11/R-12（回调浪费）· R-13（bp 位置瓶颈的量化与方案）· R-17（啸叫稀释）· R-18（离线工具链三项）· R-20（CNN 丢帧）· R-22（VLA）· R-23（double 延迟线移植代价量化）· R-25（CNN 4MB）· R-26（PA ABI 实测错位）· R-27（manifest）· R-29（扩展硬编码分布图）· R-34/R-35（export 侧三项）
+**新发现（本报告首发）**：R-2（离线末块越界）· R-3/R-4（加载与 K 校验）· R-5（fcount%3）· R-6（静音开环）· R-7（freeze 无回滚）· R-8（输入 NaN 中毒）· R-9（cfg 死字段）· R-10（UAF）· R-11/R-12（回调浪费）· R-13（bp 位置瓶颈的量化与方案）· R-17（啸叫稀释）· R-18（离线工具链三项）· R-20（CNN 丢帧）· R-22（VLA）· R-23（double 延迟线移植代价量化）· R-25（CNN 4MB）· R-26（PA ABI 实测错位）· R-27（manifest）· R-29（扩展硬编码分布图）· R-34/R-35（export 侧三项）
 
 ## 附录 B：关键验证测试设计
 
