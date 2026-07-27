@@ -15,7 +15,7 @@
 
 ### 硬件（实时模式）
 
-- **音频接口**：ASIO 多通道声卡（4in/2out+，共时钟）
+- **音频接口**：多通道声卡（4in/2out+，ASIO/WASAPI/WDM-KS 均可）
 - **麦克风**：参考麦 ×1 + 误差麦 ×3
 - **扬声器**：2 声道
 - **电脑**：Windows 10/11
@@ -70,7 +70,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/pa_loader.c -lm -o gfanc_realtime.exe
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
 ```
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
@@ -185,8 +185,7 @@ GFANC_FxNLMs_Scene/
 │   └── micphone.md        麦克风数据手册
 │
 └── export/                工具脚本（Python → C 格式转换）
-    ├── export_bin.py      导出为 .bin 文件
-    └── export_model.py    导出为 .h 文件
+    └── export_bin.py      导出为 .bin 文件
 ```
 
 ## 系统架构
@@ -195,10 +194,10 @@ GFANC_FxNLMs_Scene/
 
 ### 慢速环路（每秒执行一次）— "大脑"
 
-CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（8 种），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
+CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（4 种），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
 
 ```
-噪声 → 带通(20-1500Hz) → CNN(M5, 8类) → Blend(15子滤波器) → Wc(1024tap)
+噪声 → 带通(20-1500Hz) → CNN(M5, 4类) → Blend(15子滤波器) → Wc(1024tap)
                                     ↑ 1Hz, 双缓冲+原子交接
 ```
 
@@ -232,9 +231,9 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 │                                                               │
 │  ref → bp_fir(1024tap) → cnn_buf[2][16000] 双缓冲            │
 │    │                         │                                │
-│    │                    CNN M5 (8类)                          │
+│    │                    CNN M5 (4类)                          │
 │    │                      ↓ softmax                          │
-│    │                    Blend: centroid[8][30] max归一        │
+│    │                    Blend: centroid[4][30] softmax加权     │
 │    │                      ↓                                  │
 │    │                    Wc = Σ blend[c]×sub_filter[c]         │
 │    │                    RMS对齐 stub_rms, 取反                │
@@ -278,7 +277,7 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 
 ```bash
 # 编译校准程序（只需一次）
-gcc -O2 -Iinclude src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -o calibrate_feedback.exe
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
 
 # 运行校准（自动逐扬声器两轮）
 ./calibrate_feedback.exe
@@ -312,7 +311,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 误差麦克风 (E) | 3 | 放在降噪目标位置 |
 | 扬声器 (S) | 2 | 播放反噪声 |
 | 子滤波器 (C) | 15 | 预训练滤波器, 按场景混合 |
-| 场景类型 (K) | 8 | CNN 可识别的噪声环境数 |
+| 场景类型 (K) | 4 | CNN 可识别的噪声环境数 (运行时从数据推导) |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
 | 输入预增益 | 10x (+20dB) | MIC_PRE_GAIN, 可调 |
@@ -326,7 +325,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
 | 啸叫陷波 | DFT 256pt, IIR ×2 | 15dB 峰均值阈值, 逐扬声器独立状态 |
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
-| 回调预算 | ~73% | fir_tick 取模已消除 (双段循环) |
+| 回调预算 | ~30-45% (SIMD ~5-10%) | 已优化: 双段循环零取模, 含安全边际 |
 
 ## 代码结构
 
@@ -352,7 +351,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | 指标 | 结果 |
 |------|------|
 | 平均降噪量 (dB) | **15.00** |
-| 场景识别 | 8 类, 每秒 1 次 |
+| 场景识别 | 4 类, 每秒 1 次 |
 | 处理速度 | 2.5× 实时 (15s 音频 6.1s 完成) |
 
 实时模式在 50cm 窗户开口 + ASIO 声卡上实测 NR 4-9dB（稳态噪声），取决于噪声源与参考/误差麦的声学耦合。
@@ -366,7 +365,7 @@ A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器
 A: 终端每秒输出 NR(dB)、err/anti RMS、啸叫状态。NR > 3dB 表示有效降噪。
 
 **Q: 可以处理其他采样率的文件吗？**
-A: 离线模式自动将输入重采样到 16000 Hz。支持 8/16/24 bit WAV。
+A: 离线模式自动将输入重采样到 16000 Hz。支持 16-bit PCM WAV。
 
 **Q: 实时版使用什么音频 API？**
-A: PortAudio + ASIO 后端 (`libportaudio64bit-asio.dll`)，通过 `src/pa_loader.c` 运行时加载。
+A: PortAudio 运行时加载 (`libportaudio64bit-asio.dll`)，支持 ASIO / WASAPI / WDM-KS 后端，通过 `src/pa_loader.c` 动态加载 DLL。
