@@ -140,7 +140,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ── 1. 加载权重 ── */
+    /* ── 1. 加载权重 (R-3: 逐文件校验长度) ── */
     printf("Loading weights...\n");
     float *sec_path, *pri_path, *sub_filters, *centroids, *bp_coeff;
     int sec_len  = bin_load_float("data/secondary_path.bin", &sec_path);
@@ -148,7 +148,32 @@ int main(int argc, char **argv)
     int sub_len  = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len   = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     int n_scene  = bin_load_float("data/scene_defs.bin", &centroids);
+
+    if (sec_len < E*S*SEC_LEN) {
+        fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
+        return 1;
+    }
+    if (pri_len < E*2*PRI_LEN) {
+        fprintf(stderr, "FATAL: primary_path.bin too short/load failed (%d<%d)\n", pri_len, E*2*PRI_LEN);
+        return 1;
+    }
+    if (sub_len < C*S || sub_len % (C*S) != 0) {
+        fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, C*S);
+        return 1;
+    }
+    if (bp_len < BP_LEN) {
+        fprintf(stderr, "FATAL: bandpass_fir.bin too short/load failed (%d<%d)\n", bp_len, BP_LEN);
+        return 1;
+    }
+    if (n_scene < S*C) {
+        fprintf(stderr, "FATAL: scene_defs.bin too short (%d<%d)\n", n_scene, S*C);
+        return 1;
+    }
     int L = sub_len / (C * S); /* 1024 */
+    if (L < 64 || L > 4096) {
+        fprintf(stderr, "FATAL: filter length L=%d out of range [64,4096]\n", L);
+        return 1;
+    }
     printf("  OK: sec=%d pri=%d sub=%d bp=%d L=%d\n", sec_len, pri_len, sub_len, bp_len, L);
     (void)pri_len;
 
@@ -188,6 +213,14 @@ int main(int argc, char **argv)
     scene_ctrl_t sc;
     if (scene_ctrl_init(&sc, centroids, sub_filters, L, n_scene) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); return 1;
+    }
+    /* R-4: CNN K vs scene_defs K 交叉校验 */
+    { extern int cnn_m5_get_K(void);
+      if (cnn_m5_get_K() != sc.K) {
+        fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
+                cnn_m5_get_K(), sc.K);
+        return 1;
+      }
     }
 
     /* 2e. FxNLMS */
@@ -277,11 +310,18 @@ int main(int argc, char **argv)
             }
         dis_pwr_band /= (len * E); dis_pwr_full /= (len * E);
 
-        /* 4d. CNN 场景分类 (输入: noise_bp + minmaxscaler) */
+        /* 4d. CNN 场景分类 (输入: noise_bp + minmaxscaler)
+           仅完整 1s 块调用 CNN；末块不足 1s 时复用上一帧分类, 保持当前 Wc */
         float probs[SC_K_MAX];
         int old_scene = sc.cur_scene;
         int K = sc.K;
-        int new_scene = scene_ctrl_process(&sc, noise_bp + start, wc_cur, probs);
+        int new_scene;
+        if (len == chunk) {
+            new_scene = scene_ctrl_process(&sc, noise_bp + start, wc_cur, probs);
+        } else {
+            memcpy(probs, sc.prev_probs, K * sizeof(float));
+            new_scene = sc.cur_scene;
+        }
 
         /* Top-3 */
         int top3[3] = {-1, -1, -1};

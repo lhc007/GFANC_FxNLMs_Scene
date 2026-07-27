@@ -163,6 +163,13 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out
 {
     int S = SC_S, C = SC_C, L = sc->L, SC = S * C;
 
+    /* R-4: 防御性钳位 — scene_id 越界时回退到 scene 0 (不应发生, 但兜底) */
+    if (scene_id < 0 || scene_id >= sc->K) {
+        fprintf(stderr, "[WARN] construct_wc: scene_id=%d out of [0,%d), clamp to 0\n",
+                scene_id, sc->K);
+        scene_id = 0;
+    }
+
     /* blend = centroid[scene_id] */
     const float *blend = sc->centroids + scene_id * SC;
     float bmax = blend[0];

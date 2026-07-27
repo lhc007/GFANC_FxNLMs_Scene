@@ -469,19 +469,50 @@ int main(void) {
 
     printf("\n");
 
-    /* 加载权重 */
+    /* 加载权重 (R-3: 逐文件校验长度, 缺/截断文件 → FATAL 而非崩溃) */
+    int ret = 0;
     printf("Loading weights...\n");
     float *sec_path, *sub_filters, *centroids, *bp_coeff;
-    bin_load_float("data/secondary_path.bin", &sec_path);
+    int sec_len = bin_load_float("data/secondary_path.bin", &sec_path);
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
     int n_scene = bin_load_float("data/scene_defs.bin", &centroids);
-    bin_load_float("data/bandpass_fir.bin", &bp_coeff);
+    int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
+
+    if (sec_len < E*S*SEC_LEN) {
+        fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
+        ret = 1; goto cleanup;
+    }
+    if (sub_len < SC_C*SC_S || sub_len % (SC_C*SC_S) != 0) {
+        fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, SC_C*SC_S);
+        ret = 1; goto cleanup;
+    }
+    if (n_scene < SC_S*SC_C) {
+        fprintf(stderr, "FATAL: scene_defs.bin too short (%d<%d)\n", n_scene, SC_S*SC_C);
+        ret = 1; goto cleanup;
+    }
+    if (bp_len < BP_LEN) {
+        fprintf(stderr, "FATAL: bandpass_fir.bin too short/load failed (%d<%d)\n", bp_len, BP_LEN);
+        ret = 1; goto cleanup;
+    }
+    {
+        int L_from_sub = sub_len / (SC_C*SC_S);
+        if (L_from_sub < 64 || L_from_sub > 4096) {
+            fprintf(stderr, "FATAL: filter length L=%d out of range [64,4096]\n", L_from_sub);
+            ret = 1; goto cleanup;
+        }
+        if (L_from_sub != L) {
+            fprintf(stderr, "FATAL: sub_filters L=%d mismatches compile-time L=%d\n", L_from_sub, L);
+            ret = 1; goto cleanup;
+        }
+    }
     extern int cnn_m5_init(void); extern int cnn_m5_get_K(void);
-    cnn_m5_init();
-    printf("  OK K=%d L=%d\n", cnn_m5_get_K(), sub_len / (15*2));
+    if (cnn_m5_init() != 0) {
+        fprintf(stderr, "FATAL: CNN init failed (missing/corrupt cnn_*.bin?)\n");
+        ret = 1; goto cleanup;
+    }
+    printf("  OK K=%d L=%d\n", cnn_m5_get_K(), sub_len / (SC_C*SC_S));
 
     /* 初始化 ANC 模块 */
-    int ret = 0;
     PaStream *stream = NULL;
     rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
     if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
@@ -547,6 +578,12 @@ int main(void) {
 
     if (scene_ctrl_init(&ctx->sc, centroids, sub_filters, L, n_scene) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); ret = 1; goto cleanup;
+    }
+    /* R-4: CNN K vs scene_defs K 交叉校验 — 防止不同批次 data/ 混配 */
+    if (cnn_m5_get_K() != ctx->sc.K) {
+        fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
+                cnn_m5_get_K(), ctx->sc.K);
+        ret = 1; goto cleanup;
     }
     howling_init(&ctx->hw, HOWLING_ENABLED);
     if (fxnlms_init(&ctx->fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
