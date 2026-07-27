@@ -51,6 +51,47 @@ void scene_ctrl_free(scene_ctrl_t *sc)
     sc->prev_probs = NULL;
 }
 
+/* 概率加权混合 Wc: wc_out = Σ_k probs[k] * Wc_k / Σ probs[k]
+   (忽略 <5% 的低概率场景以节省计算, 不影响总权重归一化) */
+static void scene_ctrl_blend_wc(const scene_ctrl_t *sc, const float *probs,
+                                 float *wc_out)
+{
+    int K = sc->K, S = SC_S, C = SC_C, L = sc->L;
+    int n = S * L;
+
+    /* 复用临时缓冲区 (单场景 Wc 构造用, K 次调用共享) */
+    float *wc_k = (float *)malloc(n * sizeof(float));
+    if (!wc_k) {
+        /* OOM 回退: argmax + 单场景 Wc */
+        int best = 0;
+        for (int k = 1; k < K; k++) if (probs[k] > probs[best]) best = k;
+        scene_ctrl_construct_wc(sc, best, wc_out);
+        return;
+    }
+
+    memset(wc_out, 0, n * sizeof(float));
+    float total_weight = 0.0f;
+    for (int k = 0; k < K; k++) {
+        if (probs[k] < 0.05f) continue;   /* 忽略低概率场景, 显著节省计算 */
+        scene_ctrl_construct_wc(sc, k, wc_k);
+        for (int i = 0; i < n; i++)
+            wc_out[i] += probs[k] * wc_k[i];
+        total_weight += probs[k];
+    }
+
+    if (total_weight > 0.0f) {
+        float inv = 1.0f / total_weight;
+        for (int i = 0; i < n; i++) wc_out[i] *= inv;
+    } else {
+        /* 所有 probs < 5% (理论上不会发生, 安全回退) */
+        int best = 0;
+        for (int k = 1; k < K; k++) if (probs[k] > probs[best]) best = k;
+        scene_ctrl_construct_wc(sc, best, wc_out);
+    }
+
+    free(wc_k);
+}
+
 int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
                         float *wc_out, float *probs_out)
 {
@@ -64,12 +105,12 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     }
     float denom = mx - mn;
 
-    /* 信号太弱 (<1%满幅峰峰值) → 不值得分类, 保持当前场景不切换
+    /* 信号太弱 (<1%满幅峰峰值) → 不值得分类, 保持当前概率分布
        避免深夜底噪被逐帧归一化放大后引发误分类污染 scene_wc */
     if (denom <= 0.01f) {
         if (sc->cur_scene >= 0) {
-            scene_ctrl_construct_wc(sc, sc->cur_scene, wc_out);
             memcpy(probs_out, sc->prev_probs, K * sizeof(float));
+            scene_ctrl_blend_wc(sc, probs_out, wc_out);
             return sc->cur_scene;
         }
         memset(probs_out, 0, K * sizeof(float));
@@ -87,10 +128,10 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     free(cnn_in);
 
     if (cnn_ret != 0) {
-        /* CNN 推理失败 (malloc 失败等), 保持上一帧场景 */
+        /* CNN 推理失败 (malloc 失败等), 保持上一帧概率分布 */
         if (sc->cur_scene >= 0) {
-            scene_ctrl_construct_wc(sc, sc->cur_scene, wc_out);
             for (int k = 0; k < K; k++) probs_out[k] = sc->prev_probs[k];
+            scene_ctrl_blend_wc(sc, probs_out, wc_out);
             return sc->cur_scene;
         }
         /* 无历史场景 → 回退到 scene 0 */
@@ -106,12 +147,12 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     for (int k = 0; k < K; k++) { probs_out[k] = expf(logits[k] - logit_mx); sum_exp += probs_out[k]; }
     for (int k = 0; k < K; k++) probs_out[k] /= sum_exp;
 
-    /* argmax */
+    /* argmax (仅用于日志/滞回检测, 不参与 Wc 构造) */
     int scene_id = 0;
     for (int k = 1; k < K; k++) if (probs_out[k] > probs_out[scene_id]) scene_id = k;
 
-    /* 构造 Wc */
-    scene_ctrl_construct_wc(sc, scene_id, wc_out);
+    /* 概率加权混合 Wc (软分配 — 替代旧的单场景 argmax) */
+    scene_ctrl_blend_wc(sc, probs_out, wc_out);
 
     sc->cur_scene = scene_id;
     memcpy(sc->prev_probs, probs_out, K * sizeof(float));
