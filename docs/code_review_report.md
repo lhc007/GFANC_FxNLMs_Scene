@@ -390,6 +390,7 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **造成的影响**：调参工作流被隐性破坏（以为改了参数实际没改），现场调试误导。
 - **修复方案**：二选一：① 删除死字段与对应 env 项，日志改打印实际生效宏值；②（推荐）回调初始化时用 cfg 计算 RAMP_SAMPLES/MUTE_HOLD_SAMPLES/FADE_LEN 存入 ctx，统一单一事实源。
 - **验证方法**：`GFANC_RAMP_MS=800` 启动，日志值与示波器/录制实测 ramp 时长一致。
+- **修复状态**：✅ **已修复** (2026-07-27, `16ec532`) — 删除 dsp_delay/mic_clip_max 死字段；FADE_LEN/RAMP_SAMPLES/MUTE_HOLD/MIC_PRE_GAIN 全部改用 cfg 运行时值，env 变量真正生效。
 
 #### R-10 cleanup 中 use-after-free 读取 ctx->log_file · **一般** · [Phase-1]
 
@@ -397,6 +398,7 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **问题描述**：释放 ctx 后解引用取 log_file 指针。UB；当前因堆块未复用而"能工作"。
 - **修复方案**：`FILE *lf = ctx->log_file;` 在 free 前取出，free 后用 lf；或将日志关闭移到 free(ctx) 之前。
 - **验证方法**：WSL ASan（或 clang-cl ASan）下 Ctrl+C 退出 → 修复前报 heap-use-after-free，修复后干净。
+- **修复状态**：✅ **已修复** (2026-07-27, `16ec532`) — free(ctx) 前取出 log_file 指针，free 后通过局部变量关闭。
 
 ### B. 性能与实时性
 
@@ -562,6 +564,7 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
   代码仅用 `name`，x64 下指针 8 字节对齐使 name 恰好落在 +8 → 能工作。但结构体声明是错的：`type` 实际读到 deviceCount；32-bit 编译时 name 会落到 +4（读到 type 值当指针）→ 立即崩溃。
 - **修复方案**：按 portaudio.h 改为 `{int structVersion; int type; const char *name; int deviceCount; int defaultInputDevice; int defaultOutputDevice;}`。
 - **验证方法**：修复后设备列表输出与探针表一致；32-bit 编译（若需要）不崩溃。
+- **修复状态**：✅ **已修复** (2026-07-27, `16ec532`) — 按 portaudio.h 修正: structVersion → type → name → deviceCount → ...
 
 #### R-27 权重文件无格式头/manifest — 版本混配无防线 · **一般 · [Phase-2/3]**
 
@@ -775,7 +778,7 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 | 3 | ~~**R-2** 离线末块越界~~ ✅ 已修复 (2026-07-27, `6dddf85`) | 0.2 天 |
 | 4 | ~~**R-8** 输入 isfinite + FIR 中毒看门狗~~ ✅ 已修复 (2026-07-27, `b649d74`) | 0.5 天 |
 | 5 | ~~**R-6** 静音期梯度冻结 + **R-7** freeze Wc 回滚~~ ✅ 已修复 (2026-07-27, `f15b909`) | 0.5 天 |
-| 6 | **R-10** UAF + **R-9** cfg 死字段 + **R-26** ABI 修正 | 0.5 天 |
+| 6 | ~~**R-10** UAF + **R-9** cfg 死字段 + **R-26** ABI 修正~~ ✅ 已修复 (2026-07-27, `16ec532`) | 0.5 天 |
 | 7 | **R-31** 黄金回归测试基线 | 1 天 |
 
 ### 7.3 迁移前必须重构
