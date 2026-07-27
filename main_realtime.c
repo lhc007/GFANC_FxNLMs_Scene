@@ -305,18 +305,32 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->acc_err  += err_meas[e] * err_meas[e];
             ctx->acc_dist += err_meas[e] * err_meas[e];  /* 实测误差功率 (用于NR参考) */
         }
-        /* anti_est[e] = Σ_s,k Wc[s,k] * Xd[e,s,k] (模型估计反噪声, 用于NR) */
-        {   float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
-            for (int e = 0; e < E; e++)
-                for (int s = 0; s < S; s++)
-                    for (int k = 0; k < L; k++)
-                        anti_est[e] += ctx->fx.wc[s*L+k]
-                                     * ctx->fx.xd[(e*S+s)*L+k];
+        /* R-11: anti_est 仅前 250 样本计算 (省 ~16% 回调预算)
+           R-12: xd 环形双段访问 (零取模, 编译器可向量化) */
+        if (ctx->acc_cnt < 250) {
+            float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
+            int xp = ctx->fx.xd_ptr;
+            int seg1 = (xp == 0) ? L - 1 : xp - 1;
+            for (int e = 0; e < E; e++) {
+                for (int s = 0; s < S; s++) {
+                    float *base = ctx->fx.xd + (e*S+s)*L;
+                    float *wc_s = ctx->fx.wc + s*L;
+                    float sum = 0; int k = 0;
+                    for (int idx = seg1; idx >= 0; idx--, k++)
+                        sum += wc_s[k] * base[idx];
+                    if (xp > 0)
+                        for (int idx = L-1; idx >= xp; idx--, k++)
+                            sum += wc_s[k] * base[idx];
+                    anti_est[e] += sum;
+                }
+            }
             for (int e = 0; e < E; e++)
                 ctx->acc_anti_est += anti_est[e] * anti_est[e];
         }
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
-            float pe = ctx->acc_err, pa = ctx->acc_anti_est;
+            float pe = ctx->acc_err;
+            /* R-11: pa 按 250/FS_ANC 比例缩放到全秒等效功率 */
+            float pa = ctx->acc_anti_est * (float)FS_ANC / 250.0f;
             /* NR: 模型估计反噪声 vs 实测残差 (proxy for acoustic NR) */
             ctx->nr_level = 10.0f * log10f((pe + pa + 1e-12f) / (pe + 1e-12f));
             ctx->anti_est_rms = sqrtf(pa / (FS_ANC * E));

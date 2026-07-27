@@ -6,12 +6,14 @@
 
 typedef struct {
     float       *wc;         /* [S * L] 控制滤波器系数 */
-    float       *xd;         /* [E * S * L] 滤波参考 (梯度用) */
-    float       *x_hist;     /* [L] 原始带通参考历史 (实时输出用) */
+    float       *xd;         /* [E * S * L] 滤波参考 (梯度用, 环形缓冲) */
+    float       *x_hist;     /* [L] 原始带通参考历史 (实时输出用, 环形缓冲) */
     int          E, S, L;
+    int          xd_ptr;     /* R-12: xd 环形写指针 (下一个写入位置) */
+    int          x_hist_ptr; /* R-12: x_hist 环形写指针 */
     float        step_size;
     float        leak;
-    volatile long freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 (long=LONG, Interlocked兼容) */
+    volatile long freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 */
 } fxnlms_mimo_t;
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
