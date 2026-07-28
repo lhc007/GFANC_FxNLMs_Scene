@@ -116,6 +116,8 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 
 **实时版** — 实时抵消环境噪声：
 ```bash
+$env:GFANC_MIC_GAIN = "4"
+
 ./gfanc_realtime.exe
 ```
 
