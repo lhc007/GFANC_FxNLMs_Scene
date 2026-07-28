@@ -101,18 +101,21 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
     int p = fx->xd_ptr;
     int seg1 = (p == 0) ? L - 1 : p - 1;  /* 最新样本物理位置 */
 
+    /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
+       安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
+       floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
     float power[S];
     for (int s = 0; s < S; s++) {
-        power[s] = 1e-6f;
+        power[s] = 0.0f;
         for (int e = 0; e < E; e++) {
             float *base = fx->xd + (e * S + s) * L;
             for (int idx = seg1; idx >= 0; idx--)
                 power[s] += base[idx] * base[idx];
-            if (p > 0)  /* p==0 时段1已覆盖全部 L 个样本 */
+            if (p > 0)
                 for (int idx = L - 1; idx >= p; idx--)
                     power[s] += base[idx] * base[idx];
         }
-        power[s] /= (float)(E * L);
+        power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
     /* 梯度更新 */
@@ -140,18 +143,23 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
 void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                        const float *err_meas, float *anti_out)
 {
-    int S = fx->S, L = fx->L, hp = fx->x_hist_ptr;
+    int S = fx->S, L = fx->L;
 
     xd_roll_write(fx, Fx);
     x_hist_push(fx, x_ref);
 
-    /* R-12: anti = Wc ⊗ x_hist — 双段环形访问 (hp=写入位置=最新样本) */
+    /* R-47: anti = Wc ⊗ x_hist — 双段环形访问, 从最新到最旧.
+       x_hist_push 写 x_hist[old_ptr] 后 ptr 指向下一个写入位 (最旧样本).
+       最新样本 = (ptr-1+L)%L, wc[0] 对齐最新, wc[1] 对齐次新, ...
+       旧代码从 ptr 开始读 (最旧), wc[0] 对齐最旧样本 — 时间反转 bug,
+       导致 Wc 被梯度训练在一个时间方向但输出应用在相反方向. */
+    int newest = (fx->x_hist_ptr == 0) ? L - 1 : fx->x_hist_ptr - 1;
     for (int s = 0; s < S; s++) { anti_out[s] = 0;
         float *wc_s = fx->wc + s * L;
         int k = 0;
-        for (int idx = hp; idx >= 0; idx--, k++)
+        for (int idx = newest; idx >= 0; idx--, k++)
             anti_out[s] += wc_s[k] * fx->x_hist[idx];
-        for (int idx = L - 1; idx > hp; idx--, k++)
+        for (int idx = L - 1; idx > newest; idx--, k++)
             anti_out[s] += wc_s[k] * fx->x_hist[idx];
     }
 
@@ -161,18 +169,21 @@ void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
 void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                     const float *err_meas, float *anti_out)
 {
-    int E = fx->E, S = fx->S, L = fx->L, hp = fx->x_hist_ptr;
+    int E = fx->E, S = fx->S, L = fx->L;
 
     xd_roll_write(fx, Fx);
     x_hist_push(fx, x_ref);
 
-    /* anti = Wc ⊗ x_hist (双段环形, hp=写入位置=最新) */
+    /* R-47: anti = Wc ⊗ x_hist — 从最新到最旧, wc[0] 对齐最新样本.
+       旧代码从 x_hist_ptr 开始读 (最旧), wc[0] 对齐最旧 — 时间反转 bug,
+       导致 Wc 被梯度训练在一个时间方向但输出应用在相反方向, 输出相位完全错误. */
+    int newest = (fx->x_hist_ptr == 0) ? L - 1 : fx->x_hist_ptr - 1;
     for (int s = 0; s < S; s++) { anti_out[s] = 0;
         float *wc_s = fx->wc + s * L;
         int k = 0;
-        for (int idx = hp; idx >= 0; idx--, k++)
+        for (int idx = newest; idx >= 0; idx--, k++)
             anti_out[s] += wc_s[k] * fx->x_hist[idx];
-        for (int idx = L - 1; idx > hp; idx--, k++)
+        for (int idx = L - 1; idx > newest; idx--, k++)
             anti_out[s] += wc_s[k] * fx->x_hist[idx];
     }
 
@@ -180,9 +191,12 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     int p = fx->xd_ptr;
     int seg1 = (p == 0) ? L - 1 : p - 1;
 
+    /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
+       安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
+       floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
     float power[S];
     for (int s = 0; s < S; s++) {
-        power[s] = 1e-6f;
+        power[s] = 0.0f;
         for (int e = 0; e < E; e++) {
             float *base = fx->xd + (e * S + s) * L;
             for (int idx = seg1; idx >= 0; idx--)
@@ -191,7 +205,7 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                 for (int idx = L - 1; idx >= p; idx--)
                     power[s] += base[idx] * base[idx];
         }
-        power[s] /= (float)(E * L);
+        power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
     /* anti-windup: 输出超出钳位阈值(±1.2)时冻结梯度 + 快速衰减(100×leak),

@@ -47,7 +47,7 @@ static float biquad_tick(biquad_t *f, float x)
 #define FS_CAL      16000
 #define FB_TAPS     256
 #define CAL_SEC     4           /* 校准时长 (秒) */
-#define NOISE_AMP   0.3f        /* 白噪声幅度 */
+#define NOISE_AMP   0.9f        /* 白噪声幅度 (env: GFANC_CAL_NOISE 可覆盖) */
 #define NLMS_MU     0.2f        /* NLMS 步长 */
 #define FB_FILE     "data/feedback_path.bin"
 
@@ -122,7 +122,10 @@ static void nlms_identify(const float *noise_16k, const float *ref_16k,
         /* error = actual - estimate */
         float e = ref_16k[n] - y;
 
-        /* signal power sum (with regularization), NOT averaged */
+        /* signal power sum (with regularization), NOT averaged.
+           R-48 note: 此处 power 是 Σx² 不除以 n_taps, NLMS_MU=0.2 对应标准 β∈(0,2).
+           floor=1e-6 合理 (power 预期 ~7.7 for noise_amp=0.3, n_taps=256),
+           与 fxnlms_mimo.c 的归一化 power 不同, 无需修改. */
         float power = 1e-6f;
         for (int k = 0; k < n_taps; k++) {
             float v = x[(ptr - k + n_taps) % n_taps];
@@ -199,6 +202,10 @@ int main(void) {
     printf("Output device ID (ASIO Speaker): "); fflush(stdout); scanf("%d", &out_dev);
 
     /* 预生成 16kHz 白噪声 — ZOH×3 播放, 与运行时输出路径一致 (F-F修复) */
+    float noise_amp = NOISE_AMP;
+    {   const char *s = getenv("GFANC_CAL_NOISE");
+        if (s) noise_amp = (float)atof(s); }
+    printf("Noise amplitude: %.2f (set GFANC_CAL_NOISE to override)\n", noise_amp);
     int total_hw = FS_HW * CAL_SEC;
     int n_16k     = total_hw / 3;
     float *noise_16k = (float *)malloc(n_16k * sizeof(float));
@@ -206,7 +213,7 @@ int main(void) {
     float *ref_16k   = (float *)malloc(n_16k * sizeof(float));
     srand(42);  /* 固定种子, 可复现 */
     for (int i = 0; i < n_16k; i++)
-        noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
+        noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * noise_amp;
 
     PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.01, NULL };
     PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };

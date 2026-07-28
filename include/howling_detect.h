@@ -18,8 +18,11 @@
 #define HW_FFT_N        256      /* DFT 窗口 (16ms @ 16kHz) */
 #define HW_MIN_BIN      2        /* 最低检测 bin (125Hz, 跳过 DC+工频) */
 #define HW_MAX_BIN      24       /* 最高检测 bin (~1500 Hz, 匹配带通上限) */
-#define HW_THRESH_DB    12.0f    /* err通道 峰均值比阈值 (原15: 限幅梳状谐波稀释峰均比, 实测振荡仅11-13dB) */
-#define HW_ANTI_THRESH_DB 10.0f  /* anti通道 峰均值比阈值 (输出振荡无扰动噪声稀释, 峰更干净) */
+/* P3: 阈值从 12/10 提高到 14/12 — 实测 125Hz 环境窄带(房间驻波/变压器)持续
+   触发 9.7~12.8dB 峰均值比, 在旧阈值边界间歇激活释放陷波. 真正声学反馈啸叫
+   峰均值比通常 >20dB, 14dB 仍有足够余量且可滤除多数环境伪峰. */
+#define HW_THRESH_DB    14.0f    /* err通道 峰均值比阈值 */
+#define HW_ANTI_THRESH_DB 12.0f  /* anti通道 峰均值比阈值 */
 #define HW_ANTI_MIN_RMS2 4e-4f   /* anti帧功率下限 (RMS>0.02 才检测, 防静音期伪峰) */
 #define HW_PERSIST       4       /* 连续帧数确认啸叫 (4帧≈64ms) */
 #define HW_RELEASE       8       /* 啸叫消失后延迟释放帧数 */

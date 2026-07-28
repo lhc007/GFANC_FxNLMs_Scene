@@ -493,8 +493,30 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
     printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
            ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
            ctx->ref_rms, cfg.mic_pre_gain);
+    /* P1: 输入电平诊断 — ref RMS 过低则 ANC 环路增益不足, 受限于 ADC 量化噪声.
+       目标 ref_rms ∈ [0.01, 0.1] (-40~-20dBFS). 通过 GFANC_MIC_GAIN 环境变量调节.
+       注意: 提高增益前需确保反馈抵消已标定, 否则可能触发啸叫. */
+    {
+        float ref_dbfs = 20.0f * log10f(ctx->ch_rms[0] + 1e-10f);
+        if (ctx->ch_rms[0] < 0.005f && ctx->ch_rms[0] > 1e-8f) {
+            float suggested = 0.03f / (ctx->ch_rms[0] + 1e-10f);
+            if (suggested > 50.0f) suggested = 50.0f;
+            printf("       ⚠ 输入电平过低 ref=%.0fdBFS (目标>-40dBFS), 建议 GFANC_MIC_GAIN=%.0f\n",
+                   ref_dbfs, suggested);
+        } else if (ctx->ch_rms[0] > 0.3f) {
+            printf("       ⚠ 输入电平过高 ref=%.0fdBFS (目标<-10dBFS), 建议降低 GFANC_MIC_GAIN\n",
+                   ref_dbfs);
+        }
+    }
     printf("       ANC: err=%.4f antiEst=%.4f  (err=实测残差, antiEst=模型估计反噪声)\n",
            ctx->err_rms, ctx->anti_est_rms);
+    /* R-49: antiEst/anti_rms 比值超 20× 时警告 — Wc 可能膨胀或 Ŝ 模型增益失配,
+       此时 NR 读数可能虚高 (pd = Σ(err-anti_est)² 被大 anti_est 主导).
+       R-47 时间反转修复 + R-48 功率 floor 修复后该比值应大幅下降. */
+    if (ctx->anti_est_rms > ctx->anti_rms * 20.0f && ctx->anti_rms > 0.0005f) {
+        printf("       ⚠ antiEst/anti=%.0fx — Wc膨胀或Ŝ增益失配, NR可能虚高\n",
+               ctx->anti_est_rms / (ctx->anti_rms + 1e-10f));
+    }
     if (ctx->fb_active)
         printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx->fb_rms);
     if (ctx->hw.active_count > 0 || ctx->hw.dominant_db > HW_THRESH_DB * 0.7f)
