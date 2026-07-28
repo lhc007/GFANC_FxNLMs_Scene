@@ -39,6 +39,7 @@ typedef struct {
     float switch_threshold;      /* cos_sim 场景切换阈值 */
     float nr_converge_db;        /* 收敛判定 NR 阈值 dB */
     int   freeze_retry_sec;      /* freeze 后尝试解冻的秒数 */
+    float diverge_anti_rms;      /* anti_rms 连续3s超此值 → Wc 发散救援 (env: GFANC_DIVERGE_ANTI) */
 
     /* 啸叫检测 */
     float hw_thresh_db;          /* 峰均值比阈值 */
@@ -46,18 +47,24 @@ typedef struct {
     int   hw_release;            /* 释放帧数 */
     float hw_notch_r;            /* 陷波带宽 */
     int   hw_min_hold;           /* 陷波最小保持帧数 */
+
+    int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
 } gfanc_config_t;
 
-/* 默认配置 (与当前 #define 一致) */
+/* 默认配置 (与当前 #define 一致)
+   2026-07-28 稳定性批次: gain 3.0→1.0 (降环路增益), step 1e-6→5e-7,
+   leak 1e-6→5e-6 (抑制安静期漂移), 新增 diverge_anti_rms=0.25 */
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
-    10.0f,              /* mic_pre_gain */ \
-    0.0001f, 1e-6f,    /* step_size, leak */ \
+    1.0f,               /* mic_pre_gain */ \
+    0.0000005f, 5e-6f,  /* step_size, leak */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
-    5.0f, 0.8f, 3.0f,  /* freeze_ratio, switch_threshold, nr_converge_db */ \
+    30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
+    0.25f,              /* diverge_anti_rms */ \
     15.0f, 4, 8, 0.96f, /* hw_thresh_db, hw_persist, hw_release, hw_notch_r */ \
-    32                  /* hw_min_hold */ \
+    32,                 /* hw_min_hold */ \
+    16                  /* dsp_delay */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -68,7 +75,10 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_RAMP_MS")))   cfg->ramp_ms      = atoi(s);
     if ((s = getenv("GFANC_MUTE_MS")))   cfg->mute_hold_ms = atoi(s);
     if ((s = getenv("GFANC_FADE_LEN")))  cfg->fade_len     = atoi(s);
-    if ((s = getenv("GFANC_LEAK")))      cfg->leak         = (float)atof(s);
+    if ((s = getenv("GFANC_LEAK")))         cfg->leak         = (float)atof(s);
+    if ((s = getenv("GFANC_FREEZE_RATIO"))) cfg->freeze_ratio = (float)atof(s);
+    if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
+    if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
 }
 
 #endif

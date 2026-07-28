@@ -89,9 +89,11 @@ void howling_init(howling_detect_t *hw, int enabled)
 
 /* ══════════════════════════════════════════════════════════
    检测一帧: DFT → 找峰值 → 判断是否为啸叫
+   thresh_db: 峰均值比阈值;  update_monitor: 是否更新 dominant_* 显示值
    返回检测到的啸叫频率 (Hz), 0=无
    ══════════════════════════════════════════════════════════ */
-static float detect_frame(howling_detect_t *hw, const float *frame, float fs)
+static float detect_frame(howling_detect_t *hw, const float *frame, float fs,
+                          float thresh_db, int update_monitor)
 {
     /* 计算所有 bin 功率 */
     float powers[HW_MAX_BIN + 1];
@@ -115,12 +117,14 @@ static float detect_frame(howling_detect_t *hw, const float *frame, float fs)
 
     float peak_db = 10.0f * log10f(peak_pwr / mean_pwr);
 
-    /* 更新监控数据 */
-    hw->dominant_freq = (float)peak_bin * fs / HW_FFT_N;
-    hw->dominant_db   = peak_db;
+    /* 更新监控数据 (仅 err 通道, 保持显示语义不变) */
+    if (update_monitor) {
+        hw->dominant_freq = (float)peak_bin * fs / HW_FFT_N;
+        hw->dominant_db   = peak_db;
+    }
 
     /* 峰值显著高于均值 → 候选啸叫 */
-    if (peak_db > HW_THRESH_DB)
+    if (peak_db > thresh_db)
         return (float)peak_bin * fs / HW_FFT_N;
 
     return 0;  /* 无显著窄带峰值 */
@@ -189,8 +193,16 @@ void howling_tick(howling_detect_t *hw, float err_sample,
 {
     if (!hw->enabled) return;
 
-    /* 累积误差样本 */
-    hw->buf[hw->buf_pos++] = err_sample;
+    /* 累积误差样本 + anti 样本 (取各扬声器瞬时值最大者, 陷波前采样:
+       已陷波的频率仍保持可见, 避免 "陷波→释放→再振荡" 循环) */
+    hw->buf[hw->buf_pos] = err_sample;
+    {
+        float a_sel = anti_spk[0];
+        for (int s = 1; s < S; s++)
+            if (fabsf(anti_spk[s]) > fabsf(a_sel)) a_sel = anti_spk[s];
+        hw->abuf[hw->buf_pos] = a_sel;
+    }
+    hw->buf_pos++;
 
     /* 未满一帧, 仅做陷波 (如果有激活的) */
     if (hw->buf_pos < HW_FFT_N) {
@@ -216,7 +228,23 @@ void howling_tick(howling_detect_t *hw, float err_sample,
     memcpy(frame, hw->buf, HW_FFT_N * sizeof(float));
     apply_hanning(frame, HW_FFT_N);
 
-    float detected = detect_frame(hw, frame, 16000.0f);
+    float det_err = detect_frame(hw, frame, 16000.0f, HW_THRESH_DB, 1);
+
+    /* anti 通道: 振荡必经输出路径, 峰不被扰动噪声稀释; 限幅把 err 谱
+       打成梳状谐波 (峰均比被压到旧 15dB 阈值以下), anti 通道保留干净峰 */
+    float det_anti = 0;
+    {
+        float p = 0;
+        for (int i = 0; i < HW_FFT_N; i++) p += hw->abuf[i] * hw->abuf[i];
+        if (p / HW_FFT_N > HW_ANTI_MIN_RMS2) {
+            float aframe[HW_FFT_N];
+            memcpy(aframe, hw->abuf, HW_FFT_N * sizeof(float));
+            apply_hanning(aframe, HW_FFT_N);
+            det_anti = detect_frame(hw, aframe, 16000.0f, HW_ANTI_THRESH_DB, 0);
+        }
+    }
+
+    float detected = (det_anti > 0) ? det_anti : det_err;
 
     /* ── 状态机 ── */
     if (detected > 0) {

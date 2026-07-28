@@ -83,11 +83,31 @@ make all      # 两个都编译
 make clean    # 清理
 ```
 
-### 4. 运行
+### 4. 校准反馈路径（实时模式首次运行前必须执行）
+
+扬声器的反噪声会通过空气耦合回参考麦克风，形成正反馈（啸叫）。校准程序会测量这条声学路径并生成抵消滤波器：
+
+```bash
+# 编译校准程序（只需一次）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+
+# 运行校准（自动逐扬声器两轮，每轮 4 秒）
+./calibrate_feedback.exe
+```
+
+选择你的 ASIO 设备（如 `23`），保持房间安静，程序会自动在扬声器 0 和 1 上播放白噪声，用 NLMS 辨识反馈路径。完成后生成 `data/feedback_path_0.bin` 和 `data/feedback_path_1.bin`。
+
+> **只在麦克风或扬声器位置变化时需要重新校准**。文件缺失时反馈抵消自动禁用，不影响降噪效果但可能引发啸叫。
+
+### 5. 运行
 
 **离线版** — 处理一段噪声录音：
 ```bash
 ./main.exe "Noise Examples/mixed_7types_56s.wav"
+
+./main.exe "Noise Examples/road_noise_0-34.wav"
+
+./main.exe "Noise Examples/road_noise-15.wav"
 ```
 
 运行后会生成两个文件：
@@ -271,27 +291,15 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 └──────────────────────────────────────────────────────────────┘
 ## 反馈路径校准
 
-反馈抵消功能需逐扬声器校准声学路径。**只需在麦克风或扬声器位置变化时重新校准**。
+反馈抵消功能需逐扬声器校准声学路径。详见 [快速开始 - 步骤 4](#4-校准反馈路径实时模式首次运行前必须执行)。
 
-### 校准步骤
-
-```bash
-# 编译校准程序（只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-
-# 运行校准（自动逐扬声器两轮）
-./calibrate_feedback.exe
-```
-
-保持安静 4 秒×2 轮，自动生成 `data/feedback_path_0.bin` 和 `data/feedback_path_1.bin`。
-
-校准完成后运行 `./gfanc_realtime.exe`，日志显示：
+校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
 ```
 Feedback spk0: 256 taps, RMS=0.0005
 Feedback spk1: 256 taps, RMS=0.0006
 ```
 
-文件缺失时反馈抵消自动禁用，不影响降噪。
+文件缺失时反馈抵消自动禁用，日志显示 `Feedback cancel: disabled`，不影响降噪但可能引发啸叫。
 
 ## 啸叫检测
 
@@ -314,7 +322,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 场景类型 (K) | 4 | CNN 可识别的噪声环境数 (运行时从数据推导) |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
-| 输入预增益 | 10x (+20dB) | MIC_PRE_GAIN, 可调 |
+| 输入预增益 | 3x (+9.5dB) | MIC_PRE_GAIN, 可调 |
 | 步长 (μ) | 0.0001 | LMS 自适应步长 |
 | 泄漏因子 | 1e-6 (~1.5%/秒) | Wc 正则化, 与 step_size 解耦 |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |

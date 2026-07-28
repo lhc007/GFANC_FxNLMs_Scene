@@ -42,6 +42,10 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
 void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                        const float *err_meas, float *anti_out);
 
+/** 计算 anti_est[e] = Σ_s,k Wc[s,k] * Xd[e,s,k] (Ŝ域抗噪估计)
+ *  使用双段线性访问. 调用时机: fxnlms_tick_rt / fxnlms_forward_rt 返回后. */
+void fxnlms_get_anti_est(const fxnlms_mimo_t *fx, float *anti_est);
+
 void fxnlms_free(fxnlms_mimo_t *fx);
 
 #endif

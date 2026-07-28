@@ -194,21 +194,53 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
         power[s] /= (float)(E * L);
     }
 
+    /* anti-windup: 输出超出钳位阈值(±1.2)时冻结梯度 + 快速衰减(100×leak),
+       将 Wc 迅速拉回线性区, 避免"饱和后锁死". */
+    int saturated = 0;
+    for (int s = 0; s < S; s++)
+        if (fabsf(anti_out[s]) > 1.2f) saturated = 1;
+
     if (!fx->freeze_lms) {
-        for (int s = 0; s < S; s++) {
-            float inv_pwr = 1.0f / power[s];
-            for (int e = 0; e < E; e++) {
-                float *base = fx->xd + (e * S + s) * L;
-                float *wc_s = fx->wc + s * L;
-                int k = 0;
-                for (int idx = seg1; idx >= 0; idx--, k++)
-                    wc_s[k] -= fx->step_size * err_meas[e] * base[idx] * inv_pwr;
-                if (p > 0)
-                    for (int idx = L - 1; idx >= p; idx--, k++)
+        if (!saturated) {
+            for (int s = 0; s < S; s++) {
+                float inv_pwr = 1.0f / power[s];
+                for (int e = 0; e < E; e++) {
+                    float *base = fx->xd + (e * S + s) * L;
+                    float *wc_s = fx->wc + s * L;
+                    int k = 0;
+                    for (int idx = seg1; idx >= 0; idx--, k++)
                         wc_s[k] -= fx->step_size * err_meas[e] * base[idx] * inv_pwr;
+                    if (p > 0)
+                        for (int idx = L - 1; idx >= p; idx--, k++)
+                            wc_s[k] -= fx->step_size * err_meas[e] * base[idx] * inv_pwr;
+                }
             }
+        }
+        /* 泄漏始终运行; 饱和时 100× 快速衰减 → 0.16%/样本 → ~1s 退出饱和 */
+        float lk = saturated ? (fx->leak * 50.0f) : fx->leak;
+        for (int s = 0; s < S; s++)
             for (int k = 0; k < L; k++)
-                fx->wc[s * L + k] *= (1.0f - fx->leak);
+                fx->wc[s * L + k] *= (1.0f - lk);
+    }
+}
+
+void fxnlms_get_anti_est(const fxnlms_mimo_t *fx, float *anti_est)
+{
+    int E = fx->E, S = fx->S, L = fx->L;
+    int p = fx->xd_ptr;
+    int seg1 = (p == 0) ? L - 1 : p - 1;
+
+    for (int e = 0; e < E; e++) {
+        anti_est[e] = 0;
+        for (int s = 0; s < S; s++) {
+            float *base = fx->xd + (e * S + s) * L;
+            float *wc_s = fx->wc  + s * L;
+            int k = 0;
+            for (int idx = seg1; idx >= 0; idx--, k++)
+                anti_est[e] += wc_s[k] * base[idx];
+            if (p > 0)
+                for (int idx = L - 1; idx >= p; idx--, k++)
+                    anti_est[e] += wc_s[k] * base[idx];
         }
     }
 }

@@ -1,10 +1,14 @@
-/** GFANC FxNLMS — 离线 WAV 降噪.
+/** GFANC FxNLMS — 离线 WAV 降噪 (统一实时路径).
  *
- * 编译: gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c
+ *  信号路径与 main_realtime.c 完全一致, 仅 I/O 不同:
+ *    实时版: PortAudio 硬件 (ADC/DAC)
+ *    离线版: WAV 文件读写
+ *
+ *  编译: gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c
  *              src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c
  *              -lm -o main.exe
- * 运行: ./main.exe <noise.wav>
- * 输出: anti_out.wav (S=2ch 反噪声), error_out.wav (E=3ch 残差)
+ *  运行: ./main.exe <noise.wav>
+ *  输出: anti_out.wav (S=2ch 反噪声), error_out.wav (E=3ch 误差麦信号)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,7 +141,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define BP_LEN  1024
 #define PRI_LEN 1024
 #define SEC_LEN 1024
-#define DSP_DELAY 16
+#define DSP_DELAY 64  /* ASIO 96帧@48k: ADC 2ms + DAC 2ms ≈ 4ms → 64样本@16kHz */
 /* R-9: 增益/渐变参数统一由 cfg 管理, GFANC_MIC_GAIN / GFANC_FADE_LEN 等 env 变量可覆盖 */
 
 /* ══════════════════════════════════════════════════════════
@@ -202,6 +206,19 @@ int main(int argc, char **argv)
     fir_filter_t bp_fir = { bp_coeff, (double *)calloc(BP_LEN, sizeof(double)), BP_LEN, 0 };
 
     /* 2b. 次级路径 FIR (含 DSP 延迟) */
+    /* ── Ŝ 全局归一化: 所有通道统一除全局peak, 保持通道间相对增益 ── */
+    {
+        float global_peak = 0;
+        for (int i = 0; i < E*S*SEC_LEN; i++) {
+            float a = fabsf(sec_path[i]);
+            if (a > global_peak) global_peak = a;
+        }
+        if (global_peak > 0.001f) {
+            float inv = 1.0f / global_peak;
+            for (int i = 0; i < E*S*SEC_LEN; i++)
+                sec_path[i] *= inv;
+        }
+    }
     int sec_padded = SEC_LEN + DSP_DELAY;
     fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
     float *sec_coeffs = (float *)calloc(E * S * sec_padded, sizeof(float));
@@ -215,16 +232,14 @@ int main(int argc, char **argv)
             sec_firs[idx].delay_line = (double *)calloc(sec_padded, sizeof(double));
         }
 
-    /* 2c. 初级路径 FIR (仅 R=0, 无延迟) */
-    fir_filter_t pri_firs[E], pri_full_firs[E];  /* R-18: 分离带限/全频路径 */
+    /* 2c. 初级路径 FIR (R=0, 持久延迟线 — 跨 chunk 连续) */
+    fir_filter_t pri_firs[E], pri_raw_firs[E];
     for (int e = 0; e < E; e++) {
-        pri_firs[e].coeffs = pri_path + e * 2 * PRI_LEN; /* R=0 */
-        pri_firs[e].n_taps = PRI_LEN;
-        pri_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
-        pri_firs[e].ptr = 0;
-        pri_full_firs[e] = pri_firs[e];  /* 同系数, 独立延迟线 */
-        pri_full_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
-        pri_full_firs[e].ptr = 0;
+        pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path + e * 2 * PRI_LEN;
+        pri_firs[e].n_taps = pri_raw_firs[e].n_taps = PRI_LEN;
+        pri_firs[e].delay_line     = (double *)calloc(PRI_LEN, sizeof(double));
+        pri_raw_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
+        pri_firs[e].ptr = pri_raw_firs[e].ptr = 0;
     }
 
     /* 2d. Scene Controller */
@@ -264,75 +279,70 @@ int main(int argc, char **argv)
         printf("Resampled: %d Hz -> %d Hz (%d samples)\n", wav.sr, FS, N);
     } else N = wav.n;
 
-    /* 峰值归一化 + 初始带通 → noise_bp (匹配 Python noise_loader) */
-    {
-        float peak = 0;
-        for (int i = 0; i < N; i++) { float a = fabsf(ref[i]); if (a > peak) peak = a; }
-        if (peak > 1e-12f) for (int i = 0; i < N; i++) ref[i] /= peak;
-    }
-    float *noise_bp = (float *)malloc(N * sizeof(float));
+    /* 预处理: ref_filt_all = bandpass(noise × pre_gain)
+       匹配实时版 ref_filt 信号链: pre_gain → soft_clip → bandpass
+       注意: 不做峰值归一化 (实时版 ADC 输入无归一化) */
+    float *ref_filt_all = (float *)malloc(N * sizeof(float));
     {
         fir_filter_t bp_tmp = { bp_fir.coeffs, (double *)calloc(BP_LEN, sizeof(double)), BP_LEN, 0 };
-        for (int i = 0; i < N; i++) noise_bp[i] = fir_tick(&bp_tmp, ref[i]);
+        for (int i = 0; i < N; i++) {
+            float rs = ref[i] * cfg.mic_pre_gain;
+            if      (rs >  1.0f) rs =  tanhf(rs);
+            else if (rs < -1.0f) rs = -tanhf(-rs);
+            ref_filt_all[i] = fir_tick(&bp_tmp, rs);
+        }
         free(bp_tmp.delay_line);
     }
 
-    /* ── 4. 离线 ANC ── */
+    /* 次级路径 FIR — 误差合成用 (独立延迟线, 同 sec 系数)
+       用于 anti_spk → Ŝ → anti_at_mic (声学尺度, 与 Pri(noise) 可比) */
+    fir_filter_t *sec_firs_err = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
+    for (int e = 0; e < E; e++)
+        for (int s = 0; s < S; s++) {
+            int idx = e * S + s;
+            sec_firs_err[idx].coeffs = sec_coeffs + idx * sec_padded;
+            sec_firs_err[idx].n_taps = sec_padded;
+            sec_firs_err[idx].delay_line = (double *)calloc(sec_padded, sizeof(double));
+        }
+
+    /* 误差麦带通 FIR (匹配实时版 bp_err[E]) */
+    fir_filter_t bp_err[E];
+    for (int e = 0; e < E; e++) {
+        bp_err[e].coeffs = bp_coeff;
+        bp_err[e].n_taps = BP_LEN;
+        bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
+        bp_err[e].ptr = 0;
+    }
+
+    /* ── 4. 离线 ANC (统一实时路径) ── */
     int chunk = FS, n_sec = (N + chunk - 1) / chunk;
     float *anti_out = (float *)calloc(S * N, sizeof(float));
     float *err_out  = (float *)calloc(E * N, sizeof(float));
-    float *wc_fx = NULL; /* 指向 fx.wc (FANLMS 内部) */
 
     /* CrossFader 状态 */
     int   fade_cnt = 0;
     float wc_old[2048], wc_cur[2048];
 
-    float sum_db_band = 0, sum_db_full = 0;
+    float sum_nr_db = 0;
     clock_t t0 = clock();
 
-    printf("\n%4s | %5s | %25s | %-55s | %8s | %8s | %s\n", "Sec", "Scene", "Top-3", "Full Probs (0~K-1)", "dB(Band)", "dB(Full)", "Action");
+    /* 跨秒持久状态: 避免每秒重置导致音频咔声 */
+    float err_meas[E] = {0};      /* LMS 梯度驱动信号 */
+    float anti_est_prev[E] = {0}; /* anti_est = Wc⊗Xd, Ŝ域抗噪估计 */
+
+    printf("\n%4s | %5s | %25s | %-55s | %8s | %s\n", "Sec", "Scene", "Top-3", "Full Probs (0~K-1)", "NR(dB)", "Action");
     for (int i = 0; i < 120; i++) printf("-"); printf("\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
 
-        /* 4a. ref_filt = bandpass(noise_bp) × pre_gain */
-        float *ref_filt = (float *)malloc(chunk * sizeof(float));
-        for (int i = 0; i < len; i++)
-            ref_filt[i] = fir_tick(&bp_fir, noise_bp[start + i]) * cfg.mic_pre_gain;
-
-        /* 4b. Dis_band = Pri(ref_filt), Dis_full = Pri(noise_bp) */
-        float *dis_buf  = (float *)calloc(E * len, sizeof(float));
-        float *full_buf = (float *)calloc(E * len, sizeof(float));
-        for (int e = 0; e < E; e++) {
-            fir_filter_t pri_tmp = pri_firs[e];
-            for (int n = 0; n < len; n++)
-                dis_buf[e * len + n] = fir_tick(&pri_tmp, ref_filt[n]);
-            pri_firs[e].ptr = pri_tmp.ptr; /* sync ptr back */
-
-            /* R-18: 使用持久延迟线, 消除每秒启动瞬态 */
-            for (int n = 0; n < len; n++)
-                full_buf[e * len + n] = fir_tick(&pri_full_firs[e], noise_bp[start + n]);
-        }
-
-        /* 4c. 参考能量 (所有 Mic 平均) */
-        float dis_pwr_band = 0, dis_pwr_full = 0, fx_pwr_diag = 0;
-        for (int e = 0; e < E; e++)
-            for (int n = 0; n < len; n++) {
-                dis_pwr_band += dis_buf[e * len + n] * dis_buf[e * len + n];
-                dis_pwr_full += full_buf[e * len + n] * full_buf[e * len + n];
-            }
-        dis_pwr_band /= (len * E); dis_pwr_full /= (len * E);
-
-        /* 4d. CNN 场景分类 (输入: noise_bp + minmaxscaler)
-           仅完整 1s 块调用 CNN；末块不足 1s 时复用上一帧分类, 保持当前 Wc */
+        /* 4a. CNN 场景分类 (输入: ref_filt_all, 匹配实时版 CNN 输入) */
         float probs[SC_K_MAX];
-        int old_scene = sc.cur_scene;
         int K = sc.K;
         int new_scene;
         if (len == chunk) {
-            new_scene = scene_ctrl_process(&sc, noise_bp + start, wc_cur, probs);
+            new_scene = scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, probs);
         } else {
             memcpy(probs, sc.prev_probs, K * sizeof(float));
             new_scene = sc.cur_scene;
@@ -354,13 +364,12 @@ int main(int argc, char **argv)
         snprintf(scene_str, sizeof(scene_str), "%d:%.2f,%d:%.2f,%d:%.2f",
                  top3[0], probs[top3[0]], top3[1], probs[top3[1]], top3[2], probs[top3[2]]);
 
-        /* 诊断: 完整概率分布 (0~K-1) */
         char prob_full[120];
         int off = 0;
         for (int i = 0; i < K && off < (int)sizeof(prob_full) - 4; i++)
             off += snprintf(prob_full + off, sizeof(prob_full) - off, "%d:%.2f ", i, probs[i]);
 
-        /* 4e. 滞回检测 + CrossFader */
+        /* 4b. 滞回检测 + CrossFader */
         static int first_sec = 1;
         char action[20] = "-";
         if (first_sec) {
@@ -381,26 +390,14 @@ int main(int argc, char **argv)
             }
         }
         memcpy(sc.prev_probs, probs, sc.K * sizeof(float));
-        wc_fx = fx.wc; /* 指向 FxNLMS 内部 Wc */
 
-        /* 首秒诊断 */
-        if (sec == 0) {
-            float wc_new_rms = 0;
-            for (int i = 0; i < S * L; i++) wc_new_rms += wc_cur[i] * wc_cur[i];
-            wc_new_rms = sqrtf(wc_new_rms / (S * L));
-            printf("[Diag] CNN logits: (scene=%d max_prob=%.2f)\n", new_scene, probs[new_scene]);
-            printf("[Diag] Wc_new RMS: %.4f\n", wc_new_rms);
-            printf("[Diag] Dis (带内) RMS: %.4f\n", sqrtf(dis_pwr_band));
-            printf("[Diag] Dis (全频) RMS: %.4f\n", sqrtf(dis_pwr_full));
-        }
-
-        /* 4f. 逐样本 FxNLMS */
-        float err_pwr = 0;
+        /* 4c. 逐样本 FxNLMS (统一实时路径) */
+        float err_pwr = 0, dis_pwr = 0, fx_pwr_diag = 0;
         for (int n = 0; n < len; n++) {
             int idx = start + n;
-            float rn_bp = ref_filt[n];
+            float ref_filt = ref_filt_all[idx];
 
-            /* CrossFader: 混合 Wc */
+            /* CrossFader */
             if (fade_cnt > 0) {
                 float a = (float)fade_cnt / cfg.fade_len;
                 for (int i = 0; i < S * L; i++)
@@ -409,54 +406,72 @@ int main(int argc, char **argv)
                 if (fade_cnt == 0) memcpy(fx.wc, wc_cur, S * L * sizeof(float));
             }
 
-            /* Fx = Sec ⊗ rn_bp */
+            /* Fx = Ŝ ⊗ ref_filt (梯度用) */
             float Fx_arr[E * S];
             for (int e = 0; e < E; e++)
                 for (int s = 0; s < S; s++) {
-                    float v = fir_tick(&sec_firs[e * S + s], rn_bp);
+                    float v = fir_tick(&sec_firs[e * S + s], ref_filt);
                     Fx_arr[e * S + s] = v;
                     if (sec == 0) fx_pwr_diag += v * v;
                 }
 
-            /* 扰动 = Dis (带限) */
-            float dist[E];
-            for (int e = 0; e < E; e++) dist[e] = dis_buf[e * len + n];
-
-            /* FxNLMS: 内部做 Xd roll + anti_est + err + 梯度 */
-            float anti_spk[S], err_sig[E];
+            /* anti_spk = Wc ⊗ x_hist (匹配实时版) */
+            float anti_spk[S];
             if (fade_cnt == 0)
-                fxnlms_tick(&fx, Fx_arr, dist, anti_spk, err_sig);
+                fxnlms_tick_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
             else
-                fxnlms_forward_only(&fx, Fx_arr, anti_spk, err_sig);
+                fxnlms_forward_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
 
-            /* NaN/Inf 保护: 防止异常值进入输出文件/扬声器 */
             for (int s = 0; s < S; s++) {
                 if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
+                if (anti_spk[s] > 1.0f) anti_spk[s] = 1.0f;
+                if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
                 anti_out[s * N + idx] = anti_spk[s];
             }
+
+            /* 带限扰动 + 残差 (Ŝ域, 驱动 LMS 梯度和 NR) */
+            float dis_val[E];
             for (int e = 0; e < E; e++) {
-                err_out[e * N + idx] = err_sig[e];
-                err_pwr += err_sig[e] * err_sig[e];
+                dis_val[e] = fir_tick(&pri_firs[e], ref_filt);
+                dis_pwr += dis_val[e] * dis_val[e];
+                err_meas[e] = dis_val[e] + anti_est_prev[e];
+                err_pwr += err_meas[e] * err_meas[e];
             }
+
+            /* error_out: 匹配实时版误差麦信号链 —
+               anti_spk / pre_gain 还原到声学尺度, 与 Pri(noise) 可比 */
+            for (int e = 0; e < E; e++) {
+                float pri_raw = fir_tick(&pri_raw_firs[e], ref[idx]);
+                float anti_at_mic = 0;
+                for (int s = 0; s < S; s++)
+                    anti_at_mic += fir_tick(&sec_firs_err[e * S + s], anti_spk[s] / cfg.mic_pre_gain);
+                float es = (pri_raw + anti_at_mic) * cfg.mic_pre_gain;
+                if      (es >  1.0f) es =  tanhf(es);
+                else if (es < -1.0f) es = -tanhf(-es);
+                err_out[e * N + idx] = fir_tick(&bp_err[e], es);
+            }
+
+            /* 更新 anti_est_prev = Wc ⊗ Xd (供下一样本) */
+            fxnlms_get_anti_est(&fx, anti_est_prev);
         }
         err_pwr /= (len * E);
+        dis_pwr /= (len * E);
 
-        float db_band = 10.0f * log10f(dis_pwr_band / (err_pwr + 1e-12f));
-        float db_full = 10.0f * log10f(dis_pwr_full / (err_pwr + 1e-12f));
+        /* NR = 带内降噪量 (匹配实时版: 仅 20-1500 Hz 范围内的降噪效果) */
+        float nr_db = 10.0f * log10f((dis_pwr + 1e-12f) / (err_pwr + 1e-12f));
 
-        printf("%4d | %5d | %22s | %-40s | %8.2f dB | %8.2f dB | %s", sec + 1, new_scene, scene_str, prob_full, db_band, db_full, action);
+        printf("%4d | %5d | %22s | %-40s | %8.2f dB | %s", sec + 1, new_scene, scene_str, prob_full, nr_db, action);
         if (sec == 0) printf("  [FxRMS=%.4f]", sqrtf(fx_pwr_diag / (len * E * S)));
         printf("\n");
 
-        sum_db_band += db_band; sum_db_full += db_full;
-        free(ref_filt); free(dis_buf); free(full_buf);
+        sum_nr_db += nr_db;
     }
 
     clock_t t1 = clock();
     double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
 
     for (int i = 0; i < 85; i++) printf("-"); printf("\n");
-    printf("  Avg |                           | %9.2f dB | %9.2f dB |\n", sum_db_band / n_sec, sum_db_full / n_sec);
+    printf("  Avg |                           | %9.2f dB |\n", sum_nr_db / n_sec);
     printf("\nProcessing: %.1fs for %.1fs audio (%.1fx)\n", elapsed, (double)N / FS, (double)N / FS / elapsed);
 
     /* ── 5. 输出 ── */
@@ -465,12 +480,13 @@ int main(int argc, char **argv)
     printf("Output: anti_out.wav (%d ch), error_out.wav (%d ch)\n", S, E);
 
     /* ── 6. 清理 ── */
-    free(anti_out); free(err_out); free(noise_bp);
+    free(anti_out); free(err_out); free(ref_filt_all);
+    for (int e = 0; e < E; e++) free(bp_err[e].delay_line);
     fxnlms_free(&fx);
     scene_ctrl_free(&sc);
-    for (int i = 0; i < E * S; i++) free(sec_firs[i].delay_line);
-    free(sec_firs); free(sec_coeffs);
-    for (int e = 0; e < E; e++) { free(pri_firs[e].delay_line); free(pri_full_firs[e].delay_line); }
+    for (int i = 0; i < E * S; i++) { free(sec_firs[i].delay_line); free(sec_firs_err[i].delay_line); }
+    free(sec_firs); free(sec_firs_err); free(sec_coeffs);
+    for (int e = 0; e < E; e++) { free(pri_firs[e].delay_line); free(pri_raw_firs[e].delay_line); }
     free(bp_fir.delay_line);
     free(wav.data); if (ref_resampled) free(ref_resampled);
     bin_free(sec_path); bin_free(pri_path); bin_free(sub_filters);

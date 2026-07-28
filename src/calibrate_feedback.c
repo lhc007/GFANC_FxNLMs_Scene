@@ -16,6 +16,32 @@
 #include "fir_filter.h"
 #include "binary_loader.h"
 
+/* 2阶 Butterworth 低通 biquad — 与 main_realtime.c R-14 抗混叠一致.
+   旧代码直接 3:1 抽取, >8kHz 分量折叠入通带污染 FIR 辨识. */
+typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
+
+static void biquad_init_lpf(biquad_t *f, float fc, float fs)
+{
+    float w0 = 2.0f * 3.14159265f * fc / fs;
+    float c = cosf(w0), s = sinf(w0);
+    float alpha = s / (2.0f * 0.70710678f);  /* Q=1/√2 Butterworth */
+    float a0 = 1.0f + alpha;
+    f->b0 = (1.0f - c) / (2.0f * a0);
+    f->b1 = (1.0f - c) / a0;
+    f->b2 = f->b0;
+    f->a1 = -2.0f * c / a0;
+    f->a2 = (1.0f - alpha) / a0;
+    f->z1 = f->z2 = 0.0f;
+}
+
+static float biquad_tick(biquad_t *f, float x)
+{
+    float y = f->b0 * x + f->z1;
+    f->z1 = f->b1 * x - f->a1 * y + f->z2;
+    f->z2 = f->b2 * x - f->a2 * y;
+    return y;
+}
+
 /* ══════════════════════════════════════════════════════════ */
 #define FS_HW       48000
 #define FS_CAL      16000
@@ -57,7 +83,7 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
         out[i*2]   = (cal->spk_idx == 0) ? n : 0.0f;
         out[i*2+1] = (cal->spk_idx == 1) ? n : 0.0f;
         /* 录制参考麦 (ch0) */
-        cal->ref_hw[cal->idx] = in[i*6 + 0];
+        cal->ref_hw[cal->idx] = in[i*4 + 0];
         cal->idx++;
     }
     return 0; /* paContinue */
@@ -132,6 +158,10 @@ static void nlms_identify(const float *noise_16k, const float *ref_16k,
     rms = sqrtf(rms / n_taps);
     printf("  FIR: peak=%.4f @ tap %d (%.2fms), RMS=%.4f\n",
            peak, peak_idx, (float)peak_idx / FS_CAL * 1000.0f, rms);
+    /* 弱路径警告: RMS<0.001 基本等于"没标定上", 运行时反馈抵消形同虚设
+       (实测 RMS=0.0001 的 FIR 装载后 fb_est≈0, 扬声器满幅反馈直进参考麦) */
+    if (rms < 0.001f)
+        printf("  ⚠ 反馈路径过弱 — 请提高扬声器音量 / 确认参考麦能听到扬声器后重新标定!\n");
 }
 
 /* ══════════════════════════════════════════════════════════ */
@@ -142,16 +172,27 @@ int main(void) {
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 
-    /* 列出设备 */
+    /* 列出设备 (跳过 MME/DirectSound, 只显示 ASIO/WASAPI/WDM-KS) */
     int nd = p_Pa_GetDeviceCount();
-    printf("Audio Devices:\n");
-    for (int i = 0; i < nd; i++) {
-        const PaDeviceInfo2 *info = (const PaDeviceInfo2 *)p_Pa_GetDeviceInfo(i);
-        if (info && (info->maxInputChannels > 0 || info->maxOutputChannels > 0)
-            && info->defaultSampleRate >= 48000)
-            printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
-                i, info->name, info->maxInputChannels, info->maxOutputChannels, info->defaultSampleRate);
+    int napi = 0;
+    printf("\n=== Audio Devices ===\n");
+    for (int api_idx = 0; ; api_idx++) {
+        const PaHostApiInfo2 *api = (const PaHostApiInfo2 *)p_Pa_GetHostApiInfo(api_idx);
+        if (!api) break;
+        if (strstr(api->name, "MME") || strstr(api->name, "DirectSound")) continue;
+        napi++;
+        int has_dev = 0;
+        for (int i = 0; i < nd; i++) {
+            const PaDeviceInfo2 *info = (const PaDeviceInfo2 *)p_Pa_GetDeviceInfo(i);
+            if (info && info->hostApi == api_idx
+                && info->maxInputChannels > 0 && info->maxOutputChannels > 0) {
+                if (!has_dev) { printf("\n[%s]\n", api->name); has_dev = 1; }
+                printf("  %2d: %s (in=%d out=%d fs=%.0f)\n",
+                    i, info->name, info->maxInputChannels, info->maxOutputChannels, info->defaultSampleRate);
+            }
+        }
     }
+    if (napi == 0) { fprintf(stderr, "PA: no host APIs found\n"); return 1; }
 
     int in_dev, out_dev;
     printf("\nInput device ID (ASIO MIC): "); fflush(stdout); scanf("%d", &in_dev);
@@ -167,7 +208,7 @@ int main(void) {
     for (int i = 0; i < n_16k; i++)
         noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
 
-    PaStreamParams in_p  = { in_dev,  6, paFloat32, 0.01, NULL };
+    PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.01, NULL };
     PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };
 
     /* ── 逐扬声器校准 (F-G修复) ── */
@@ -187,9 +228,15 @@ int main(void) {
         p_Pa_StopStream(stream);
         p_Pa_CloseStream(stream);
 
-        /* ref_hw 3:1 抽取 → ref_16k */
-        for (int i = 0; i < n_16k; i++)
-            ref_16k[i] = ref_hw[i * 3];
+        /* ref_hw 抗混叠低通 → 3:1 抽取 → ref_16k (与运行时 R-14 链路一致) */
+        {
+            biquad_t aa;
+            biquad_init_lpf(&aa, 6500.0f, (float)FS_HW);
+            for (int i = 0; i < total_hw; i++)
+                ref_hw[i] = biquad_tick(&aa, ref_hw[i]);
+            for (int i = 0; i < n_16k; i++)
+                ref_16k[i] = ref_hw[i * 3];
+        }
 
         /* 诊断 */
         {   float nrms = 0, rrms = 0;
