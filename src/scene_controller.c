@@ -41,6 +41,7 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     float ss = 0;
     for (int i = 0; i < S * L; i++) ss += stub[i] * stub[i];
     sc->stub_rms = sqrtf(ss / (S * L));
+    sc->wc_rms_target = sc->stub_rms;  /* 默认值, 实时版按 Ŝ 物理特性覆盖 */
     free(stub);
     return 0;
 }
@@ -188,17 +189,23 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, int scene_id, float *wc_out
             wc_out[s * L + l] = v;
         }
 
-    /* 取反 (S-4修复: 不再强制对齐stub_rms, LMS功率归一化自动适应增益) */
+    /* S-4 取反. 然后缩放到目标 RMS (自动标定, 基于 Ŝ 物理衰减) */
     float rms_sq = 0;
     for (int i = 0; i < S * L; i++) rms_sq += wc_out[i] * wc_out[i];
     float wc_rms = sqrtf(rms_sq / (S * L));
-    if (wc_rms < 1e-6f) {
-        static int warn_cnt = 0;
-        if (warn_cnt < 3) {
-            fprintf(stderr, "[WARN] Wc RMS=%.6f near zero for scene=%d, ANC may be silent\n",
-                    wc_rms, scene_id);
-            warn_cnt++;
+    float target_rms = sc->wc_rms_target;
+    if (wc_rms > 1e-6f && target_rms > 1e-6f) {
+        float scale = target_rms / wc_rms;
+        for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i] * scale;
+    } else {
+        if (wc_rms < 1e-6f) {
+            static int warn_cnt = 0;
+            if (warn_cnt < 3) {
+                fprintf(stderr, "[WARN] Wc RMS=%.6f near zero for scene=%d\n",
+                        wc_rms, scene_id);
+                warn_cnt++;
+            }
         }
+        for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i];
     }
-    for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i];
 }

@@ -208,8 +208,8 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
         power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
-    /* anti-windup: 输出超出钳位阈值(±1.2)时冻结梯度 + 快速衰减(100×leak),
-       将 Wc 迅速拉回线性区, 避免"饱和后锁死". */
+    /* anti-windup: 输出超出钳位阈值(±1.2)时冻结梯度 + 快速衰减(200×leak),
+       噪声停止后 5τ≈310ms 消退, 消除 "呜尾音" */
     int saturated = 0;
     for (int s = 0; s < S; s++)
         if (fabsf(anti_out[s]) > 1.2f) saturated = 1;
@@ -230,8 +230,8 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                 }
             }
         }
-        /* 泄漏始终运行; 饱和时 100× 快速衰减 → 0.16%/样本 → ~1s 退出饱和 */
-        float lk = saturated ? (fx->leak * 50.0f) : fx->leak;
+        /* 泄漏始终运行; 饱和时 200× 快速衰减, ~310ms 消退 */
+        float lk = saturated ? (fx->leak * 200.0f) : fx->leak;
         for (int s = 0; s < S; s++)
             for (int k = 0; k < L; k++)
                 fx->wc[s * L + k] *= (1.0f - lk);

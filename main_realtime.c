@@ -129,6 +129,9 @@ typedef struct {
     volatile float acc_ref, acc_err, acc_dist, acc_fb;
     volatile float acc_ch[4], acc_anti, acc_anti_est;
     volatile float acc_d_est;    /* 扰动估计功率 Σ(err-anti_est)² (诚实NR分子) */
+    volatile float acc_err_cross;/* Σ(err × anti_est), Ŝ 校准后重构 d_cal 用 */
+    /* s_cal 已移除: Ŝ 保持物理尺度, anti_est 无需去归一化校准 */
+    float  wc_init_max;           /* INIT 后 Wc 的 max|系数| (freeze 阈值基准) */
     volatile float fb_rms;       /* 反馈抵消量 RMS */
     volatile float anti_est_rms; /* 模型估计反噪声 RMS (NR计算用) */
     volatile int   acc_cnt;
@@ -352,35 +355,30 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 /* P0-3: 扰动估计 d = err - anti_est (逐样本), 诚实 NR 的分子 */
                 float dv = err_meas[e] - anti_est[e];
                 ctx->acc_d_est += dv * dv;
+                ctx->acc_err_cross += err_meas[e] * anti_est[e];
             }
         }
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
             float pe = ctx->acc_err;
-            /* R-11: pa 按 250/FS_ANC 比例缩放到全秒等效功率 */
             float pa = ctx->acc_anti_est * (float)FS_ANC / 250.0f;
-            float pd = ctx->acc_d_est   * (float)FS_ANC / 250.0f;
-            /* P0-3: 诚实 NR = 估计扰动功率(d=err-anti_est) / 实测残差功率.
-               旧公式 (pe+pa)/pe 把"系统自己的反噪声能量"当降噪量 — 发散时 pa 爆炸,
-               实测曾显示 NR=36dB 而 err 同步恶化 20×, 完全反向指示. */
+            float cross = ctx->acc_err_cross * (float)FS_ANC / 250.0f;
+            float pd = pe + pa - 2.0f * cross;               /* d = err - anti_est (Ŝ 物理尺度) */
             ctx->nr_level = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
             ctx->anti_est_rms = sqrtf(pa / (FS_ANC * E));
             ctx->ref_rms  = sqrtf(ctx->acc_ref  / FS_ANC);
             ctx->err_rms  = sqrtf(pe / (FS_ANC * E));
-            ctx->dist_rms = sqrtf(pd / (FS_ANC * E)); /* 估计扰动 RMS (d=err-anti_est) */
+            ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
             ctx->fb_rms   = sqrtf(ctx->acc_fb   / FS_ANC);
             for (int c = 0; c < 4; c++)
                 ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
             ctx->anti_rms = sqrtf(ctx->acc_anti / (FS_ANC * 2));
-            /* 发散标志: 反噪声能量 10× 于残差 且 输出电平足够大 → 几乎必为自激振荡.
-               低电平静音室不标记 (pa/pe 比值在小信号下无意义). */
             ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f);
-            /* safety_mute: err显著>ref 且信号高于噪声地板才触发.
-               安静环境( ref<0.001≈-60dBFS )不触发,避免噪声地板附近的死锁. */
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms * 2.0f
                                 && ctx->ref_rms > 0.001f
                                 && ctx->mute_hold <= 0);
             ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0;
-            ctx->acc_anti = ctx->acc_anti_est = ctx->acc_d_est = 0; ctx->acc_cnt = 0;
+            ctx->acc_anti = ctx->acc_anti_est = ctx->acc_d_est = ctx->acc_err_cross = 0;
+            ctx->acc_cnt = 0;
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
@@ -554,15 +552,15 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     } else {
         ctx->diverge_sec = 0;
     }
-    if (wc_max > ctx->sc.stub_rms * cfg.freeze_ratio) {
+    if (wc_max > ctx->wc_init_max * cfg.freeze_ratio) {
         if (!ctx->fx.freeze_lms && !ctx->freeze_permanent) {
             InterlockedExchange(&ctx->fx.freeze_lms, 1);
             ctx->freeze_timer = cfg.freeze_retry_sec;
-            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc diverged max=%.3f stub=%.3f\n",
-                                       wc_max, ctx->sc.stub_rms);
+            if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc diverged max=%.3f init=%.3f\n",
+                                       wc_max, ctx->wc_init_max);
             printf("[WARN] Wc diverged! max|Wc|=%.3f "
-                   "> %.0f×stub(%.3f), LMS frozen (%ds retry)\n",
-                   wc_max, cfg.freeze_ratio, ctx->sc.stub_rms, cfg.freeze_retry_sec);
+                   "> %.0f×init_max(%.3f), LMS frozen (%ds retry)\n",
+                   wc_max, cfg.freeze_ratio, ctx->wc_init_max, cfg.freeze_retry_sec);
         }
     } else if (ctx->fx.freeze_lms && ctx->freeze_timer > 0 && !ctx->freeze_permanent) {
         ctx->freeze_timer--;
@@ -586,7 +584,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         if (ctx->freeze_timer >= 0)
             printf("[INFO] Wc stable after unfreeze, normal operation resumed\n");
     }
-    if (ctx->freeze_timer < 0 && wc_max > ctx->sc.stub_rms * cfg.freeze_ratio) {
+    if (ctx->freeze_timer < 0 && wc_max > ctx->wc_init_max * cfg.freeze_ratio) {
         InterlockedExchange(&ctx->fx.freeze_lms, 1);
         ctx->freeze_permanent = 1;
         ctx->freeze_timer = 0;
@@ -594,6 +592,20 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         printf("[WARN] Wc diverged again during watch period! "
                "LMS permanently frozen until scene switch\n");
     }
+    if (ctx->anti_rms > cfg.diverge_anti_rms) {
+        if (++ctx->diverge_sec >= 3) {
+            if (ctx->scene_wc_valid[ctx->cur_scene_id])
+                memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
+            else
+                scene_ctrl_construct_wc(&ctx->sc, ctx->cur_scene_id, ctx->wc_shadow);
+            InterlockedExchangeAdd(&ctx->wc_seq, 2);
+            InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
+            ctx->diverge_sec = 0;
+            ctx->peak_rollback_cnt = 0;
+            printf("[WARN] anti_rms %.3f > %.2f for 3s — Wc rescued (rollback+ramp)\n",
+                   ctx->anti_rms, cfg.diverge_anti_rms);
+        }
+    } else ctx->diverge_sec = 0;
 }
 
 static void check_convergence(rt_ctx_t *ctx) {
@@ -603,6 +615,13 @@ static void check_convergence(rt_ctx_t *ctx) {
             memcpy(ctx->scene_wc[ctx->cur_scene_id], ctx->wc_snapshot, S*L*sizeof(float));
             ctx->scene_wc_valid[ctx->cur_scene_id] = 1;
             ctx->converged_frames = 0;
+            /* ── 自适应 freeze 阈值: 收敛期 max|Wc| → 基准 → 30×=安全上限 ── */
+            float mx = 0;
+            for (int i = 0; i < S*L; i++) {
+                float a = fabsf(ctx->wc_snapshot[i]);
+                if (a > mx) mx = a;
+            }
+            if (mx > 0.001f) ctx->wc_init_max = mx;
         }
     } else {
         ctx->converged_frames = 0;
@@ -648,7 +667,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
     gfanc_config_load_env(&cfg);
-    LOG_INFO("Runtime config: gain=%.1f step=%.6f leak=%.0e ramp=%dms mute=%dms dsp_delay=%d",
+    LOG_INFO("Runtime config: gain=%.1f step=%.2e leak=%.0e ramp=%dms mute=%dms dsp=%d",
              cfg.mic_pre_gain, cfg.step_size, cfg.leak, cfg.ramp_ms, cfg.mute_hold_ms, cfg.dsp_delay);
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
@@ -746,19 +765,31 @@ int main(void) {
 
     int dsp_delay = cfg.dsp_delay;
     int sp = SEC_LEN + dsp_delay;
-    /* ── Ŝ 全局归一化: 所有通道统一除全局peak, 保持通道间相对增益 ── */
+    /* ── Ŝ 保持物理尺度 (不归一化): 实测次级路径含真实声学衰减, 直接使用.
+       Xd = Ŝ⊗ref_filt 在物理尺度下 power 由 R-48 epsilon=1e-6 主导,
+       μ_eff = step_size/1e-6 ≈ 0.5 (稳定). GFANC_STEP 可覆盖. ── */
+    if (getenv("GFANC_STEP")) cfg.step_size = (float)atof(getenv("GFANC_STEP"));
+    /* ── Ŝ 物理特性诊断 + Wc 增益自动标定 ── */
     {
-        float global_peak = 0;
+        float s_rms = 0, s_peak = 0;
         for (int i = 0; i < E*S*SEC_LEN; i++) {
             float a = fabsf(sec_path[i]);
-            if (a > global_peak) global_peak = a;
+            s_rms += sec_path[i] * sec_path[i];
+            if (a > s_peak) s_peak = a;
         }
-        if (global_peak > 0.001f) {
-            float inv = 1.0f / global_peak;
-            for (int i = 0; i < E*S*SEC_LEN; i++)
-                sec_path[i] *= inv;
-        }
+        s_rms = sqrtf(s_rms / (E*S*SEC_LEN));
+        /* anti_RMS ≈ Wc_RMS × ref_filt_RMS × √L.
+           目标: anti≈0.3 @ ref≈0.05 → Wc_RMS ≈ 0.3/(0.05×32) ≈ 0.2.
+           Ŝ 越弱 (s_peak越小) → 需越大 Wc → 按 1/s_peak 补偿. */
+        float wc_target = 0.2f;
+        if (s_peak > 0.0001f && s_peak < 1.0f) wc_target *= (0.05f / s_peak);
+        if (wc_target < 0.01f) wc_target = 0.01f;
+        if (wc_target > 1.0f)  wc_target = 1.0f;   /* 防饱和, LMS 会继续放大 */
+        printf("  Ŝ physical: peak=%.4f RMS=%.4f | auto Wc RMS target=%.3f (stub=%.3f)\n",
+               s_peak, s_rms, wc_target, ctx->sc.stub_rms);
+        ctx->sc.wc_rms_target = wc_target;          /* 覆盖 scene_ctrl_init 默认值 */
     }
+    printf("  step=%.2e (μ_eff≈%.1f)\n", cfg.step_size, cfg.step_size * 1e6f);
     ctx->sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
     ctx->sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
     if (!ctx->sec_firs || !ctx->sec_coeffs) {
@@ -880,6 +911,11 @@ int main(void) {
             /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
             memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
+            {   float mx = 0;
+                for (int i = 0; i < S*L; i++) {
+                    float a = fabsf(ctx->wc_cur[i]); if (a > mx) mx = a; }
+                ctx->wc_init_max = (mx > 0.001f) ? mx : 0.01f;
+            }
             InterlockedExchange(&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->scene_wc[new_scene], ctx->wc_cur, S*L*sizeof(float));

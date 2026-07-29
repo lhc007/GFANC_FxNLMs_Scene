@@ -205,20 +205,7 @@ int main(int argc, char **argv)
     /* 2a. 带通 FIR */
     fir_filter_t bp_fir = { bp_coeff, (double *)calloc(BP_LEN, sizeof(double)), BP_LEN, 0 };
 
-    /* 2b. 次级路径 FIR (含 DSP 延迟) */
-    /* ── Ŝ 全局归一化: 所有通道统一除全局peak, 保持通道间相对增益 ── */
-    {
-        float global_peak = 0;
-        for (int i = 0; i < E*S*SEC_LEN; i++) {
-            float a = fabsf(sec_path[i]);
-            if (a > global_peak) global_peak = a;
-        }
-        if (global_peak > 0.001f) {
-            float inv = 1.0f / global_peak;
-            for (int i = 0; i < E*S*SEC_LEN; i++)
-                sec_path[i] *= inv;
-        }
-    }
+    /* 2b. 次级路径 FIR (物理尺度, 不归一化) */
     int sec_padded = SEC_LEN + DSP_DELAY;
     fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
     float *sec_coeffs = (float *)calloc(E * S * sec_padded, sizeof(float));

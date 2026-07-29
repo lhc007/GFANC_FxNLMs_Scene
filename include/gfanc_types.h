@@ -40,6 +40,7 @@ typedef struct {
     float nr_converge_db;        /* 收敛判定 NR 阈值 dB */
     int   freeze_retry_sec;      /* freeze 后尝试解冻的秒数 */
     float diverge_anti_rms;      /* anti_rms 连续3s超此值 → Wc 发散救援 (env: GFANC_DIVERGE_ANTI) */
+    /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
 
     /* 啸叫检测 */
     float hw_thresh_db;          /* 峰均值比阈值 */
@@ -64,7 +65,7 @@ typedef struct {
     0.25f,              /* diverge_anti_rms */ \
     15.0f, 4, 8, 0.96f, /* hw_thresh_db, hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
-    16                  /* dsp_delay */ \
+    0                   /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -79,6 +80,8 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_FREEZE_RATIO"))) cfg->freeze_ratio = (float)atof(s);
     if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
+    /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
+    /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }
 
 #endif

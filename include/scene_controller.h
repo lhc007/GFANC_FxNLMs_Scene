@@ -18,6 +18,7 @@ typedef struct {
     int    K;                  /* 场景数 (运行时推导) */
     int    L;                  /* filter_len (1024) */
     float  stub_rms;
+    float  wc_rms_target;        /* 自动标定: Wc 构造目标 RMS (基于 Ŝ 物理衰减) */
     int    cur_scene;
     float *prev_probs;         /* [K] 动态分配 */
 } scene_ctrl_t;
