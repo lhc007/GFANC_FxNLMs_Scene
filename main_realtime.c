@@ -253,13 +253,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         }
 
         /* FxNLMS 实时路径: anti=Wc⊗ref, 梯度用err_meas直接驱动 (不合成err)
-           R-6: 静音/peak_mute/fade 期间冻结梯度, 防止开环空转污染 Wc */
-        if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute) {
+           R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路. */
+        if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
+            || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
             fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
-            /* P0-2: 静音期间 Wc 持续衰减 (半衰期~0.25s) — 每次静音都实质性
-               降低发散能量, 而非冻结等待 (旧行为: 解除静音即再次饱和) */
-            if (ctx->safety_mute || ctx->peak_mute) {
-                const float dk = 1.0f - 4e-5f;
+            /* 静音/啸叫期间 Wc 持续衰减 — 反馈事件后 Wc 自行退回到安全区 */
+            if (ctx->safety_mute || ctx->peak_mute
+                || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
+                const float dk = 1.0f - 4e-5f;  /* 半衰期~0.25s */
                 for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= dk;
             }
         } else {
@@ -765,31 +766,29 @@ int main(void) {
 
     int dsp_delay = cfg.dsp_delay;
     int sp = SEC_LEN + dsp_delay;
-    /* ── Ŝ 保持物理尺度 (不归一化): 实测次级路径含真实声学衰减, 直接使用.
-       Xd = Ŝ⊗ref_filt 在物理尺度下 power 由 R-48 epsilon=1e-6 主导,
-       μ_eff = step_size/1e-6 ≈ 0.5 (稳定). GFANC_STEP 可覆盖. ── */
-    if (getenv("GFANC_STEP")) cfg.step_size = (float)atof(getenv("GFANC_STEP"));
-    /* ── Ŝ 物理特性诊断 + Wc 增益自动标定 ── */
+    /* ── Ŝ peak→1.0 归一化: 消除训练/实测间的尺度差异, 使 power 在可预测范围.
+       归一化后 Xd 尺度一致, μ_eff=step_size/power 不再与 Ŝ 源耦合.
+       物理实测 Ŝ (peak<1) 归一化后 s_rms 仍由声学特性决定;
+       仿真 Ŝ (peak>1) 归一化后 s_rms 回归合理范围.
+       GFANC_STEP 可覆盖 step_size. ── */
     {
-        float s_rms = 0, s_peak = 0;
+        float s_peak = 0, s_rms = 0;
         for (int i = 0; i < E*S*SEC_LEN; i++) {
             float a = fabsf(sec_path[i]);
             s_rms += sec_path[i] * sec_path[i];
             if (a > s_peak) s_peak = a;
         }
         s_rms = sqrtf(s_rms / (E*S*SEC_LEN));
-        /* anti_RMS ≈ Wc_RMS × ref_filt_RMS × √L.
-           目标: anti≈0.3 @ ref≈0.05 → Wc_RMS ≈ 0.3/(0.05×32) ≈ 0.2.
-           Ŝ 越弱 (s_peak越小) → 需越大 Wc → 按 1/s_peak 补偿. */
-        float wc_target = 0.2f;
-        if (s_peak > 0.0001f && s_peak < 1.0f) wc_target *= (0.05f / s_peak);
-        if (wc_target < 0.01f) wc_target = 0.01f;
-        if (wc_target > 1.0f)  wc_target = 1.0f;   /* 防饱和, LMS 会继续放大 */
-        printf("  Ŝ physical: peak=%.4f RMS=%.4f | auto Wc RMS target=%.3f (stub=%.3f)\n",
-               s_peak, s_rms, wc_target, ctx->sc.stub_rms);
-        ctx->sc.wc_rms_target = wc_target;          /* 覆盖 scene_ctrl_init 默认值 */
+        if (s_peak > 0.001f) {
+            float inv = 1.0f / s_peak;          /* peak→1.0 */
+            for (int i = 0; i < E*S*SEC_LEN; i++) sec_path[i] *= inv;
+            s_rms *= inv;
+        }
+        printf("  Ŝ: peak=%.4f RMS=%.4f → norm peak=1.00 RMS=%.4f\n", s_peak,
+               s_peak > 0.001f ? s_rms * s_peak : s_rms, s_rms);
     }
-    printf("  step=%.2e (μ_eff≈%.1f)\n", cfg.step_size, cfg.step_size * 1e6f);
+    if (getenv("GFANC_STEP")) cfg.step_size = (float)atof(getenv("GFANC_STEP"));
+    printf("  step=%.2e (μ_eff≈%.1f @ epsilon floor)\n", cfg.step_size, cfg.step_size * 1e6f);
     ctx->sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
     ctx->sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
     if (!ctx->sec_firs || !ctx->sec_coeffs) {
@@ -843,6 +842,19 @@ int main(void) {
         fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
                 cnn_m5_get_K(), ctx->sc.K);
         ret = 1; goto cleanup;
+    }
+    /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
+       anti ≈ Wc_RMS × ref_filt × √L. Wc_RMS=0.03: ref=0.05→anti≈0.05 (几乎无声).
+       安静房间无外部噪声时 Wc 不会自行增长; 有噪声后 LMS 在 10-30s 内收敛到工作点.
+       收敛后 scene_wc 记忆保存正确幅值, 下次切回直接恢复 (不经过此保守初始值). ── */
+    {
+        float wc_target = 0.03f;
+        if (wc_target < 0.005f) wc_target = 0.005f;
+        if (wc_target > 0.05f) wc_target = 0.05f;
+        printf("  Wc RMS target=%.3f (stub_rms=%.4f, gain=%.1fx)\n",
+               wc_target, ctx->sc.stub_rms,
+               ctx->sc.stub_rms > 1e-6f ? wc_target / ctx->sc.stub_rms : 0.0f);
+        ctx->sc.wc_rms_target = wc_target;
     }
     howling_init(&ctx->hw, HOWLING_ENABLED);
     if (fxnlms_init(&ctx->fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
@@ -926,6 +938,19 @@ int main(void) {
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
                    new_scene, probs[new_scene], cfg.ramp_ms, cfg.mute_hold_ms);
+            /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */
+            if (!getenv("GFANC_MIC_GAIN")) {
+                /* 自动增益标定: 目标 ref≈0.03 (-30dBFS), 上限 5×.
+                   超过 5× 的部分需通过 UMC 物理旋钮提升 — 数字增益同步放大反馈残余. */
+                float auto_gain = 0.03f / (ctx->ch_rms[0] + 1e-10f);
+                if (auto_gain < 1.0f) auto_gain = 1.0f;
+                int capped = (auto_gain > 5.0f);
+                if (capped) auto_gain = 5.0f;
+                cfg.mic_pre_gain = auto_gain;
+                printf("       Auto gain=%.1fx from ref_rms=%.4f%s\n",
+                       auto_gain, ctx->ch_rms[0],
+                       capped ? " (capped@5x — 提高 UMC 物理旋钮)" : "");
+            }
             ctx->first_sec = 0;
         } else {
             /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
