@@ -60,6 +60,7 @@ typedef struct {
 
 static cnn_m5_t g_cnn;
 static int g_K = 0;  /* 运行时从 linear_weight 文件大小推导 */
+static float *g_cnn_buf = NULL;  /* R-33: 推理激活缓冲, 文件作用域便于释放 */
 
 int cnn_m5_get_K(void) { return g_K; }
 
@@ -132,9 +133,48 @@ int cnn_m5_init(void)
     return 0;
 }
 
+static void free_conv(conv_layer_t *c)
+{
+    free(c->weight); c->weight = NULL;
+    free(c->bias);   c->bias   = NULL;
+}
+
+static void free_bn(bn_layer_t *b)
+{
+    free(b->gamma); b->gamma = NULL;
+    free(b->beta);  b->beta  = NULL;
+    free(b->mean);  b->mean  = NULL;
+    free(b->var);   b->var   = NULL;
+}
+
+static void free_resblock(resblock_t *r)
+{
+    free_conv(&r->conv1);
+    free_conv(&r->conv2);
+    free_bn(&r->bn1);
+    free_bn(&r->bn2);
+    free(r->proj_weight); r->proj_weight = NULL;
+}
+
 void cnn_m5_free(void)
 {
-    /* Just free the globals (simplified — in production, track all allocations) */
+    /* Stem */
+    free_conv(&g_cnn.stem_conv);
+    free_bn(&g_cnn.stem_bn);
+
+    /* 4 ResBlocks */
+    for (int i = 0; i < 4; i++)
+        free_resblock(&g_cnn.res[i]);
+
+    /* FC */
+    free(g_cnn.fc_weight); g_cnn.fc_weight = NULL;
+    free(g_cnn.fc_bias);   g_cnn.fc_bias   = NULL;
+
+    g_K = 0;
+
+    /* R-33: 释放推理激活缓冲, 下次 forward 自动重新分配 */
+    free(g_cnn_buf);
+    g_cnn_buf = NULL;
 }
 
 /* ── 层实现 ── */
@@ -234,18 +274,17 @@ static void resblock_forward(const float *in, int in_ch, int out_ch, int in_len,
 /* ── 主前向 ── */
 int cnn_m5_forward(const float *audio, float *logits)
 {
-    /* 静态缓冲: 4块×1MB, 一次性分配避免每1Hz calloc/free碎片化 */
-    static float *b_buf = NULL;
+    /* R-33: 静态缓冲 4块, 文件作用域 g_cnn_buf 支持 cnn_m5_free 释放 */
     static int   b_len = 0;
     int max_buf = CH * STEM_OUT_LEN; /* 64*4000 = 256000 */
-    if (!b_buf || b_len < max_buf * 4) {
-        free(b_buf);
-        b_buf = (float *)calloc(max_buf * 4, sizeof(float));
-        if (!b_buf) return -1;
+    if (!g_cnn_buf || b_len < max_buf * 4) {
+        free(g_cnn_buf);
+        g_cnn_buf = (float *)calloc(max_buf * 4, sizeof(float));
+        if (!g_cnn_buf) return -1;
         b_len = max_buf * 4;
     }
     float *b[4];
-    for (int i = 0; i < 4; i++) b[i] = b_buf + i * max_buf;
+    for (int i = 0; i < 4; i++) b[i] = g_cnn_buf + i * max_buf;
 
     /* Stem: Conv → BN → ReLU → MaxPool (in:b[0] tmp, out:b[1]) */
     int slen, plen;
