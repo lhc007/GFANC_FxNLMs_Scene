@@ -683,9 +683,9 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **位置**：`data/secondary_path.bin`（6144 floats, E=3 S=2 L=1024）+ main_realtime.c:763-782 + main.c:209-220
 - **原始问题**（2026-07-26 审查时）：Python 仿真 Ŝ 的 RMS=1.0 / peak=25.5，非物理尺度。R-16 实测 Ŝ 后换为硬件实测的物理尺度脉冲响应。
 - **第一次修复**（2026-07-28）：C 端加载后 peak→1.0 归一化 + step_size 同步缩小。但此举**引入新问题**——归一化抹掉了实测 Ŝ 的物理尺度信息，导致：① Xd 被人为放大 → antiEst/anti 比值 50-500×，NR 虚高；② step_size 与 Ŝ 尺度强耦合，调参负担重；③ 归一化的 Ŝ 与 LMS 梯度中的物理误差信号不在同一尺度，μ_eff 随信号电平剧烈波动。
-- **最终修复**（2026-07-29, `2d41e78`）：**彻底移除 Ŝ 归一化**，Ŝ 保持硬件实测的物理尺度。此时 Xd = Ŝ⊗ref_filt 在物理衰减下功率远小于 R-48 的 epsilon=1e-6 floor → power 由 epsilon 主导 → μ_eff = step_size/1e-6 ≈ 常数。step_size 恢复为固定 5e-7（μ_eff≈0.5，在 NLMS 稳定域 (0,2) 内安全），`GFANC_STEP` 可覆盖。同时移除 s_cal 字段、wc_gain 用户参数，anti_est/NR 计算直接使用物理尺度值无需去归一化校准。新增 Ŝ 物理特性诊断 + Wc RMS 目标自动标定。
-- **影响消除**：① antiEst/anti 比值回归合理范围（Ŝ 物理尺度下两者可比）；② step_size 不再与 Ŝ 尺度耦合；③ NR 公式恢复物理意义：`d = err - anti_est`（Ŝ 域扰动估计），与声级计测量值量级一致。仅剩 `GFANC_MIC_GAIN` 一个用户参数。
-- **修复状态**：✅ **已修复** (2026-07-29, `2d41e78`) — 移除 main_realtime.c + main.c 的 Ŝ 归一化块，移除 s_cal/wc_gain，新增 Ŝ 物理诊断+Wc RMS 自动标定，step_size 固定 5e-7。
+- **最终修复**（2026-07-29, `2d41e78`）：保留 Ŝ peak→1.0 归一化（数值稳定需要），但重构了三个关键机制：① **freeze 阈值基准**由 `stub_rms×ratio` 改为 `wc_init_max×ratio`——stub_rms 是子滤波器 RMS（与 Ŝ 尺度无关的设计参数），而 wc_init_max 是实时 INIT 后的 Wc 最大系数，自适应跟踪实际运行尺度；② **NR 公式**由 `pd = Σ(err-anti_est)²` 直接累积改为 `pd = pe + pa - 2×Σ(err×anti_est)`，消除 anti_est 仅 250 样本累积导致的 NR 漂移；③ **移除 s_cal 字段和 wc_gain 用户参数**——Ŝ 归一化使 Xd 尺度一致，step_size 固定 5e-7（μ_eff≈0.5 @ epsilon floor），不再需要手动调参。新增 Ŝ 物理特性诊断 + Wc RMS 目标自动标定。
+- **影响消除**：① freeze 检测不再依赖 stub_rms（与信号无关的静态值），改为自适应 wc_init_max；② NR 公式与 anti_est 累积方式解耦；③ 仅剩 `GFANC_MIC_GAIN` 一个用户参数。注意：**Ŝ peak→1.0 归一化保留**（维持 Xd 尺度一致性），并非如 commit message 所述"移除归一化"——commit `2d41e78` 的 diff 确认归一化代码未被删除（代码审查交叉验证发现，2026-07-29）。
+- **修复状态**：✅ **已修复** (2026-07-29, `2d41e78`) — freeze 基准改为 wc_init_max，NR 公式改为 cross-based，移除 s_cal/wc_gain。⚠️ 注：commit message 中"移除 Ŝ peak归一化"表述不准确，实际归一化代码保留。
 
 #### R-39 默认 mic_pre_gain=10x 过激 — 反馈抵消缺失时增益过高触发声学正反馈 · **一般 · [Phase-1]**
 
