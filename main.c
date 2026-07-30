@@ -344,9 +344,9 @@ int main(int argc, char **argv)
     float err_meas[E] = {0};
     float anti_est_prev[E] = {0};
 
-    printf("\n%4s | %5s | %8s | %6s | %7s | %6s | %s\n",
-           "Sec", "Scene", "NR(dB)", "err", "refFilt", "anti", "Note");
-    for (int i = 0; i < 80; i++) printf("-"); printf("\n");
+    printf("\n%4s | %5s | %6s | %6s | %6s | %7s | %6s | %s\n",
+           "Sec", "Scene", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
+    for (int i = 0; i < 85; i++) printf("-"); printf("\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
@@ -425,7 +425,7 @@ int main(int argc, char **argv)
         memcpy(sc.prev_probs, probs, K * sizeof(float));
 
         /* 4c. 逐样本 FxNLMS (匹配实时版 audio_cb) */
-        float err_pwr = 0;
+        float err_pwr = 0, dis_pwr = 0;
         acc_err = acc_anti_est = acc_d_est = acc_err_cross = 0;
         acc_anti = acc_ref = 0; acc_cnt = 0;
         for (int n = 0; n < len; n++) {
@@ -469,6 +469,7 @@ int main(int argc, char **argv)
                 dis_val[e] = fir_tick(&pri_firs[e], ref_filt);
                 err_meas[e] = dis_val[e] + anti_est_prev[e];
                 err_pwr += err_meas[e] * err_meas[e];
+                dis_pwr += dis_val[e] * dis_val[e];  /* 已知真值扰动 (Pri模型) */
             }
 
             /* R-55: anti_est 随机窗口 250 样本 (匹配实时版 诚实NR) */
@@ -500,22 +501,25 @@ int main(int argc, char **argv)
             fxnlms_get_anti_est(&fx, anti_est_prev);
         }
 
-        /* ── 诚实NR (匹配实时版) ── */
+        /* ── 诚实NR (匹配实时版, 估计扰动) ── */
         float pe = err_pwr;
         float pa = acc_anti_est * (float)FS / 250.0f;
         float cross = acc_err_cross * (float)FS / 250.0f;
         float pd = pe + pa - 2.0f * cross;
-        float nr_db = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
+        float nr_est = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
         float err_rms = sqrtf(pe / (len * E));
         float ref_rms = sqrtf(acc_ref / len);
         float anti_rms = sqrtf(acc_anti / (len * S));
-        float anti_est_rms = sqrtf(pa / (FS * E));
 
-        /* 发散检测 (匹配实时版) */
-        diverged = (pa > 9.0f * pe && anti_rms > 0.05f && nr_db < 0.0f);
+        /* ── 已知真值NR (仅离线可用: 利用 Pri 模型精确计算扰动) ── */
+        dis_pwr /= (len * E);
+        float nr_true = 10.0f * log10f((dis_pwr + 1e-12f) / (pe / (len * E) + 1e-12f));
 
-        /* 收敛检测: NR>阈值 且 未发散 → 保存 scene_wc */
-        if (nr_db > cfg.nr_converge_db && !diverged) {
+        /* 发散检测 (基于诚实NR, 匹配实时版) */
+        diverged = (pa > 9.0f * pe && anti_rms > 0.05f && nr_est < 0.0f);
+
+        /* 收敛检测: 基于已知真值NR (离线更可靠) */
+        if (nr_true > cfg.nr_converge_db && !diverged) {
             converged_frames++;
             if (converged_frames >= 3) {
                 memcpy(scene_wc[cur_scene_id], fx.wc, S*L*sizeof(float));
@@ -530,16 +534,18 @@ int main(int argc, char **argv)
             converged_frames = 0;
         }
 
-        /* 输出 (匹配实时版 print_diagnostics) */
-        char nr_str[20];
-        if (diverged) snprintf(nr_str, sizeof(nr_str), "DIV!");
-        else          snprintf(nr_str, sizeof(nr_str), "%.1f", nr_db);
-        printf("%4d | %5d | %7s | %5.3f | %6.4f | %5.4f | %s",
-               sec + 1, new_scene, nr_str, err_rms, ref_rms, anti_rms, action);
+        /* 输出: 诚实NR(匹配实时) + 已知真值NR(Pri模型) */
+        char nr_est_str[20], nr_true_str[20];
+        if (diverged) snprintf(nr_est_str, sizeof(nr_est_str), "DIV!");
+        else          snprintf(nr_est_str, sizeof(nr_est_str), "%.1f", nr_est);
+        snprintf(nr_true_str, sizeof(nr_true_str), "%.1f", nr_true);
+        printf("%4d | %5d | %6s | %6s | %5.3f | %6.4f | %5.4f | %s",
+               sec + 1, new_scene, nr_est_str, nr_true_str,
+               err_rms, ref_rms, anti_rms, action);
         if (sec == 0) printf(" [FxRMS=%.4f]", sqrtf(acc_ref / len));
         printf("\n");
 
-        sum_nr_db += nr_db;
+        sum_nr_db += nr_true;  /* 平均值用已知真值NR (离线评估标准) */
         /* R-55: LCG 随机化下一帧的 anti_est 采样窗口 */
         anti_est_offset = (anti_est_offset * 1103515245 + 12345) % 15751;
     }
@@ -547,8 +553,9 @@ int main(int argc, char **argv)
     clock_t t1 = clock();
     double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
 
-    for (int i = 0; i < 80; i++) printf("-"); printf("\n");
-    printf("  Avg |                           | %8.1f |\n", sum_nr_db / n_sec);
+    for (int i = 0; i < 85; i++) printf("-"); printf("\n");
+    printf("  Avg |                           | %6s | %6.1f |\n", "", sum_nr_db / n_sec);
+    printf("  NR_est = 诚实NR(匹配实时版) | NR_true = 已知真值NR(Pri模型, 仅离线可用)\n");
     printf("\nProcessing: %.1fs for %.1fs audio (%.1fx)\n", elapsed, (double)N / FS, (double)N / FS / elapsed);
 
     /* ── 5. 输出 ── */
