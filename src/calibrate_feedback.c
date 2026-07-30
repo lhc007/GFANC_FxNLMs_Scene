@@ -92,7 +92,7 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
 /* ══════════════════════════════════════════════════════════
    NLMS 辨识: 已知激励(out) 和响应(ref), 求 FIR 系数
    ══════════════════════════════════════════════════════════ */
-static void nlms_identify(const float *noise_16k, const float *ref_16k,
+static int nlms_identify(const float *noise_16k, const float *ref_16k,
                           int n_samples, float *fb_coeffs, int n_taps)
 {
     float *x = (float *)calloc(n_taps, sizeof(float));  /* delay line */
@@ -161,10 +161,19 @@ static void nlms_identify(const float *noise_16k, const float *ref_16k,
     rms = sqrtf(rms / n_taps);
     printf("  FIR: peak=%.4f @ tap %d (%.2fms), RMS=%.4f\n",
            peak, peak_idx, (float)peak_idx / FS_CAL * 1000.0f, rms);
-    /* 弱路径警告: RMS<0.001 基本等于"没标定上", 运行时反馈抵消形同虚设
-       (实测 RMS=0.0001 的 FIR 装载后 fb_est≈0, 扬声器满幅反馈直进参考麦) */
+    /* R-57: 弱路径质量门禁 — RMS<0.0005 时 FIR 基本是噪声, 反馈抵消形同虚设.
+       此时不保存文件, 避免运行时加载无效 FIR 产生虚假 fb_est.
+       实测 RMS=0.0001 的 FIR 装载后 fb_est≈0, 扬声器满幅反馈直进参考麦. */
+    if (rms < 0.0005f) {
+        printf("  ❌ 反馈路径过弱 (FIR RMS=%.6f < 0.0005) — 标定失败, 不保存文件!\n", rms);
+        printf("     请提高扬声器音量 / 确认参考麦能听到扬声器后重新标定.\n");
+        printf("     提示: 设置 GFANC_CAL_NOISE 环境变量可调整噪声幅度 (默认=%.2f).\n",
+               (double)NOISE_AMP);
+        return -1;  /* x 已在 L149 释放, 直接返回错误码 */
+    }
     if (rms < 0.001f)
-        printf("  ⚠ 反馈路径过弱 — 请提高扬声器音量 / 确认参考麦能听到扬声器后重新标定!\n");
+        printf("  ⚠ 反馈路径偏弱 (FIR RMS=%.6f < 0.001) — 建议提高扬声器音量后重新标定!\n", rms);
+    return 0;  /* 标定成功 */
 }
 
 /* ══════════════════════════════════════════════════════════ */
@@ -257,7 +266,11 @@ int main(void) {
 
         /* NLMS 辨识 */
         float fb_coeffs[FB_TAPS];
-        nlms_identify(noise_16k, ref_16k, n_16k, fb_coeffs, FB_TAPS);
+        int nlms_ret = nlms_identify(noise_16k, ref_16k, n_16k, fb_coeffs, FB_TAPS);
+        if (nlms_ret != 0) {
+            printf("  ⚠ Speaker %d calibration failed, skipping file save.\n", spk);
+            continue;  /* R-57: 标定质量不达标, 不保存无效 FIR */
+        }
 
         /* 保存 (feedback_path_0.bin / feedback_path_1.bin) */
         char fname[64];

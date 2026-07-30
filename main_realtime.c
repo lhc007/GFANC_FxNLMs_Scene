@@ -131,6 +131,7 @@ typedef struct {
     volatile float acc_d_est;    /* 扰动估计功率 Σ(err-anti_est)² (诚实NR分子) */
     volatile float acc_err_cross;/* Σ(err × anti_est), Ŝ 校准后重构 d_cal 用 */
     /* s_cal 已移除: Ŝ 保持物理尺度, anti_est 无需去归一化校准 */
+    int    anti_est_offset;   /* R-55: anti_est 采样窗口起始偏移 (每帧随机化) */
     float  wc_init_max;           /* INIT 后 Wc 的 max|系数| (freeze 阈值基准) */
     volatile float fb_rms;       /* 反馈抵消量 RMS */
     volatile float anti_est_rms; /* 模型估计反噪声 RMS (NR计算用) */
@@ -304,6 +305,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 if (++ctx->peak_hold_cnt >= 10 && !ctx->peak_mute) {
                     ctx->peak_mute = 1;
                     for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= 0.5f;
+                    ctx->wc_init_max *= 0.5f;  /* R-52: 同步收紧 freeze 基准, 防止膨胀逃逸 */
                     ctx->peak_rollback_cnt++;
                 }
             } else {
@@ -332,9 +334,10 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->acc_err  += err_meas[e] * err_meas[e];
             ctx->acc_dist += err_meas[e] * err_meas[e];  /* 实测误差功率 (用于NR参考) */
         }
-        /* R-11: anti_est 仅前 250 样本计算 (省 ~16% 回调预算)
-           R-12: xd 环形双段访问 (零取模, 编译器可向量化) */
-        if (ctx->acc_cnt < 250) {
+        /* R-11+R-55: anti_est 每帧随机窗口 250 样本计算 (消除系统性偏差).
+           使用 LCG 伪随机偏移, 避免与 1s 边界对齐引入的周期性采样偏差. */
+        {   int aoffs = ctx->anti_est_offset;
+            if (ctx->acc_cnt >= aoffs && ctx->acc_cnt < aoffs + 250) {
             float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
             int xp = ctx->fx.xd_ptr;
             int seg1 = (xp == 0) ? L - 1 : xp - 1;
@@ -358,7 +361,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 ctx->acc_d_est += dv * dv;
                 ctx->acc_err_cross += err_meas[e] * anti_est[e];
             }
-        }
+            } /* R-55: end if(acc_cnt in window) */
+        } /* R-55: end outer scope (aoffs) */
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
             float pe = ctx->acc_err;
             float pa = ctx->acc_anti_est * (float)FS_ANC / 250.0f;
@@ -373,13 +377,17 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int c = 0; c < 4; c++)
                 ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
             ctx->anti_rms = sqrtf(ctx->acc_anti / (FS_ANC * 2));
-            ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f);
+            /* R-56: NR<0 确保只有真正恶化时才判定发散 (NR>0 说明仍在降噪,
+               pa>>pe 只是小误差导致的高比值, 不是 Wc 膨胀) */
+            ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f && ctx->nr_level < 0.0f);
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms * 2.0f
                                 && ctx->ref_rms > 0.001f
                                 && ctx->mute_hold <= 0);
             ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0;
             ctx->acc_anti = ctx->acc_anti_est = ctx->acc_d_est = ctx->acc_err_cross = 0;
             ctx->acc_cnt = 0;
+            /* R-55: LCG 伪随机偏移, 每帧随机化 anti_est 采样窗口位置 [0, 15750] */
+            ctx->anti_est_offset = (ctx->anti_est_offset * 1103515245 + 12345) % 15751;
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
@@ -534,7 +542,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     /* P0-2: 输出能量发散救援 — max|Wc| 阈值太宽 (实测 anti_rms=0.63 持续失控
        都未触发 30×stub 判据). anti_rms 连续 3s 超限 → 回滚 Wc + 冷启动 ramp.
        注意: 诚实 NR 修复后, 发散态 NR<0, scene_wc 不会再被发散快照污染. */
-    if (ctx->anti_rms > cfg.diverge_anti_rms) {
+    if (ctx->anti_rms > cfg.diverge_anti_rms / (cfg.mic_pre_gain > 0.1f ? cfg.mic_pre_gain : 1.0f)) {
         if (++ctx->diverge_sec >= 3) {
             if (ctx->scene_wc_valid[ctx->cur_scene_id])
                 memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
@@ -593,20 +601,6 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         printf("[WARN] Wc diverged again during watch period! "
                "LMS permanently frozen until scene switch\n");
     }
-    if (ctx->anti_rms > cfg.diverge_anti_rms) {
-        if (++ctx->diverge_sec >= 3) {
-            if (ctx->scene_wc_valid[ctx->cur_scene_id])
-                memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
-            else
-                scene_ctrl_construct_wc(&ctx->sc, ctx->cur_scene_id, ctx->wc_shadow);
-            InterlockedExchangeAdd(&ctx->wc_seq, 2);
-            InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
-            ctx->diverge_sec = 0;
-            ctx->peak_rollback_cnt = 0;
-            printf("[WARN] anti_rms %.3f > %.2f for 3s — Wc rescued (rollback+ramp)\n",
-                   ctx->anti_rms, cfg.diverge_anti_rms);
-        }
-    } else ctx->diverge_sec = 0;
 }
 
 static void check_convergence(rt_ctx_t *ctx) {
@@ -749,6 +743,7 @@ int main(void) {
     rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
     if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
+    ctx->anti_est_offset = 0;  /* R-55: 首次从 0 开始, 每帧 LCG 随机化 */
     /* R-14: 初始化 4 通道抗混叠低通 (fc=6.5kHz @48k, 2阶 Butterworth) */
     for (int c = 0; c < 4; c++) biquad_init_lpf(&ctx->aa_filt[c], 6500.0f, 48000.0f);
     g_ctx = ctx;
@@ -818,13 +813,21 @@ int main(void) {
             if (fb_len > 0 && fb_raw) {
                 int n = fb_len < FB_LEN ? fb_len : FB_LEN;
                 memcpy(ctx->fb_coeffs_buf[spk], fb_raw, n * sizeof(float));
+                float fb_rms = 0;
+                for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
+                fb_rms = sqrtf(fb_rms / FB_LEN);
+                /* R-57: FIR RMS < 0.0005 时反馈抵消形同虚设, 加载无效 FIR
+                   会在高增益下产生虚假 fb_est, 干扰 ref 信号. */
+                if (fb_rms < 0.0005f) {
+                    printf("  Feedback spk%d: RMS=%.6f too weak, skipping (re-run calibrate)\n", spk, fb_rms);
+                    bin_free(fb_raw);
+                    continue;
+                }
                 ctx->fb_fir[spk].coeffs    = ctx->fb_coeffs_buf[spk];
                 ctx->fb_fir[spk].n_taps    = FB_LEN;
                 ctx->fb_fir[spk].delay_line = (double *)calloc(FB_LEN, sizeof(double));
                 ctx->fb_fir[spk].ptr       = 0;
-                float fb_rms = 0;
-                for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
-                printf("  Feedback spk%d: %d taps, RMS=%.4f\n", spk, FB_LEN, sqrtf(fb_rms / FB_LEN));
+                printf("  Feedback spk%d: %d taps, RMS=%.4f\n", spk, FB_LEN, fb_rms);
                 bin_free(fb_raw); loaded++;
             }
         }
