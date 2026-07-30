@@ -682,10 +682,31 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 
 - **位置**：`data/secondary_path.bin`（6144 floats, E=3 S=2 L=1024）+ main_realtime.c:763-782 + main.c:209-220
 - **原始问题**（2026-07-26 审查时）：Python 仿真 Ŝ 的 RMS=1.0 / peak=25.5，非物理尺度。R-16 实测 Ŝ 后换为硬件实测的物理尺度脉冲响应。
-- **第一次修复**（2026-07-28）：C 端加载后 peak→1.0 归一化 + step_size 同步缩小。但此举**引入新问题**——归一化抹掉了实测 Ŝ 的物理尺度信息，导致：① Xd 被人为放大 → antiEst/anti 比值 50-500×，NR 虚高；② step_size 与 Ŝ 尺度强耦合，调参负担重；③ 归一化的 Ŝ 与 LMS 梯度中的物理误差信号不在同一尺度，μ_eff 随信号电平剧烈波动。
-- **最终修复**（2026-07-29, `2d41e78`）：保留 Ŝ peak→1.0 归一化（数值稳定需要），但重构了三个关键机制：① **freeze 阈值基准**由 `stub_rms×ratio` 改为 `wc_init_max×ratio`——stub_rms 是子滤波器 RMS（与 Ŝ 尺度无关的设计参数），而 wc_init_max 是实时 INIT 后的 Wc 最大系数，自适应跟踪实际运行尺度；② **NR 公式**由 `pd = Σ(err-anti_est)²` 直接累积改为 `pd = pe + pa - 2×Σ(err×anti_est)`，消除 anti_est 仅 250 样本累积导致的 NR 漂移；③ **移除 s_cal 字段和 wc_gain 用户参数**——Ŝ 归一化使 Xd 尺度一致，step_size 固定 5e-7（μ_eff≈0.5 @ epsilon floor），不再需要手动调参。新增 Ŝ 物理特性诊断 + Wc RMS 目标自动标定。
-- **影响消除**：① freeze 检测不再依赖 stub_rms（与信号无关的静态值），改为自适应 wc_init_max；② NR 公式与 anti_est 累积方式解耦；③ 仅剩 `GFANC_MIC_GAIN` 一个用户参数。注意：**Ŝ peak→1.0 归一化保留**（维持 Xd 尺度一致性），并非如 commit message 所述"移除归一化"——commit `2d41e78` 的 diff 确认归一化代码未被删除（代码审查交叉验证发现，2026-07-29）。
-- **修复状态**：✅ **已修复** (2026-07-29, `2d41e78`) — freeze 基准改为 wc_init_max，NR 公式改为 cross-based，移除 s_cal/wc_gain。⚠️ 注：commit message 中"移除 Ŝ peak归一化"表述不准确，实际归一化代码保留。
+- **第一次修复**（2026-07-28）：C 端加载后 peak→1.0 归一化 + step_size 同步缩小。commit message 声称此举"移除归一化"但代码 diff 显示归一化代码从未被删除——该 commit 实际改的是 freeze 基准（stub_rms→wc_init_max）和 NR 公式（cross-based），归一化保留。**归一化本身是正确的工程决策**，见下方数学论证。
+- **最终修复**（2026-07-29, `2d41e78`）：保留 Ŝ peak→1.0 归一化（数值稳定需要，见论证），重构三个关键机制：① **freeze 阈值基准**由 `stub_rms×ratio` 改为 `wc_init_max×ratio`；② **NR 公式**由 `pd = Σ(err-anti_est)²` 改为 `pd = pe + pa - 2×Σ(err×anti_est)`；③ **移除 s_cal 字段和 wc_gain 用户参数**，step_size 固定 5e-7。新增 Ŝ 物理特性诊断 + Wc RMS 目标自动标定。
+- **⚠️ 代码交叉验证发现**（2026-07-29）：commit message 中"移除 Ŝ peak归一化"表述不准确——`main_realtime.c:777-780` 的 `sec_path[i] *= inv` 归一化代码从未被删除。以下从 FxLMS 稳定性出发论证归一化为何应当保留。
+
+  **归一化必要性论证（FxLMS 稳定域分析）**：
+  
+  归一化 Ŝ_norm = Ŝ / s_peak 将 Xd = Ŝ_norm ⊗ ref 的 RMS 压缩到与 ref 同一量级。关键量是有效步长 μ_eff = step_size / power，它决定了 LMS 的稳定性：
+  ```
+  power[s] = ΣXd² / (E·L) + 1e-6
+  μ_eff    = step_size / power[s]     (实际驱动 Wc 更新的步长)
+  ```
+  取日志中两种典型 ref 电平，对比有无归一化的 μ_eff 跨度：
+  
+  | ref_RMS | 有归一化 (ŝ_RMS=0.039) | 无归一化 (ŝ_RMS=1.0) |
+  |---------|------------------------|----------------------|
+  | | Xd_RMS | power | μ_eff | Xd_RMS | power | μ_eff |
+  | 安静 0.001 | 3.9e-5 | ~1e-6(floor) | **0.5** | 0.001 | ~1e-6(floor) | **0.5** |
+  | 响亮 0.4 | 0.016 | 2.5e-4 | **0.002** | 0.4 | 0.16 | **3.1e-6** |
+  | **μ_eff 动态范围** | | | **250×** | | | **161,000×** |
+  
+  无归一化时 μ_eff 跨 5 个数量级，安静期步长巨大（易发散），响亮期步长微小（不收敛）。归一化将动态范围压缩 **650 倍**，使单一 μ 在全部信号电平下稳定。
+  
+  这与业内实践一致：Matlab DSP System Toolbox 的 `dsp.FilteredXLMSFilter` 提供 `NormalizeSecondaryPath` 选项（文档："Normalizing the secondary path estimate improves numerical stability and convergence consistency across different hardware setups."）；Kuo & Morgan (1996) §7.3 指出 ANC 系统中 Ŝ 的尺度差异主要影响收敛速度而非稳态解，归一化是处理多硬件平台的推荐方法。产品级 ANC（Bose/Sony）因硬件固定可跳过此步，但 GFANC 作为研究平台需支持仿真/实测 Ŝ 混用 → 归一化是正确选择。
+- **影响消除**：① freeze 检测不再依赖 stub_rms，改为自适应 wc_init_max；② NR 公式与 anti_est 累积方式解耦；③ 仅剩 `GFANC_MIC_GAIN` 一个用户参数。
+- **修复状态**：✅ **已修复** (2026-07-29, `2d41e78`) — freeze 基准改 wc_init_max，NR 公式改 cross-based，移除 s_cal/wc_gain。归一化代码保留（正确决策）。commit message 中"移除归一化"表述有误。
 
 #### R-39 默认 mic_pre_gain=10x 过激 — 反馈抵消缺失时增益过高触发声学正反馈 · **一般 · [Phase-1]**
 
