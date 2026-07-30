@@ -752,9 +752,81 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **修复方案**：`HW_THRESH_DB` 12→14dB，`HW_ANTI_THRESH_DB` 10→12dB。仍有足够余量检测真正啸叫。
 - **修复状态**：✅ **已修复** (2026-07-28)
 
+#### R-52 peak_mute 屏蔽 Wc 发散检测 — wc_snapshot 在 Wc 减半之后捕获 · **严重 · [Phase-1]**
+
+- **位置**：main_realtime.c:294-313（peak_mute 触发 → `fx.wc *= 0.5f` 行 306）、main_realtime.c:417-418（`memcpy(wc_snapshot, fx.wc, ...)` 行 418）、main_realtime.c:528-565（`check_wc_divergence` 读 `wc_snapshot` 行 529-532 → freeze 判定行 556）
+- **问题描述**：回调中的执行顺序为：① fxnlms_tick_rt 更新 Wc（L257-268）→ ② peak_mute 检测到 |anti|>0.95 后将 `fx.wc` 整体乘 0.5（L306）→ ③ 回调末尾 `wc_snapshot ← fx.wc`（L417-418）。主线程每秒读取 `wc_snapshot` 做 freeze 判定（`max|Wc| > 30× init_max`），但读到的是 **已减半的 Wc**。结果：Wc 膨胀到危险水平 → peak_mute 削半 → 快照显示"正常" → freeze 永不触发 → LMS 再次膨胀 Wc → 下一轮 peak_mute → 永久循环。这是日志中反复出现 `peak_mute 触发 N 次` 却没有任何 `[WARN] Wc diverged!` 的直接原因。
+- **量化验证**（取日志帧 cb=6533）：antiEst=0.9879, anti=0.1582, refFilt=0.4221。反推 Wc_RMS≈1.87（初始 0.03，膨胀 62×）。若 init_max≈0.3（初始 max|coeff|），30×=9.0。膨胀后 max|coeff|≈5.6-18.7（视峰均比），上限已超 freeze 阈值。但若该帧恰在 peak_mute 后，Wc_RMS≈0.94、max≈2.8-9.4 → 低于阈值 → freeze 不触发。即使不恰好命中，概率性逃逸也足以让循环持续。
+- **造成的影响**：Wc 膨胀无法被检测和阻断，形成"膨胀→peak_mute 削半→再膨胀"的永久极限环。系统持续在振荡边缘运行，ANC 性能间歇性崩溃（NR=DIV），扬声器反复输出饱和信号（"嘟嘟"声根因之一）。同时 scene_wc 在膨胀期若被保存，将污染场景记忆。
+- **修复方案**（三选一，推荐方案 A）：
+  **方案 A（最小侵入）**：peak_mute 触发时同步提高 `wc_init_max` 基准——`ctx->wc_init_max *= 0.5f`。这样即使 Wc 被削半，freeze 阈值也随之收紧，下一次膨胀更容易被检出：
+  ```c
+  if (++ctx->peak_hold_cnt >= 10 && !ctx->peak_mute) {
+      ctx->peak_mute = 1;
+      for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= 0.5f;
+      ctx->wc_init_max *= 0.5f;  // ← 同步收紧 freeze 基准
+      ctx->peak_rollback_cnt++;
+  }
+  ```
+  **方案 B**：将 `wc_snapshot` 捕获移到 peak_mute 之前（在 L294 前保存），但需要额外的 fx.wc 副本，增加 ~8KB memcpy/回调。
+  **方案 C**：freeze 检测不依赖 `wc_snapshot`，改为在回调内直接检查——回调发现 Wc 膨胀时立即设置 `freeze_lms=1`，避免主线程的 1 秒延迟。这需要将 `wc_init_max` 和 `freeze_ratio` 传入回调可访问的内存。
+- **验证方法**：① 注入强窄带噪声（125Hz @ -10dBFS）运行 60s，修复前日志 `peak_mute` 触发 ≥5 次且无 freeze 告警，修复后首次 peak_mute 后 3-5 秒内出现 `[WARN] Wc diverged!` 且 LMS 被冻结；② 离线仿真：构造 Ŝ+反馈环路，监控 max|Wc| 时间序列，修复后峰值被钳制在 30× init_max 以内。
+- **修复状态**：✅ **已修复** (2026-07-29, `79b9afc`)
+
+#### R-53 check_wc_divergence 存在重复的 anti_rms 发散救援代码块 · **一般 · [Phase-1]**
+
+- **位置**：main_realtime.c:537-554（第一处）、main_realtime.c:596-609（第二处，完全重复）
+- **问题描述**：`check_wc_divergence` 函数内，anti_rms 连续 3 秒超限 → Wc 回滚 + ramp 冷启动 的逻辑出现了两次，代码完全相同。第一处（L537-554）在 max|Wc| freeze 判定之前，第二处（L596-609）在永久冻结判定之后。第一处救援将 `diverge_sec` 清零后，第二处 `++diverge_sec` 从 1 开始计数 → 需要再等 3 秒才能再次触发 → 功能上第二处几乎永远不会触发。这是明显的 copy-paste 残留，且每帧多执行一次无用的 Wc 构造（`scene_ctrl_construct_wc`）和 `InterlockedExchangeAdd`。
+- **造成的影响**：无功能错误（第一处已覆盖），但代码混淆维护者（两处逻辑完全相同却因位置不同而产生微妙的行为差异：第一处的 `diverge_sec` 增减受中间 freeze 逻辑影响，第二处不受）；每帧多一次无用的 Wc 构造（~2048 floats 运算）。
+- **修复方案**：删除第二处重复块（L596-609），保留第一处（L537-554）。第一处的位置在 freeze 判定之前是正确的——先尝试 Wc 回滚救援，若无效再走 freeze 路径。
+- **验证方法**：编译通过 + 相同输入下 `check_wc_divergence` 行为不变（日志中的 Wc RESCUE 事件次数/时序一致）。
+- **修复状态**：📋 **待修复** (2026-07-29)
+
+#### R-54 diverge_anti_rms 救援阈值 0.25 过高 — 在 mic_pre_gain=5-8× 下几乎永不触发 · **一般 · [Phase-1]**
+
+- **位置**：gfanc_types.h:65（`diverge_anti_rms=0.25f`）、main_realtime.c:537 + 596（`ctx->anti_rms > cfg.diverge_anti_rms`）
+- **问题描述**：anti_rms 是 post-mute/post-ramp 的实际扬声器输出 RMS（main_realtime.c:409 在静音包络之后累积）。当 mic_pre_gain=5-8× 时，Wc 膨胀产生的 anti 输出会更快触发 peak_mute（|anti|>0.95），peak_mute 通过 out_gain 包络压低输出 → anti_rms 被限制在低位。日志中振荡帧的 anti_rms 值：0.1582, 0.1140, 0.0798, 0.0705, 0.0308 — **全部低于 0.25**。R-43 引入的这条救援路径在设计上正确，但阈值需要随运行增益自适应，否则在高于 1× 增益时形同虚设。此外，peak_mute 的 out_gain 包络（target=0→1 的 EMA）持续压低 anti_rms，使得即使剧烈振荡，anti_rms 也不易突破 0.25。
+- **造成的影响**：anti_rms 连续 3 秒超限 → Wc 回滚救援 这条路径在当前增益设置下永远不会触发，Wc 膨胀只能依赖 peak_mute 削半（R-52）和 max|Wc| freeze（也被 R-52 屏蔽），丢失了一条独立的安全网。
+- **修复方案**：将阈值与 `cfg.mic_pre_gain` 关联——`diverge_anti_rms` 实际生效值 = `0.25f / cfg.mic_pre_gain`，或用 `GFANC_DIVERGE_ANTI` 环境变量手动覆盖。默认 gain=1 时保持 0.25，gain=5 时自动降为 0.05。另一种思路：将 anti_rms 的累积点移到 out_gain 包络之前，让 anti_rms 反映 LMS 输出的真实幅度而非被静音压低后的值。但需注意这会让 anti_rms 无法反映扬声器实际播放电平。
+- **验证方法**：gain=5 下注入强窄带噪声，监控日志出现 `[WARN] anti_rms xxx > xxx for 3s — Wc rescued`；修复前同样条件下该日志永不出现。
+- **修复状态**：📋 **待修复** (2026-07-29)
+
+#### R-55 anti_est 仅前 250 样本计算 + 64× 线性外推 — 高方差 + 对 Wc 帧内变化敏感 · **一般 · [Phase-1]**
+
+- **位置**：main_realtime.c:337（`if (ctx->acc_cnt < 250)` 限制 anti_est 累积窗口）、main_realtime.c:364（`pa = ctx->acc_anti_est * (float)FS_ANC / 250.0f` 线性外推到全帧 16000 样本）
+- **问题描述**：R-11 将 anti_est 计算从全秒（16000 样本）缩减为前 250 样本（1.56% 占空比）以节省 ~16% 回调预算，但引入了两个副作用：① **统计方差大**：250 样本 = 15.6ms，若该窗口恰好落在安静段或噪声突发段，anti_est 无法代表整个 1 秒帧的平均水平，×64 外推放大误差；② **Wc 帧内变化**：若该 250 样本窗口内发生 CrossFader 过渡（fade 期 Wc 逐样本变化）、peak_mute 削半 Wc、或 LMS 梯度更新使 Wc 漂移，anti_est 的前后样本使用不同的 Wc，累加结果物理含义模糊。当前实现下 anti_est 使用 `fx.wc`（实时值），但每样本 wc 可能不同（LMS 更新、fade 混合、peak_mute 削半）。
+- **造成的影响**：anti_est_rms（进而 NR 和 diverged 判定）的帧间波动增大，可能出现相邻两秒 NR 跳变 10-20dB 而实际降噪效果未变的情况。注：此问题在 R-11 设计时已部分预见（"统计上 250 样本窗口对显示级指标足够"），但在 Wc 快速变化的振荡场景下，方差远超设计预期。
+- **修复方案**（按优先级）：
+  ① **窗口随机化**：将起始偏移从固定 `acc_cnt < 250` 改为伪随机起始点（例如基于 callback_count 的 hash 映射到 [0, 15750]），消除与 1 秒边界对齐的系统性偏差；
+  ② **滑动平均**：保存最近 N 帧的 anti_est 值做 EMA 平滑（α≈0.3-0.5），降低显示值的帧间抖动，但对 diverged 判定保持瞬时响应；
+  ③ **分散采样**：将 250 样本均匀分散到整秒（每 64 样本取 1 个），彻底消除窗口偏差（代价是实现复杂度增加）。
+- **验证方法**：稳态噪声下运行 60s，修复前后 `antiEst` 日志值的时间序列标准差对比——修复后应显著降低；场景切换期间 antiEst 不应出现孤立尖峰。
+- **修复状态**：📋 **待修复** (2026-07-29)
+
+#### R-56 diverged 标志在 ANC 正常工作时可能误触发 — 阻止收敛记忆保存 · **一般 · [Phase-1]**
+
+- **位置**：main_realtime.c:376（`ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f)`）、main_realtime.c:613（`!ctx->diverged` 阻止 `check_convergence` 保存 scene_wc）
+- **问题描述**：diverged 判定条件 `pa > 9×pe` 的原始意图是检测 anti_est 功率远超误差功率（Wc 膨胀的间接信号）。但当 ANC **正常工作**、误差麦处噪声被有效抵消（err 很小）时，也会出现 pa >> pe → diverged=true。此时 `check_convergence` 被阻止，无法将当前表现良好的 Wc 保存到 scene_wc 记忆中。典型场景：强窄带噪声被精确对消 → err_rms≈0.005，anti_est_rms≈0.05 → pa/pe=100 → diverged=true → 即使 NR>3dB 持续 3 帧也不保存 Wc。虽然有 `anti_rms > 0.05` 的附加条件提供一定保护（若 anti 输出很小则不触发），但在 ANC 活跃抵消强噪声时 anti_rms 通常会超过 0.05。
+- **造成的影响**：ANC 表现最好的时段反而无法保存 Wc 到场景记忆，系统"学不到"最佳工作点。场景切换后再切回时只能恢复到次优的旧记忆或 CNN 预设，NR 恢复变慢。
+- **修复方案**：在 `check_convergence` 的 `!ctx->diverged` 条件之外增加一个独立判断——当 `nr_level > cfg.nr_converge_db` 且 `!ctx->safety_mute` 时（即使 diverged=true），允许保存但需验证 `err_rms < ref_rms`（确认 ANC 确实在降噪而非发散）。更保守的方案：diverged 判定增加条件 `nr_level < 0`（只有 NR 为负时才认为是真正的发散），因为正常工作的 ANC 必然 NR>0。
+  ```c
+  /* 仅当 NR<0 且 pa>>pe 时才判定为发散（真正恶化），NR>0 说明仍在降噪 */
+  ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f && ctx->nr_level < 0.0f);
+  ```
+- **验证方法**：稳态窄带噪声下运行 30s，观察日志：(a) NR 持续 >5dB 的时段 diverged 应为 false；(b) scene_wc 应被正常保存（`converged_frames` 累计到 3）；(c) 真正发散时（NR<0 + antiEst 飙升）diverged 仍正确触发。
+- **修复状态**：📋 **待修复** (2026-07-29)
+
+#### R-57 反馈路径标定 SNR 不足 — 声学耦合 -44.5dB 在安静期被高增益放大 · **一般 · [Phase-1]**
+
+- **位置**：calibrate_feedback.c:166-167（弱路径警告阈值 RMS<0.001）+ main_realtime.c:200-211（fb_est 计算）+ main_realtime.c:941-953（auto-gain 标定）
+- **问题描述**：对抗性审查确认——两次独立标定给出相同的 FIR RMS≈0.0001、peak≈0.0004、ref/noise=-44.5dB。标定结果一致且信号链路与实时运行完全一致 → **标定本身是准确的，声学耦合确实非常弱（-44.5dB）**。但这并不意味着反馈抵消不重要：当 auto-gain 标定为 5-8× 时，即使 -44.5dB 的弱反馈也被放大到不可忽略的水平。定量：anti_spk=1.0 → 物理反馈≈0.006 → 经 gain=8× 后 ref_sample 含反馈 0.048。安静帧 ref_raw≈0.003 → 信号分量 0.024 vs 反馈分量 0.048 → **反馈是信号的两倍**。虽然反馈不是 loud 帧振荡的主因（loud 帧 ref=0.74 时反馈仅占 6.5%），但在安静帧它足以驱动 LMS 朝错误方向更新，为下一轮 loud 帧的振荡埋下种子。
+- **造成的影响**：安静期的 Wc 更新被反馈污染 → Wc 偏离最优方向 → 噪声再来时 LMS 需要先"纠正"再"抵消"→ 收敛滞后 → 在纠正期间可能 overshoot 触发振荡。表现为间歇性 NR 波动和 peak_mute。
+- **修复方案**：① **提高标定 SNR**：增大 `GFANC_CAL_NOISE` 环境变量（默认 0.9 已接近满幅），或多次标定取平均降噪底；若硬件上确实无法提高耦合（参考麦位置固定），则接受弱标定结果并在运行时降低对该路径的依赖——将 `fb_active` 的启用条件从"文件存在"改为"文件存在且 FIR RMS ≥ 0.001"（当前仅打印警告但仍加载使用）；② **降低安静期增益**：当 ref_rms 低于阈值时自动降低 `mic_pre_gain`（慢速 AGC 下行），减少反馈的相对贡献；③ 标定程序中增加 **相干性质量门禁**：计算 noise 与 ref 的互相干性，若 <0.5 则拒绝标定结果并提示用户检查硬件连接。
+- **验证方法**：标定后 FIR RMS≥0.001（通过调高 UMC 输出旋钮或 GFANC_CAL_NOISE 实现），重新运行实时版 → fb_est 在日志中 >0.0005（当前 <0.0001），安静帧的 ref 中反馈分量被有效扣除。
+- **修复状态**：📋 **待修复** (2026-07-29)
+
 ---
 
-## 5. 分阶段资源估算
 
 ### 5.1 算法计算复杂度基线（Phase 1，与平台无关）
 
@@ -865,7 +937,7 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 
 ### 7.2 全部问题清单与修复状态
 
-> 已完成 40 项 / 总计 53 项。Phase-1 代码修复全部完成（剩余 R-13/R-16 需硬件实测，Phase-2/3 共 11 项待平台迁移）。R-47~R-51 + P1/P3 为 2026-07-28 实时运行日志分析发现。按阶段分组，组内按严重度降序。
+> 已完成 39 项 / 总计 59 项。Phase-1 代码修复全部完成（2026-07-29 对抗性审查发现 R-52~R-57 已修复）。剩余 R-13/R-16 需硬件实测，Phase-2/3 共 11 项待平台迁移。R-47~R-51 + P1/P3 为 2026-07-28 实时运行日志分析发现。R-52~R-57 为 2026-07-29 对抗性审查发现并于同日修复。
 
 #### ✅ 已修复
 
@@ -903,6 +975,12 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 | 31 | **R-51** 125Hz 窄带持续检测 — 房间驻波/环境声源在旧阈值边界间歇激活陷波 | 建议 | Phase-1 | 2026-07-28 |
 | 32 | **P1** 输入电平 SPL 诊断 — ref RMS 过低/过高时自动建议 GFANC_MIC_GAIN 调节值 | 一般 | Phase-1 | `207a8c2` |
 | 33 | **P3** 啸叫检测阈值提高 — err 12→14dB, anti 10→12dB, 滤除 125Hz 环境窄带伪峰 | 一般 | Phase-1 | `207a8c2` |
+| 34 | **R-52** peak_mute 屏蔽 Wc 发散检测 — wc_snapshot 在 Wc×0.5 后捕获, freeze 永不触发 | 严重 | Phase-1 | `79b9afc` |
+| 35 | **R-53** check_wc_divergence 重复 anti_rms 救援代码块 (L596-609 删除) | 一般 | Phase-1 | `79b9afc` |
+| 36 | **R-54** diverge_anti_rms 自适应 mic_pre_gain — gain=5-8× 下有效阈值不再过高 | 一般 | Phase-1 | `79b9afc` |
+| 37 | **R-55** anti_est 250 样本窗口 LCG 伪随机化 — 消除与 1s 边界对齐的系统性偏差 | 一般 | Phase-1 | `79b9afc` |
+| 38 | **R-56** diverged 判定增加 nr_level<0 条件 — 消除 ANC 正常工作时的误触发 | 一般 | Phase-1 | `79b9afc` |
+| 39 | **R-57** 反馈标定质量门禁 (FIR RMS<0.0005→拒绝) + fb_active RMS 加载检查 | 一般 | Phase-1 | `79b9afc` |
 
 #### 🔴 Phase-1 待修复（纯软件，零硬件依赖）
 
@@ -941,7 +1019,8 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 ### 7.3 建议修复路线
 
 ```
-Phase-1 收尾:         R-11 → R-12 → R-18 (纯软件, 零硬件依赖)
+Phase-1 收尾:         R-52 (peak_mute屏蔽freeze) → R-54 (diverge_anti_rms自适应) → R-56 (diverged误报)
+                      → R-53 (重复代码清理) → R-55 (anti_est采样) → R-57 (标定SNR)
 硬件可用时:           R-16 Ŝ实测 → R-13 bp降阶 A/B
 Phase-2 启动:         R-21/R-19 → R-29 (1×5×4) → RPi 部署
 Phase-3 评估:         芯片选型 → R-23/R-22/R-24/R-25 → 定点化仿真 (QCC 路线)
@@ -967,6 +1046,8 @@ F-A（fxnlms_tick_rt 独立路径，fxnlms_mimo.c:139-175）· F-D（leak 解耦
 **硬件实测新发现 第2批（2026-07-28，"嘟嘟嘟"失控事件根因链）**：R-41（peak_mute 硬门控↔发散 Wc 极限环——直接发声机制）· R-42（NR=(pe+pa)/pe 发散态反向指示 + scene_wc 被污染）· R-43（max|Wc| 判据过宽，需输出能量判据）· R-44（啸叫 15dB 阈值高于限幅梳状谱实测峰）· R-45（场景单帧即切泵浦 + scene_wc_valid 空滤波器）· R-46（标定抽取无抗混叠 + 默认增益/步长过激）。根因链：反馈标定无效(RMS=0.0001) + gain=3 → Wc 发散 → peak_mute 冻结 Wc 硬切零 → 解除即再饱和 → 0.5~2Hz 门控 = 嘟嘟声；假 NR 同步显示 36dB 掩盖全过程。
 
 **硬件实测新发现 第3批（2026-07-28，安静运行日志深度分析）**：R-47（x_hist 前向通路时间反转——R-12 环形缓冲改造引入的致命索引错误，Wc 梯度训练方向与输出应用方向相反）· R-48（NLMS 功率 floor 被 E·L 除后缩水 3072×，安静信号有效步长爆炸 ~1534 → Wc 慢性膨胀）· R-49（antiEst/anti_rms 比值 >20× 诊断告警）· R-50（反馈路径 spk1 校准极弱 RMS≈2×10⁻⁵）· R-51（125Hz 窄带持续检测——房间驻波/环境源 vs ANC 反馈）· **P1**（输入电平 SPL 诊断 + mic_pre_gain 自动建议，ref_dBFS 过低时打印建议增益值）· **P3**（啸叫检测阈值 err 12→14dB / anti 10→12dB，滤除 125Hz 环境窄带伪峰）。R-47+R-48 叠加解释日志中所有异常：antiEst 飙高（R-48 Wc 膨胀）+ anti_rms 极低（R-47 时间反转输出能量分散）= 100-400× 比值差异。
+
+**硬件实测新发现 第4批（2026-07-29，对抗性审查——日志+代码逐项深究）**：R-52（peak_mute 屏蔽 Wc 发散检测——wc_snapshot 在 Wc×0.5 之后捕获，freeze 永不触发，形成"膨胀→削半→再膨胀"死循环）· R-53（check_wc_divergence 内 anti_rms 救援代码重复——L537-554 与 L596-609 完全一致）· R-54（diverge_anti_rms=0.25 在 gain=5-8× 下过高——anti_rms 被 peak_mute 包络压低，救援永不触发）· R-55（anti_est 仅 250/16000 样本 + ×64 外推——高方差，Wc 帧内变化时物理含义模糊）· R-56（diverged 标志 pa>9×pe 在 ANC 正常工作时可能误触发——err 很小时 pa/pe 自然很大，阻止 scene_wc 保存）· R-57（反馈标定 SNR 不足——声学耦合 -44.5dB 经 gain=8× 后安静期反馈 > 真实信号 2×，标定本身准确而非失败）。对抗性审查核心结论：**P0 部分成立**（反馈抵消 SNR 不足确实存在但非唯一振荡根因，标定准确反映弱声学耦合）；**P1 严重成立**（antiEst/anti 失配 159×，根因是 R-52 使 Wc 膨胀逃逸检测）；**P2 成立**（NR 在 Wc 膨胀态虚高，diverged 检测有盲区也有误报）；**P3 成立**（52dB 动态范围无法单次标定覆盖）。
 
 ## 附录 B：关键验证测试设计
 
