@@ -75,13 +75,6 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c s
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
 
-也可以用 `make`：
-```bash
-make          # 编译离线版
-make realtime # 编译实时版
-make all      # 两个都编译
-make clean    # 清理
-```
 
 ### 4. 校准反馈路径（实时模式首次运行前必须执行）
 
@@ -216,10 +209,10 @@ GFANC_FxNLMs_Scene/
 
 ### 慢速环路（每秒执行一次）— "大脑"
 
-CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（4 种），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
+CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（K 种，运行时从数据推导，当前 K=3），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
 
 ```
-噪声 → 带通(20-1500Hz) → CNN(M5, 4类) → Blend(15子滤波器) → Wc(1024tap)
+噪声 → 带通(20-1500Hz) → CNN(M5, K类) → Blend(15子滤波器) → Wc(1024tap)
                                     ↑ 1Hz, 双缓冲+原子交接
 ```
 
@@ -253,12 +246,12 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 │                                                               │
 │  ref → bp_fir(1024tap) → cnn_buf[2][16000] 双缓冲            │
 │    │                         │                                │
-│    │                    CNN M5 (4类)                          │
+│    │                    CNN M5 (K类, 运行时推导)               │
 │    │                      ↓ softmax                          │
-│    │                    Blend: centroid[4][30] softmax加权     │
+│    │                    Blend: centroid[K][30] softmax加权     │
 │    │                      ↓                                  │
 │    │                    Wc = Σ blend[c]×sub_filter[c]         │
-│    │                    RMS对齐 stub_rms, 取反                │
+│    │                    RMS自动标定 (wc_rms_target), 取反     │
 │    │                      ↓                                  │
 │    │                    滞回检测 (cos<0.8)                    │
 │    │                      ↓ 切换                             │
@@ -276,8 +269,8 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 │                                     ↓                        │
 │  err_meas = bp(err_mic) ──→ ΔWc = -μ·err_meas·Xd/power       │
 │                              (per-sample LMS)                 │
-│                              + leak (1e-6)                    │
-│                              + freeze_lms (max|Wc|>5×stub)    │
+│                              + leak (5e-6)                    │
+│                              + freeze_lms (max|Wc|>30×wc_init_max) │
 │                                                               │
 ├─ 反馈环路 (规划中, B-1) ─────────────────────────────────────┤
 │                                                               │
@@ -321,7 +314,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 误差麦克风 (E) | 3 | 放在降噪目标位置 |
 | 扬声器 (S) | 2 | 播放反噪声 |
 | 子滤波器 (C) | 15 | 预训练滤波器, 按场景混合 |
-| 场景类型 (K) | 4 | CNN 可识别的噪声环境数 (运行时从数据推导) |
+| 场景类型 (K) | 3 (运行时从数据推导) | CNN 可识别的噪声环境数 |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
 | 输入预增益 | 3x (+9.5dB) | MIC_PRE_GAIN, 可调 |
@@ -331,7 +324,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
 | 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
-| Wc 发散阈值 | max\|Wc\| > 5×stub_rms | 自动冻结 LMS 梯度 |
+| Wc 发散阈值 | max\|Wc\| > 30×wc_init_max | 自动冻结 LMS 梯度 (自适应基准) |
 | 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
 | 啸叫陷波 | DFT 256pt, IIR ×2 | 15dB 峰均值阈值, 逐扬声器独立状态 |
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
