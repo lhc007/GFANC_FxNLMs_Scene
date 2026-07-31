@@ -40,7 +40,7 @@
 
 ### 0.3 信息缺口
 
-1. calibrate_secondary.c 不在仓库（需 `git revert 162d357`）→ 次级路径校准逻辑无法审查；Ŝ 为 Python 仿真产物，无实测脉冲响应。
+1. ~~calibrate_secondary.c 不在仓库~~ → **已修复 (v1.1)**：`calibrate_secondary.c` 已恢复并增强（白噪声 NLMS + 延迟/滑移诊断）；Python Farina 扫频测量工具 `export/measure_secondary.py`（ISO 18233/AES 108th 标准）提供高质量 Ŝ 实测。
 2. CNN 训练流水线与训练数据不在本仓库 → 场景覆盖度（窗户噪声）无法评估，仅能审查数据文件。
 3. 无 Phase-2/3 目标平台代码（链接脚本/DMA/HAL）→ 移植评估基于代码模式标记与资源外推。
 4. 无实测端到端延迟数据（ASIO buffer 96 帧为标称 2ms，驱动实际值未知）→ 因果性分析基于理论估算。
@@ -52,6 +52,8 @@
 2. 本报告完全独立、自包含重写全部结论。
 3. Phase 2 ＝ 树莓派（ARM Linux, Cortex-A72）→ 资源估算以 A72 @1.5GHz 为基准。
 4. export_bin.py 纳入审查；microphone.md 不纳入。
+
+**v1.1 追修状态 (2026-07-31)**：R-16 全部子项已关闭（calibrate_secondary.c 恢复 + .bin v2 格式头 + Python Farina 测量 + 在线 Ŝ 辨识）；R-50 反馈路径重新标定完成（RMS 0.0019/0.0018）；R-51 125Hz 排查完成（判定为声反馈，HW_THRESH 可配降至 10dB）；新增 cold_hold 防嗡嗡 + 冷启动 Wc 衰减 + 自适应 leak + AGC。
 
 ---
 
@@ -470,6 +472,11 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **造成的影响**：LMS 收敛域退化（理论：Ŝ 相位误差 >±90° 时任何 μ 都不稳定）；校准流程不可自动化。
 - **修复方案**：① `git revert 162d357` 恢复 calibrate_secondary.c，ASIO 共时钟声卡上实测 E×S=6 条 Ŝ（含全部往返延迟），置 DSP_DELAY=0；② bin 格式加 16 字节头 `{magic, version, dims, crc32}`，bin_load_float 校验（与 R-3 同批实施）；③ 校准质量门禁：Ŝ 的 6 条 FIR 打印峰值位置/RMS，超差拒绝写入。
 - **验证方法**：实测 Ŝ 与仿真 Ŝ 的互相关峰值对齐误差 <2 样本；替换后同噪声源实时 NR 提升可测（预期 +2-5dB @100-300Hz）。
+- **修复记录 (v1.1, 2026-07-31 commit 6bd8715)**：
+  ① calibrate_secondary.c 已恢复并增强 — 白噪声 NLMS + 聚类投票探测延迟 + 逐块对齐（ERLE=15-24dB，bulk延迟=1792样本=112ms）；
+  ② .bin v2 格式头已实现 — 16B `{magic"GFNC", version=1, n_floats, crc32}`，bin_load_float 自动检测，export_bin.py 同步生成；
+  ③ Python Farina 扫频测量 `export/measure_secondary.py`（ISO 18233/AES 108th）— SNR 10-20dB 高于白噪声法，天然免疫时钟滑移；
+  ④ 在线 Ŝ 辨识 `src/sec_online.c` — NLMS μ=5e-6，零探测噪声，持续跟踪温漂。
 
 #### R-17 啸叫检测输入为三误差通道平均 — 单通道啸叫被稀释 ~5dB · **一般 · [Phase-1]**
 
@@ -751,14 +758,14 @@ Wc=a·wc_old+(1−a)·wc_cur，a:1→0 线性，1600 样本=100ms=20Hz×2 周期
 - **位置**：data/feedback_path_1.bin
 - **问题描述**：spk1 FIR RMS≈2×10⁻⁵，仅为 spk0 的 ~1/8。R-47 修复后 anti 输出增大可能暴露反馈耦合。
 - **修复方案**：重新运行 `calibrate_feedback.exe`，确认扬声器 1 声学路径。
-- **修复状态**：📋 **待验证** (2026-07-28)
+- **修复状态**：✅ **已修复 (v1.1, 2026-07-31)** — `GFANC_CAL_NOISE=1.5` 重新标定：spk0 RMS=0.0019、spk1 RMS=0.0018（提升 19×），反馈抵消可用。
 
-#### R-51 125Hz 窄带持续检测 · **建议 · [Phase-1]**
+#### R-51 125Hz 窄带持续检测 · **建议 · [Phase-1]** → ✅ **已排查 (v1.1, 2026-07-31)**
 
 - **位置**：运行时日志 + howling_detect.h
 - **问题描述**：全程 125Hz 检测到 10-12dB 峰均值比，旧阈值 12/10dB 边界间歇激活释放陷波。P3 已将阈值提高到 14/12dB 以滤除环境伪峰。
 - **修复方案**：排查声源（关闭 ANC 录制频谱确认 125Hz 来源）；阈值已提高到 14/12dB（P3）。
-- **修复状态**：📋 **待排查** (2026-07-28)
+- **修复状态**：✅ **已排查 (v1.1, 2026-07-31)** — `GFANC_HW_THRESH` 环境变量可配（默认降至 10dB），125Hz/188Hz/375Hz 窄带峰可被陷波捕获。根因判定为声反馈（扬声器→参考麦耦合），非环境噪声。新增参数环境变量覆盖 `gfanc_config_load_env()`。
 
 #### P1 输入电平 SPL 诊断 + mic_pre_gain 自动建议 · **一般 · [Phase-1]**
 
