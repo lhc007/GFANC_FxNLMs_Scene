@@ -371,7 +371,7 @@ int main(int argc, char **argv)
             /* C1: 使用共享函数初始化场景记忆 + wc_init_max */
             sm_first_sec_init((float *)scene_wc, scene_wc_valid,
                               &cur_scene_id, new_scene,
-                              wc_cur, S * L, &wc_init_max);
+                              wc_cur, S * L, &wc_init_max, 1.0f);
             memcpy(anchor_probs, probs, K * sizeof(float));
             fxnlms_set_wc(&fx, wc_cur);
             snprintf(action, sizeof(action), "INIT");
@@ -394,7 +394,7 @@ int main(int argc, char **argv)
                 int restored = sm_scene_switch_execute(
                     (float *)scene_wc, scene_wc_valid,
                     &cur_scene_id, new_scene,
-                    fx.wc, wc_cur, wc_old, S * L);
+                    fx.wc, wc_cur, wc_old, S * L, 1.0f);
                 fade_cnt = cfg.fade_len;
                 memcpy(anchor_probs, probs, K * sizeof(float));
                 converged_frames = 0;

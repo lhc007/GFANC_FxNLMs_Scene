@@ -79,14 +79,15 @@ static inline float sm_wc_rms(const float *wc, int n)
  *  @param wc_cur          新场景 Wc (输出: 被恢复的记忆或 CNN 预设覆盖)
  *  @param wc_old          CrossFader 旧端 Wc (输出: 被当前快照覆盖)
  *  @param wc_n            每个扬声器的系数数 (=S*L)
- *  @return 1=使用了已收敛记忆, 0=使用了 CNN 预设
+ *  @param wc_cold_start   首次场景衰减 (0.3=30%起步, 1.0=关闭)
+ *  @return 1=使用了已收敛记忆, 0=使用了 CNN 预设 (首次)
  */
 static inline int sm_scene_switch_execute(
     float *scene_wc, int *scene_wc_valid,
     int *cur_scene_id, int new_scene,
     const float *wc_snapshot,
     float *wc_cur, float *wc_old,
-    int wc_n)
+    int wc_n, float wc_cold_start)
 {
     int restored = 0;
 
@@ -99,6 +100,11 @@ static inline int sm_scene_switch_execute(
         memcpy(wc_cur, scene_wc + new_scene * wc_n, wc_n * sizeof(float));
         restored = 1;
     } else {
+        /* 冷启动衰减: 首次未收敛场景, CNN 预设可能偏离真实噪声,
+           LMS 从低向上收敛 (安全) 避免从过高值 overshoot 发散. */
+        if (wc_cold_start < 1.0f && wc_cold_start > 0.0f) {
+            for (int i = 0; i < wc_n; i++) wc_cur[i] *= wc_cold_start;
+        }
         /* CNN 预设同步存入场景记忆 — 防止下次恢复时拿到未初始化的空滤波器 */
         memcpy(scene_wc + new_scene * wc_n, wc_cur, wc_n * sizeof(float));
         scene_wc_valid[new_scene] = 1;
@@ -117,16 +123,22 @@ static inline int sm_scene_switch_execute(
  *  @param scene_wc_valid  场景记忆有效标志
  *  @param cur_scene_id    当前场景 ID (输出)
  *  @param new_scene       CNN 分类的场景 ID
- *  @param wc_cur          CNN 构造的初始 Wc
+ *  @param wc_cur          CNN 构造的初始 Wc (in/out: 会被 wc_cold_start 衰减)
  *  @param wc_n            系数数 (=S*L)
  *  @param wc_init_max     输出: max|Wc| 作为 freeze 基准 (最小 0.01)
+ *  @param wc_cold_start   首次衰减系数 (0.3=30%起步, 1.0=关闭)
  */
 static inline void sm_first_sec_init(
     float *scene_wc, int *scene_wc_valid,
     int *cur_scene_id, int new_scene,
-    const float *wc_cur, int wc_n,
-    float *wc_init_max)
+    float *wc_cur, int wc_n,
+    float *wc_init_max, float wc_cold_start)
 {
+    /* 冷启动衰减: CNN 预设可能大幅偏离当前噪声 → LMS 从低向上收敛, 防 overshoot */
+    if (wc_cold_start < 1.0f && wc_cold_start > 0.0f) {
+        for (int i = 0; i < wc_n; i++) wc_cur[i] *= wc_cold_start;
+    }
+
     memcpy(scene_wc + new_scene * wc_n, wc_cur, wc_n * sizeof(float));
     scene_wc_valid[new_scene] = 1;
     *cur_scene_id = new_scene;

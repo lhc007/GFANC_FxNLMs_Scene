@@ -73,6 +73,8 @@ typedef struct {
     int   hw_min_hold;           /* 陷波最小保持帧数 */
 
     int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
+    float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
+    float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -90,7 +92,9 @@ typedef struct {
     0.25f,              /* diverge_anti_rms */ \
     15.0f, 4, 8, 0.96f, /* hw_thresh_db, hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
-    0                   /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
+    0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
+    5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
+    0.3f                /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -106,6 +110,9 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
     if ((s = getenv("GFANC_WC_TARGET")))  cfg->wc_rms_target = (float)atof(s);
+    if ((s = getenv("GFANC_SEC_MU")))     cfg->sec_online_mu  = (float)atof(s);
+    if ((s = getenv("GFANC_WC_COLD")))   cfg->wc_cold_start  = (float)atof(s);
+    if ((s = getenv("GFANC_HW_THRESH"))) cfg->hw_thresh_db   = (float)atof(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

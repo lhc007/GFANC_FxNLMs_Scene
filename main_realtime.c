@@ -19,6 +19,7 @@
 #include "scene_manager.h"
 #include "fxnlms_mimo.h"
 #include "howling_detect.h"
+#include "sec_online.h"
 
 /* R-14: 2阶 Butterworth 低通 biquad (48kHz侧抗混叠, fc≈6kHz) */
 typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
@@ -88,6 +89,7 @@ typedef struct {
 
     /* 啸叫检测 */
     howling_detect_t hw;           /* DFT 频谱检测 + IIR 陷波 */
+    sec_online_t   sec_on;        /* 在线 Ŝ 辨识 (NLMS, 零探测噪声) */
 
     /* §6.2 跨线程: 影子缓冲, 主线程不直接写/读 fx.wc */
     float  wc_shadow[S*L];      /* 主线程写→回调应用 (Wc更新) */
@@ -302,6 +304,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             }
         } else {
             fxnlms_tick_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
+            /* 在线 Ŝ 辨识: 利用 anti→err 关系跟踪次级路径变化.
+               仅正常运行时更新 (非 mute/fade/howling/ramp).
+               anti 此时尚未钳位, err_meas 为带通信号, NLMS 无偏. */
+            if (cfg.sec_online_mu > 0 && ctx->ramp_cnt == 0)
+                sec_online_update(&ctx->sec_on, anti_spk, err_meas, ctx->sec_coeffs);
         }
 
         /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
@@ -654,7 +661,8 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
     int restored = sm_scene_switch_execute(
         (float *)ctx->scene_wc, ctx->scene_wc_valid,
         &ctx->cur_scene_id, new_scene,
-        ctx->wc_snapshot, ctx->wc_cur, ctx->wc_old, S * L);
+        ctx->wc_snapshot, ctx->wc_cur, ctx->wc_old, S * L,
+        cfg.wc_cold_start);
 
     if (ctx->log_file)
         fprintf(ctx->log_file, "# EVENT: scene switch %d→%d cos=%.3f restored=%d\n",
@@ -846,6 +854,19 @@ int main(void) {
             }
         }
 
+    /* 在线 Ŝ 辨识: 从 anti_spk→err_mic 关系持续跟踪次级路径.
+       零探测噪声, 利用 ANC 自身输出作为激励. μ≈5e-6 极慢, 抗扰动偏差. */
+    if (cfg.sec_online_mu > 0) {
+        if (sec_online_init(&ctx->sec_on, E, S, SEC_LEN, dsp_delay,
+                             cfg.sec_online_mu) != 0) {
+            fprintf(stderr, "OOM: sec_online\n"); ret = 1; goto cleanup;
+        }
+        printf("  Online Ŝ: μ=%.0e (adaptive, zero probe noise)\n",
+               (double)cfg.sec_online_mu);
+    } else {
+        printf("  Online Ŝ: disabled (GFANC_SEC_MU=0)\n");
+    }
+
     /* 反馈抵消: 逐扬声器加载 FIR (需先运行 calibrate_feedback.exe, F-G修复) */
 #if FB_ENABLED
     {
@@ -971,7 +992,8 @@ int main(void) {
             /* C1: 使用共享函数初始化场景记忆 + wc_init_max */
             sm_first_sec_init((float *)ctx->scene_wc, ctx->scene_wc_valid,
                               &ctx->cur_scene_id, new_scene,
-                              ctx->wc_cur, S * L, &ctx->wc_init_max);
+                              ctx->wc_cur, S * L, &ctx->wc_init_max,
+                              cfg.wc_cold_start);
             /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
             memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
@@ -1055,6 +1077,7 @@ cleanup:
             free(ctx->sec_firs);
         }
         free(ctx->sec_coeffs);
+        if (cfg.sec_online_mu > 0) sec_online_free(&ctx->sec_on);
         for (int s = 0; s < S; s++) free(ctx->fb_fir[s].delay_line);
         fxnlms_free(&ctx->fx);
         free(ctx->ref_buf); free(ctx->anti_buf); free(ctx->err_buf);
