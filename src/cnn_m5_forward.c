@@ -1,16 +1,27 @@
 /** m5_scene CNN 前向 — 从 .bin 文件加载权重, 纯 C float 实现.
 
 架构: stem(Conv+BN+ReLU+MaxPool) → 2×2 ResBlock(64,64) → Pool → Linear(64,K)
+
+C2 修复 (ADVERSARIAL_REVIEW): 全局静态变量 → 实例化接口.
 用法:
-    cnn_m5_init() — 从 data/*.bin 加载所有权重 (一次)
-    cnn_m5_forward(audio_16000, logits_out) — 前向推理
-    cnn_m5_free() — 释放
+    cnn_instance_t cnn;
+    cnn_init(&cnn);                    // 从 data/ 下 .bin 文件加载所有权重
+    cnn_forward(&cnn, audio, logits);  // 前向推理
+    cnn_free(&cnn);                   // 释放
+向后兼容: cnn_m5_init/forward/get_K/free 宏 → 全局单例.
 */
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
 #include "binary_loader.h"
+#include "cnn_m5_forward.h"
+
+/* ── 内部类型别名 (与头文件类型对应) ── */
+typedef cnn_conv_layer_t conv_layer_t;
+typedef cnn_bn_layer_t    bn_layer_t;
+typedef cnn_resblock_t    resblock_t;
+typedef cnn_model_t       model_t;
 
 #define CH       64
 #define INPUT_LEN 16000
@@ -33,36 +44,8 @@
 #define RES2_OUT_LEN  RES1_POOL_LEN                                 /* 125 */
 #define RES2_POOL_LEN ((RES2_OUT_LEN - POOL_K)/POOL_S + 1)          /* 31 */
 
-/* ── 权重结构 ── */
-typedef struct {
-    float *weight, *bias;
-    int out_ch, in_ch, ksize, stride, pad;
-} conv_layer_t;
-
-typedef struct {
-    float *gamma, *beta, *mean, *var;
-    int ch;
-} bn_layer_t;
-
-typedef struct {
-    conv_layer_t conv1, conv2;
-    bn_layer_t    bn1, bn2;
-    float        *proj_weight;
-    int           in_ch;
-} resblock_t;
-
-typedef struct {
-    conv_layer_t stem_conv;
-    bn_layer_t    stem_bn;
-    resblock_t    res[4];
-    float        *fc_weight, *fc_bias;
-} cnn_m5_t;
-
-static cnn_m5_t g_cnn;
-static int g_K = 0;  /* 运行时从 linear_weight 文件大小推导 */
-static float *g_cnn_buf = NULL;  /* R-33: 推理激活缓冲, 文件作用域便于释放 */
-
-int cnn_m5_get_K(void) { return g_K; }
+/* C2: 全局单例 — 向后兼容宏 (cnn_m5_*) 使用的实例 */
+cnn_instance_t _gfanc_cnn_singleton;
 
 /* ── 加载 ── */
 static int load_conv(const char *tag, conv_layer_t *c, int oc, int ic, int k, int s, int p) {
@@ -91,18 +74,19 @@ static int load_bn(const char *tag, bn_layer_t *b, int ch) {
     return 0;
 }
 
-int cnn_m5_init(void)
+int cnn_init(cnn_instance_t *cnn)
 {
-    memset(&g_cnn, 0, sizeof(g_cnn));
+    memset(cnn, 0, sizeof(*cnn));
+    model_t *m = &cnn->model;
 
     /* Stem */
-    if (load_conv("stem_conv", &g_cnn.stem_conv, CH, 1, STEM_K, STEM_S, STEM_P)) return -1;
-    if (load_bn("stem_bn", &g_cnn.stem_bn, CH)) return -1;
+    if (load_conv("stem_conv", &m->stem_conv, CH, 1, STEM_K, STEM_S, STEM_P)) return -1;
+    if (load_bn("stem_bn", &m->stem_bn, CH)) return -1;
 
     /* 4 ResBlocks: res0, res1, res2, res3 */
     for (int i = 0; i < 4; i++) {
         char tag[32];
-        resblock_t *r = &g_cnn.res[i];
+        resblock_t *r = &m->res[i];
         r->in_ch = CH;
         /* R-35: 尝试加载 projection 权重 (in_ch≠out_ch 时需要, 当前64→64无投影) */
         snprintf(tag, sizeof(tag), "data/cnn_res%d_proj_weight.bin", i);
@@ -120,12 +104,12 @@ int cnn_m5_init(void)
     }
 
     /* FC — K 从 linear_weight 文件大小推导: n = K*CH → K = n/CH */
-    int n_w = bin_load_float("data/cnn_linear_weight.bin", &g_cnn.fc_weight);
-    int n_b = bin_load_float("data/cnn_linear_bias.bin", &g_cnn.fc_bias);
+    int n_w = bin_load_float("data/cnn_linear_weight.bin", &m->fc_weight);
+    int n_b = bin_load_float("data/cnn_linear_bias.bin", &m->fc_bias);
     if (n_w < 0 || n_b < 0) return -1;
-    g_K = n_w / CH;
-    if (g_K < 1 || g_K > 16) {
-        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats)\n", g_K, n_w);
+    cnn->K = n_w / CH;
+    if (cnn->K < 1 || cnn->K > 16) {
+        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats)\n", cnn->K, n_w);
         return -1;
     }
     (void)n_b;
@@ -156,25 +140,27 @@ static void free_resblock(resblock_t *r)
     free(r->proj_weight); r->proj_weight = NULL;
 }
 
-void cnn_m5_free(void)
+void cnn_free(cnn_instance_t *cnn)
 {
+    model_t *m = &cnn->model;
+
     /* Stem */
-    free_conv(&g_cnn.stem_conv);
-    free_bn(&g_cnn.stem_bn);
+    free_conv(&m->stem_conv);
+    free_bn(&m->stem_bn);
 
     /* 4 ResBlocks */
     for (int i = 0; i < 4; i++)
-        free_resblock(&g_cnn.res[i]);
+        free_resblock(&m->res[i]);
 
     /* FC */
-    free(g_cnn.fc_weight); g_cnn.fc_weight = NULL;
-    free(g_cnn.fc_bias);   g_cnn.fc_bias   = NULL;
+    free(m->fc_weight); m->fc_weight = NULL;
+    free(m->fc_bias);   m->fc_bias   = NULL;
 
-    g_K = 0;
+    cnn->K = 0;
 
     /* R-33: 释放推理激活缓冲, 下次 forward 自动重新分配 */
-    free(g_cnn_buf);
-    g_cnn_buf = NULL;
+    free(cnn->act_buf);
+    cnn->act_buf = NULL;
 }
 
 /* ── 层实现 ── */
@@ -271,27 +257,30 @@ static void resblock_forward(const float *in, int in_ch, int out_ch, int in_len,
     }
 }
 
-/* ── 主前向 ── */
-int cnn_m5_forward(const float *audio, float *logits)
+/* ── 主前向 (实例化) ── */
+int cnn_forward(cnn_instance_t *cnn, const float *audio, float *logits)
 {
-    /* R-33: 静态缓冲 4块, 文件作用域 g_cnn_buf 支持 cnn_m5_free 释放 */
-    static int   b_len = 0;
+    model_t *m = &cnn->model;
+    int K = cnn->K;
     int max_buf = CH * STEM_OUT_LEN; /* 64*4000 = 256000 */
-    if (!g_cnn_buf || b_len < max_buf * 4) {
-        free(g_cnn_buf);
-        g_cnn_buf = (float *)calloc(max_buf * 4, sizeof(float));
-        if (!g_cnn_buf) return -1;
+
+    /* C2: 激活缓冲移到实例内, 支持多实例 */
+    static int b_len = 0;  /* 分配尺寸追踪 (全局, 因所有实例共享相同架构) */
+    if (!cnn->act_buf || b_len < max_buf * 4) {
+        free(cnn->act_buf);
+        cnn->act_buf = (float *)calloc(max_buf * 4, sizeof(float));
+        if (!cnn->act_buf) return -1;
         b_len = max_buf * 4;
     }
     float *b[4];
-    for (int i = 0; i < 4; i++) b[i] = g_cnn_buf + i * max_buf;
+    for (int i = 0; i < 4; i++) b[i] = cnn->act_buf + i * max_buf;
 
     /* Stem: Conv → BN → ReLU → MaxPool (in:b[0] tmp, out:b[1]) */
     int slen, plen;
-    conv1d(audio, INPUT_LEN, 1, g_cnn.stem_conv.weight, g_cnn.stem_conv.bias,
+    conv1d(audio, INPUT_LEN, 1, m->stem_conv.weight, m->stem_conv.bias,
            CH, STEM_K, STEM_S, STEM_P, b[0], &slen);
-    batchnorm(b[0], CH, slen, g_cnn.stem_bn.gamma, g_cnn.stem_bn.beta,
-              g_cnn.stem_bn.mean, g_cnn.stem_bn.var);
+    batchnorm(b[0], CH, slen, m->stem_bn.gamma, m->stem_bn.beta,
+              m->stem_bn.mean, m->stem_bn.var);
     relu(b[0], CH * slen);
     maxpool1d(b[0], CH, slen, POOL0_K, POOL0_S, b[1], &plen);
     /* b[1]=current feature map, b[0]=free, b[2]=scratch1, b[3]=scratch2 */
@@ -301,7 +290,7 @@ int cnn_m5_forward(const float *audio, float *logits)
         for (int rb = g*2; rb < g*2+2; rb++) {
             /* in=b[1], scratch1=b[2], scratch2=b[3], out=b[0] */
             int rlen;
-            resblock_forward(b[1], CH, CH, plen, &g_cnn.res[rb],
+            resblock_forward(b[1], CH, CH, plen, &m->res[rb],
                              b[0], &rlen, b[2], b[3]);
             /* swap b[0]<->b[1], new feature map in b[1] */
             { float *t = b[0]; b[0] = b[1]; b[1] = t; plen = rlen; }
@@ -320,10 +309,10 @@ int cnn_m5_forward(const float *audio, float *logits)
     }
 
     /* Linear */
-    for (int o = 0; o < g_K; o++) {
-        float sum = g_cnn.fc_bias ? g_cnn.fc_bias[o] : 0.0f;
+    for (int o = 0; o < K; o++) {
+        float sum = m->fc_bias ? m->fc_bias[o] : 0.0f;
         for (int i = 0; i < CH; i++)
-            sum += gap[i] * g_cnn.fc_weight[o * CH + i];
+            sum += gap[i] * m->fc_weight[o * CH + i];
         logits[o] = sum;
     }
 

@@ -985,7 +985,7 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 
 ### 7.2 全部问题清单与修复状态
 
-> 已完成 38 项 / 总计 55 项。剩余 17 项分类：🟠 Python 训练侧配合 2 项（R-13, R-16-②）、🟡 硬件实测 4 项（R-16-①③, R-50, R-51）、🟠 Phase-2 6 项（R-19/21/24/27/29/30）、🔵 Phase-3 4 项（R-22/23/25/28）。R-50/R-51 已从已修复表移除（代码侧 P3 阈值修复已完成，但硬件验证/排查仍待做），统一归入硬件窗口期。R-47~R-51 + P1/P3 为 2026-07-28 实时运行日志分析发现。R-52~R-57 为 2026-07-29 对抗性审查发现并于同日修复。
+> 已完成 46 项 / 总计 55 项。剩余 9 项分类：🟠 Python 训练侧配合 2 项（R-13, R-16-②）、🟡 硬件实测 4 项（R-16-①③, R-50, R-51）、🟠 Phase-2 3 项（R-21/24/27/30）、🔵 Phase-3 2 项（R-25/28）。R-50/R-51 已从已修复表移除（代码侧 P3 阈值修复已完成，但硬件验证/排查仍待做），统一归入硬件窗口期。R-47~R-51 + P1/P3 为 2026-07-28 实时运行日志分析发现。R-52~R-57 为 2026-07-29 对抗性审查发现并于同日修复。R-58/C1/C2/C3 + R-22/R-29/R-19/R-23 为 2026-07-31 对抗性审查追修 (2 批次, commit `a3ed34b`)。
 
 #### ✅ 已修复
 
@@ -1028,12 +1028,18 @@ CPU 需求与芯片推荐（1×3×2，修复 R-11/R-12/R-23 后 ≈440 MMAC/s + 
 | 36 | **R-56** diverged 判定增加 nr_level<0 条件 — 消除 ANC 正常工作时的误触发 | 一般 | Phase-1 | `79b9afc` |
 | 37 | **R-57** 反馈标定质量门禁 (FIR RMS<0.0005→拒绝) + fb_active RMS 加载检查 | 一般 | Phase-1 | `79b9afc` |
 | 38 | **R-33** cnn_m5_free 完整释放 CNN 权重+激活缓冲 — 支持 OTA/热切换 | 建议 | Phase-1 | `72164c8` |
+| 39 | **R-58** wc_rms_target 环境变量化 — 新增 `GFANC_WC_TARGET` env var + `gfanc_config_t.wc_rms_target` 字段, 消除硬编码 0.03f | 一般 | Phase-1 | 2026-07-31 |
+| 40 | **C3** magic number 集中化 — `WC_MUTE_DECAY`/`OUT_GAIN_SLEW`/#define + `TARGET_REF_RMS` 提取到 gfanc_types.h, 消除 6 处硬编码 | 低 | Phase-1 | 2026-07-31 |
+| 41 | **C1** 共享场景管理逻辑 — 新建 `include/scene_manager.h` (7 个纯函数): sm_cos_sim/sm_wc_max_abs/sm_scene_switch_execute/sm_first_sec_init/sm_check_divergence/sm_check_convergence/sm_check_scene_switch；main.c + main_realtime.c 同步重构, 净减少 ~60 行重复 | 中等 | Phase-1 | 2026-07-31 |
+| 42 | **C2** CNN 模块实例化 — 新建 `include/cnn_m5_forward.h` (cnn_instance_t + 向后兼容宏)；`src/cnn_m5_forward.c` 全局 g_cnn/g_K/g_cnn_buf → 实例字段；scene_controller.c extern → 标准头文件；cleanup 路径新增 cnn_m5_free() 调用 | 中等 | Phase-1 | 2026-07-31 |
+| 43 | **R-22** VLA 消除 — `fxnlms_mimo.c` 2 处变长数组 → `GFANC_E_MAX`/`GFANC_S_MAX` 定长 (MSVC/IAR/Keil 可编译) | 严重 | Phase-3 | `a3ed34b` |
+| 44 | **R-29** E/S/L 硬编码集中 — `n*3+e`→`n*E+e`, `for(s<2)`→`for(s<S)`, `fb_fir[2]`→`fb_fir[S]`；`gfanc_types.h` 添加 `GFANC_E_MAX`/`GFANC_S_MAX`/`GFANC_L_MAX`/`GFANC_C_MAX` 上限宏 | 严重 | Phase-2 | `a3ed34b` |
+| 45 | **R-19** 原子操作抽象 — 新建 `include/os_atomic.h` (Win32 Interlocked / C11 stdatomic / GCC __atomic 三后端), 提供 `gf_atomic_exchange_add`/`exchange`/`decrement`/`increment` | 一般 | Phase-2 | `a3ed34b` |
+| 46 | **R-23** FIR 延迟线 double→float 编译开关 — `gfanc_delay_t` typedef + `GFANC_FLOAT_DELAY` 宏；`fir_filter.c` + main.c/main_realtime.c/test 全部 `(double*)calloc`→`(gfanc_delay_t*)calloc` | 严重 | Phase-3 | `a3ed34b` |
 
 #### 🔴 Phase-1 待修复（纯软件，零硬件依赖）
 
-| 序 | 项 | 级别 | 工作量 |
-|----|----|------|--------|
-| 41 | **R-58** wc_rms_target + leak 网格搜索标定 — 当前为经验值, 离线批量扫最优 | 一般 | 0.3 天 |
+*（Phase-1 纯 C 可修复项已全部完成。）*
 
 #### 🟠 需 Python 训练侧配合（纯软件，但依赖外部工具链）
 

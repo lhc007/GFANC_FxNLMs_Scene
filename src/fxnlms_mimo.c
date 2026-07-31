@@ -83,7 +83,7 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
     xd_roll_write(fx, Fx);
 
     /* anti_est[e] = Σ_s,k Wc[s,k] * Xd[e,s,k] */
-    float anti_est[E];
+    float anti_est[GFANC_E_MAX];  /* R-22: VLA → 定长, MSVC/IAR/Keil 兼容 */
     for (int e = 0; e < E; e++) { anti_est[e] = 0;
         for (int s = 0; s < S; s++)
             for (int k = 0; k < L; k++)
@@ -104,7 +104,7 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
     /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
        安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
        floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
-    float power[S];
+    float power[GFANC_S_MAX];  /* R-22: VLA → 定长 */
     for (int s = 0; s < S; s++) {
         power[s] = 0.0f;
         for (int e = 0; e < E; e++) {
@@ -194,7 +194,7 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
        安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
        floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
-    float power[S];
+    float power[GFANC_S_MAX];  /* R-22: VLA → 定长 */
     for (int s = 0; s < S; s++) {
         power[s] = 0.0f;
         for (int e = 0; e < E; e++) {

@@ -32,7 +32,7 @@ static void test_fir_impulse(void)
     float *coeffs = (float *)calloc(n_taps, sizeof(float));
     for (int i = 0; i < n_taps; i++) coeffs[i] = (float)(i + 1) / n_taps;
 
-    fir_filter_t f = { coeffs, (double *)calloc(n_taps, sizeof(double)), n_taps, 0 };
+    fir_filter_t f = { coeffs, (gfanc_delay_t *)calloc(n_taps, sizeof(gfanc_delay_t)), n_taps, 0 };
 
     /* 注入单位脉冲 */
     float imp = fir_tick(&f, 1.0f);  /* h[0] 叠加当前延迟线状态(=0) */

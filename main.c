@@ -19,7 +19,9 @@
 
 #include "fir_filter.h"
 #include "binary_loader.h"
+#include "cnn_m5_forward.h"
 #include "scene_controller.h"
+#include "scene_manager.h"
 #include "fxnlms_mimo.h"
 
 /* ══════════════════════════════════════════════════════════
@@ -100,7 +102,8 @@ static void wav_write(const char *path, const float *data, int n, int ch, int sr
     for (int i = 0; i < n; i++)
         for (int c = 0; c < ch; c++) {
             float v = data[c * n + i];
-            if (v > 1.0f) v = 1.0f; if (v < -1.0f) v = -1.0f;
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
             short s = (short)(v * 32767.0f); fwrite(&s, 2, 1, f);
         }
     fclose(f);
@@ -198,12 +201,11 @@ int main(int argc, char **argv)
 
     /* ── 2. 初始化组件 ── */
     /* CNN 必须先初始化 (加载权重) */
-    extern int cnn_m5_init(void);
     if (cnn_m5_init() != 0) { fprintf(stderr, "CNN init failed\n"); return 1; }
     printf("  CNN loaded.\n");
 
     /* 2a. 带通 FIR */
-    fir_filter_t bp_fir = { bp_coeff, (double *)calloc(BP_LEN, sizeof(double)), BP_LEN, 0 };
+    fir_filter_t bp_fir = { bp_coeff, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
 
     /* 2b. 次级路径 FIR (peak→1.0 归一化, 与实时版一致) */
     {
@@ -227,7 +229,7 @@ int main(int argc, char **argv)
                    sec_path + idx * SEC_LEN, SEC_LEN * sizeof(float));
             sec_firs[idx].coeffs = sec_coeffs + idx * sec_padded;
             sec_firs[idx].n_taps = sec_padded;
-            sec_firs[idx].delay_line = (double *)calloc(sec_padded, sizeof(double));
+            sec_firs[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
     /* 2c. 初级路径 FIR (R=0, 持久延迟线 — 跨 chunk 连续) */
@@ -235,8 +237,8 @@ int main(int argc, char **argv)
     for (int e = 0; e < E; e++) {
         pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path + e * 2 * PRI_LEN;
         pri_firs[e].n_taps = pri_raw_firs[e].n_taps = PRI_LEN;
-        pri_firs[e].delay_line     = (double *)calloc(PRI_LEN, sizeof(double));
-        pri_raw_firs[e].delay_line = (double *)calloc(PRI_LEN, sizeof(double));
+        pri_firs[e].delay_line     = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
+        pri_raw_firs[e].delay_line = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
         pri_firs[e].ptr = pri_raw_firs[e].ptr = 0;
     }
 
@@ -246,12 +248,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); return 1;
     }
     /* R-4: CNN K vs scene_defs K 交叉校验 */
-    { extern int cnn_m5_get_K(void);
-      if (cnn_m5_get_K() != sc.K) {
+    if (cnn_m5_get_K() != sc.K) {
         fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
                 cnn_m5_get_K(), sc.K);
         return 1;
-      }
     }
 
     /* 2e. FxNLMS */
@@ -282,7 +282,7 @@ int main(int argc, char **argv)
        注意: 不做峰值归一化 (实时版 ADC 输入无归一化) */
     float *ref_filt_all = (float *)malloc(N * sizeof(float));
     {
-        fir_filter_t bp_tmp = { bp_fir.coeffs, (double *)calloc(BP_LEN, sizeof(double)), BP_LEN, 0 };
+        fir_filter_t bp_tmp = { bp_fir.coeffs, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
         for (int i = 0; i < N; i++) {
             float rs = ref[i] * cfg.mic_pre_gain;
             if      (rs >  1.0f) rs =  tanhf(rs);
@@ -300,7 +300,7 @@ int main(int argc, char **argv)
             int idx = e * S + s;
             sec_firs_err[idx].coeffs = sec_coeffs + idx * sec_padded;
             sec_firs_err[idx].n_taps = sec_padded;
-            sec_firs_err[idx].delay_line = (double *)calloc(sec_padded, sizeof(double));
+            sec_firs_err[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
     /* 误差麦带通 FIR (匹配实时版 bp_err[E]) */
@@ -308,7 +308,7 @@ int main(int argc, char **argv)
     for (int e = 0; e < E; e++) {
         bp_err[e].coeffs = bp_coeff;
         bp_err[e].n_taps = BP_LEN;
-        bp_err[e].delay_line = (double *)calloc(BP_LEN, sizeof(double));
+        bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t));
         bp_err[e].ptr = 0;
     }
 
@@ -346,7 +346,8 @@ int main(int argc, char **argv)
 
     printf("\n%4s | %5s | %6s | %6s | %6s | %7s | %6s | %s\n",
            "Sec", "Scene", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
-    for (int i = 0; i < 85; i++) printf("-"); printf("\n");
+    for (int i = 0; i < 85; i++) printf("-");
+    printf("\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
@@ -367,59 +368,37 @@ int main(int argc, char **argv)
         char action[20] = "-";
         int first_sec = (cur_scene_id < 0);
         if (first_sec) {
-            memcpy(scene_wc[new_scene], wc_cur, S*L*sizeof(float));
-            scene_wc_valid[new_scene] = 1;
-            cur_scene_id = new_scene;
+            /* C1: 使用共享函数初始化场景记忆 + wc_init_max */
+            sm_first_sec_init((float *)scene_wc, scene_wc_valid,
+                              &cur_scene_id, new_scene,
+                              wc_cur, S * L, &wc_init_max);
             memcpy(anchor_probs, probs, K * sizeof(float));
             fxnlms_set_wc(&fx, wc_cur);
-            {   float mx = 0;
-                for (int i = 0; i < S*L; i++) {
-                    float a = fabsf(wc_cur[i]); if (a > mx) mx = a; }
-                wc_init_max = (mx > 0.001f) ? mx : 0.01f;
-            }
             snprintf(action, sizeof(action), "INIT");
             /* 自动增益标定 (匹配实时版) */
             if (!getenv("GFANC_MIC_GAIN")) {
-                float auto_gain = 0.03f / (sqrtf(acc_ref / (len + 1e-10f)) + 1e-10f);
+                float auto_gain = TARGET_REF_RMS / (sqrtf(acc_ref / (len + 1e-10f)) + 1e-10f);
                 if (auto_gain < 1.0f) auto_gain = 1.0f;
                 if (auto_gain > 5.0f) auto_gain = 5.0f;
                 cfg.mic_pre_gain = auto_gain;
             }
         } else {
             /* S-1: cos(anchor, cur) 替代 cos(prev, cur) */
-            float dot = 0, np = 0, nc = 0;
-            for (int k = 0; k < K; k++) {
-                dot += anchor_probs[k] * probs[k];
-                np  += anchor_probs[k] * anchor_probs[k];
-                nc  += probs[k] * probs[k];
-            }
-            float cos_sim = dot / (sqrtf(np) * sqrtf(nc) + 1e-10f);
+            float cos_sim = sm_cos_sim(anchor_probs, probs, K);
 
             /* P4: 场景切换滞回 — 候选需连续3帧一致 */
-            if (cos_sim < cfg.switch_threshold && new_scene != cur_scene_id) {
-                if (new_scene == scene_cand) scene_cand_cnt++;
-                else { scene_cand = new_scene; scene_cand_cnt = 1; }
-                if (scene_cand_cnt >= 3) {
-                    /* 保存旧场景 Wc */
-                    memcpy(scene_wc[cur_scene_id], fx.wc, S*L*sizeof(float));
-                    scene_wc_valid[cur_scene_id] = 1;
-                    /* 恢复新场景 Wc */
-                    if (scene_wc_valid[new_scene])
-                        memcpy(wc_cur, scene_wc[new_scene], S*L*sizeof(float));
-                    else {
-                        memcpy(scene_wc[new_scene], wc_cur, S*L*sizeof(float));
-                        scene_wc_valid[new_scene] = 1;
-                    }
-                    memcpy(wc_old, fx.wc, S*L*sizeof(float));
-                    fade_cnt = cfg.fade_len;
-                    memcpy(anchor_probs, probs, K * sizeof(float));
-                    cur_scene_id = new_scene;
-                    converged_frames = 0;
-                    scene_cand = -1; scene_cand_cnt = 0;
-                    snprintf(action, sizeof(action), "RESET");
-                }
-            } else {
-                scene_cand = -1; scene_cand_cnt = 0;
+            if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
+                                       new_scene, cur_scene_id,
+                                       &scene_cand, &scene_cand_cnt, 3)) {
+                /* C1: 使用共享场景切换 */
+                int restored = sm_scene_switch_execute(
+                    (float *)scene_wc, scene_wc_valid,
+                    &cur_scene_id, new_scene,
+                    fx.wc, wc_cur, wc_old, S * L);
+                fade_cnt = cfg.fade_len;
+                memcpy(anchor_probs, probs, K * sizeof(float));
+                converged_frames = 0;
+                snprintf(action, sizeof(action), restored ? "RESET(mem)" : "RESET");
             }
         }
         memcpy(sc.prev_probs, probs, K * sizeof(float));
@@ -519,20 +498,12 @@ int main(int argc, char **argv)
         diverged = (pa > 9.0f * pe && anti_rms > 0.05f && nr_est < 0.0f);
 
         /* 收敛检测: 基于已知真值NR (离线更可靠) */
-        if (nr_true > cfg.nr_converge_db && !diverged) {
-            converged_frames++;
-            if (converged_frames >= 3) {
-                memcpy(scene_wc[cur_scene_id], fx.wc, S*L*sizeof(float));
-                scene_wc_valid[cur_scene_id] = 1;
-                converged_frames = 0;
-                float mx = 0;
-                for (int i = 0; i < S*L; i++) {
-                    float a = fabsf(fx.wc[i]); if (a > mx) mx = a; }
-                if (mx > 0.001f) wc_init_max = mx;
-            }
-        } else {
-            converged_frames = 0;
-        }
+        /* C1: 使用共享收敛检测 (离线版用 nr_true, 实时版用 nr_level) */
+        sm_check_convergence(nr_true, cfg.nr_converge_db,
+                             0/*safety_mute*/, diverged,
+                             &converged_frames,
+                             (float *)scene_wc, cur_scene_id,
+                             fx.wc, S * L, &wc_init_max);
 
         /* 输出: 诚实NR(匹配实时) + 已知真值NR(Pri模型) */
         char nr_est_str[20], nr_true_str[20];
@@ -553,7 +524,8 @@ int main(int argc, char **argv)
     clock_t t1 = clock();
     double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
 
-    for (int i = 0; i < 85; i++) printf("-"); printf("\n");
+    for (int i = 0; i < 85; i++) printf("-");
+    printf("\n");
     printf("  Avg |                           | %6s | %6.1f |\n", "", sum_nr_db / n_sec);
     printf("  NR_est = 诚实NR(匹配实时版) | NR_true = 已知真值NR(Pri模型, 仅离线可用)\n");
     printf("\nProcessing: %.1fs for %.1fs audio (%.1fx)\n", elapsed, (double)N / FS, (double)N / FS / elapsed);

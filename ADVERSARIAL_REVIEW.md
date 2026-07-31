@@ -1,6 +1,7 @@
 # GFANC FxNLMs 对抗性审查报告
 
 > **审查日期**: 2026-07-30  
+> **修复批次**: 2026-07-31 commit `a3ed34b` (C1/C2/C3/R-58 + R-22/R-29/R-19/R-23, 共 8 项)  
 > **审查范围**: 架构设计 / 算法 / 可维护性 / 可移植性 / 可量产性 / 实时性  
 > **审查方式**: 纯代码审查（未阅读 docs/ 下任何文件）  
 > **项目目标**: 窗户开口处主动降噪（声压→0），噪声类型：马路/铁路/儿童玩耍  
@@ -187,6 +188,8 @@ DFT 使用 256 点 FFT（实际是逐个 bin 的 DFT），频率分辨率 = 1600
 
 场景管理状态机、Wc 发散检测、收敛判定逻辑在离线版和实时版中各实现了一遍。修改一个版本时另一个版本容易遗漏。
 
+> ✅ **已修复 (2026-07-31)**: 新建 `include/scene_manager.h`，提取 7 个共享纯函数 (sm_cos_sim, sm_wc_max_abs, sm_scene_switch_execute, sm_first_sec_init, sm_check_divergence, sm_check_convergence, sm_check_scene_switch)。main.c 和 main_realtime.c 同步重构，净减少 ~60 行重复代码。
+
 #### C2. 【中等】CNN 模块使用全局静态变量
 
 ```c
@@ -197,6 +200,8 @@ static float *g_cnn_buf = NULL;
 
 这使 CNN 模块不可重入——无法在同一进程中运行两个独立的 ANC 实例（如多窗户场景）。`static int b_len` 的持久化存在同样的重入问题。
 
+> ✅ **已修复 (2026-07-31)**: 新建 `include/cnn_m5_forward.h` (cnn_instance_t 实例化接口 + cnn_m5_* 向后兼容宏)。`src/cnn_m5_forward.c` 重构为实例化 API (全局 g_cnn/g_K/g_cnn_buf → cnn_instance_t 字段)。scene_controller.c 移除 extern 声明，改用标准头文件。cleanup 路径新增 cnn_m5_free() 调用。
+
 #### C3. 【低】magic number 散布在代码中
 
 - Wc 初始 RMS 目标 `0.03f` 直接硬编码在 `main_realtime.c:854`
@@ -205,6 +210,8 @@ static float *g_cnn_buf = NULL;
 - `0.004f` 的 out_gain slew rate（main_realtime.c:398）
 
 这些值应纳入 `gfanc_config_t` 或至少以 `#define` 集中管理。
+
+> ✅ **已修复 (2026-07-31)**: `WC_MUTE_DECAY(4e-5f)` + `OUT_GAIN_SLEW(0.004f)` 集中为 #define (main_realtime.c)；`TARGET_REF_RMS(0.03f)` 提取到 gfanc_types.h (main.c + main_realtime.c 共享)；新增 `GFANC_WC_TARGET` env var (R-58) 消除 wc_rms_target 硬编码。
 
 #### C4. 【低】测试覆盖率极低
 
@@ -242,6 +249,8 @@ static float *g_cnn_buf = NULL;
 
 这种不一致的同步策略在 ARM 或其他非 x86 平台上可能引入数据竞争。
 
+> ✅ **已修复 (2026-07-31, `a3ed34b`)**: 新建 `include/os_atomic.h` — Win32 Interlocked / C11 stdatomic / GCC `__atomic_*` 三后端统一的原子操作抽象层。提供 `gf_atomic_exchange_add`/`exchange`/`decrement`/`increment`。Phase-2 ARM Linux 迁移时只需 `-DGFANC_ATOMIC_C11`。
+
 #### D3. 【中等】`double` 精度 FIR 延迟线
 
 ```c
@@ -249,6 +258,8 @@ double *delay_line;  // 在 fir_filter_t 中
 ```
 
 在 `gfanc_types.h` 中 `fir_filter_t` 使用 `double` 精度延迟线，理由是"匹配 Python scipy float64"。这对 PC 平台不是问题，但对于嵌入式 DSP（如 ARM Cortex-M7 单精度 FPU），double 运算需要软件模拟，速度慢 10-100×。
+
+> ✅ **已修复 (2026-07-31, `a3ed34b`)**: 新增 `gfanc_delay_t` typedef + `GFANC_FLOAT_DELAY` 编译开关。PC 保持 double（默认），MCU 端 `-DGFANC_FLOAT_DELAY` 切换为 float32。`fir_filter.c` + main.c/main_realtime.c/test 全部 `(double*)calloc`→`(gfanc_delay_t*)calloc`。
 
 #### D4. 【低】GCC 特定的 `__VA_ARGS__` 扩展
 
@@ -430,6 +441,8 @@ CNN 推理在主线程中执行，不影响音频回调。8ms 的推理时间对
 | P2 | 算法 | K 从 3 增加到 5-8，提升场景分辨能力 | 中（需重新训练 CNN） |
 | P2 | 算法 | 反馈路径使用在线自适应 FIR（与 ANC 同时运行） | 中 |
 | P2 | 可移植 | 将平台相关代码抽象为 HAL 层（Audio, OS, Thread） | 大 |
-| P3 | 可维护 | 提取 main.c 和 main_realtime.c 的共享逻辑到 scene_manager.c | 中 |
+| P3 | 可维护 | ~~提取 main.c 和 main_realtime.c 的共享逻辑到 scene_manager.c~~ ✅ 已完成 (2026-07-31) | 中 |
+| P3 | 可维护 | ~~magic number 集中管理~~ ✅ 已完成 (2026-07-31) | 低 |
+| P3 | 可维护 | ~~CNN 模块实例化 (消除全局静态变量)~~ ✅ 已完成 (2026-07-31) | 中 |
 | P3 | 可维护 | 改善测试覆盖率（发散保护、场景切换、边界条件） | 中 |
 | P3 | 量产 | 配置文件替代环境变量 + OTA 更新支持 | 中 |

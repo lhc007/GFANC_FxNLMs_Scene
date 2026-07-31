@@ -7,10 +7,29 @@
 
 typedef float gfanc_float_t;
 
-/* FIR 滤波器 (double 精度延迟线, 匹配 Python scipy float64) */
+/* ── 维度编译期上限 (R-22: 消除 VLA, R-29: 统一硬编码源头) ── */
+#define GFANC_E_MAX  5    /* 误差麦最大数量 (当前 3, 目标 1×5×4=5) */
+#define GFANC_S_MAX  4    /* 扬声器最大数量 (当前 2, 目标 1×5×4=4) */
+#define GFANC_L_MAX  2048 /* 滤波器最大长度 (当前 1024) */
+#define GFANC_K_MAX  16   /* 场景最大数量 (SC_K_MAX, 已存在于 scene_controller.h) */
+#define GFANC_C_MAX  15   /* 子滤波器最大数量 (SC_C, 已存在于 scene_controller.h) */
+
+/* FIR 滤波器.
+ *
+ *  延迟线精度:
+ *    - 默认 double (匹配 Python scipy float64, x86/A72 硬件支持).
+ *    - 定义 GFANC_FLOAT_DELAY 切换为 float32 (Phase-3 MCU/DSP:
+ *      Cortex-M 无双精度 FPU, double 软浮点 10-30× 减速 + RAM 翻倍).
+ *    - 建议 x86/A72 保持 double; 仅在 MCU 上启用此开关. */
+#ifdef GFANC_FLOAT_DELAY
+typedef float  gfanc_delay_t;
+#else
+typedef double gfanc_delay_t;
+#endif
+
 typedef struct {
     gfanc_float_t *coeffs;
-    double        *delay_line;
+    gfanc_delay_t *delay_line;
     int            n_taps;
     int            ptr;
 } fir_filter_t;
@@ -21,6 +40,9 @@ typedef struct {
 #define LOG_INFO(fmt, ...)  printf(  "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) /* disabled in release */ ((void)0)
 
+/* ── 算法常数 (非用户调节, 表达物理/设计约束) ── */
+#define TARGET_REF_RMS  0.03f   /* 自动增益标定目标 ref RMS (-30dBFS) */
+
 /* ── 集中参数 (A2): 所有可调参数一处管理 ── */
 typedef struct {
     /* 音频链 */
@@ -30,6 +52,7 @@ typedef struct {
     /* ANC 自适应 */
     float step_size;             /* LMS 步长 μ */
     float leak;                  /* 泄漏因子 */
+    float wc_rms_target;         /* Wc 初始 RMS 目标 (env: GFANC_WC_TARGET) */
     int   fade_len;              /* CrossFader 过渡样本数 */
     int   ramp_ms;               /* 冷启动 ramp 时长 ms */
     int   mute_hold_ms;          /* safety_mute 抑制时长 ms */
@@ -59,6 +82,7 @@ typedef struct {
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
     0.0000005f, 5e-6f,  /* step_size, leak */ \
+    0.03f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET) */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
     30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
@@ -80,6 +104,7 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_FREEZE_RATIO"))) cfg->freeze_ratio = (float)atof(s);
     if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
+    if ((s = getenv("GFANC_WC_TARGET")))  cfg->wc_rms_target = (float)atof(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

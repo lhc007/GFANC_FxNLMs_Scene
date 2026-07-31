@@ -9,8 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include "scene_controller.h"
-
-extern int cnn_m5_forward(const float *audio, float *logits);
+#include "cnn_m5_forward.h"
 
 int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
                      const float *sub_filters, int filter_len,
