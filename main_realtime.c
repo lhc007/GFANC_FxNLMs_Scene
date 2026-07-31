@@ -860,10 +860,10 @@ int main(void) {
         ret = 1; goto cleanup;
     }
     /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
-       anti ≈ Wc_RMS × ref_filt × √L. Wc_RMS=0.03: ref=0.05→anti≈0.05 (几乎无声).
-       安静房间无外部噪声时 Wc 不会自行增长; 有噪声后 LMS 在 10-30s 内收敛到工作点.
-       收敛后 scene_wc 记忆保存正确幅值, 下次切回直接恢复 (不经过此保守初始值).
-       可通过 GFANC_WC_TARGET 环境变量覆盖 (网格搜索标定结果). ── */
+       anti ≈ Wc_RMS × ref_filt × √L. 默认 0.01: ref=0.025→anti≈0.008 (−42dBFS).
+       几乎无声, 确保噪声突增时不会饱和; LMS 在 10-30s 内自行收敛到工作点.
+       收敛后 scene_wc 保存正确幅值, 切回直接恢复 (不经过此保守值).
+       通过 GFANC_WC_TARGET 环境变量覆盖. ── */
     {
         float wc_target = cfg.wc_rms_target;
         if (wc_target < 0.005f) wc_target = 0.005f;
