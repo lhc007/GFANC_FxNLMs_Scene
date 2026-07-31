@@ -20,7 +20,7 @@ typedef struct {
     float  stub_rms;
     float  wc_rms_target;        /* 自动标定: Wc 构造目标 RMS (基于 Ŝ 物理衰减) */
     int    cur_scene;
-    float *prev_probs;         /* [K] 动态分配 */
+    float  prev_probs[SC_K_MAX];  /* [K] R-24: 定长数组替代动态分配 (最多64B) */
 } scene_ctrl_t;
 
 /** @param n_centroids  scene_defs.bin 总 float 数 (K * S * C) */

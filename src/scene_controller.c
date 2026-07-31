@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "gfanc_types.h"
 #include "scene_controller.h"
 #include "cnn_m5_forward.h"
 
@@ -26,13 +27,15 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     sc->sub_filters = sub_filters;
     sc->L           = filter_len;
     sc->cur_scene   = -1;
-    sc->prev_probs  = (float *)calloc(sc->K, sizeof(float));
-    if (!sc->prev_probs) return -1;
+    /* R-24: prev_probs 改为定长数组 (SC_K_MAX floats in struct), 无需动态分配 */
+    memset(sc->prev_probs, 0, sizeof(sc->prev_probs));
 
-    /* stub RMS: 所有子滤波器等权求和 → RMS */
+    /* stub RMS: 所有子滤波器等权求和 → RMS.
+       R-24: 静态临时缓冲 (init 期一次性使用, ≤32KB) */
     int L = filter_len;
-    float *stub = (float *)calloc(S * L, sizeof(float));
-    if (!stub) { free(sc->prev_probs); return -1; }
+    static float stub_buf[GFANC_S_MAX * GFANC_L_MAX];
+    float *stub = stub_buf;
+    memset(stub, 0, S * L * sizeof(float));
     for (int c = 0; c < C; c++)
         for (int s = 0; s < S; s++)
             for (int l = 0; l < L; l++)
@@ -41,33 +44,37 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *centroids,
     for (int i = 0; i < S * L; i++) ss += stub[i] * stub[i];
     sc->stub_rms = sqrtf(ss / (S * L));
     sc->wc_rms_target = sc->stub_rms;  /* 默认值, 实时版按 Ŝ 物理特性覆盖 */
-    free(stub);
     return 0;
 }
 
 void scene_ctrl_free(scene_ctrl_t *sc)
 {
-    free(sc->prev_probs);
-    sc->prev_probs = NULL;
+    /* R-24: prev_probs 为定长数组, 无需释放. 此处保留为 no-op 供将来扩展. */
+    (void)sc;
 }
 
 /* 概率加权混合 Wc: wc_out = Σ_k probs[k] * Wc_k / Σ probs[k]
-   (忽略 <5% 的低概率场景以节省计算, 不影响总权重归一化) */
+   (忽略 <5% 的低概率场景以节省计算, 不影响总权重归一化)
+   R-24: 临时缓冲区改为静态 (消除每秒 malloc/free, S*L≤8192 floats=32KB). */
 static void scene_ctrl_blend_wc(const scene_ctrl_t *sc, const float *probs,
                                  float *wc_out)
 {
     int K = sc->K, S = SC_S, C = SC_C, L = sc->L;
     int n = S * L;
 
-    /* 复用临时缓冲区 (单场景 Wc 构造用, K 次调用共享) */
-    float *wc_k = (float *)malloc(n * sizeof(float));
-    if (!wc_k) {
-        /* OOM 回退: argmax + 单场景 Wc */
+    /* R-24: 静态临时缓冲区 (单场景 Wc 构造用, K 次调用共享).
+       最大 S*L = GFANC_S_MAX * GFANC_L_MAX = 4*2048 = 8192 floats = 32KB.
+       单调用者 (主线程), 无重入风险. */
+    static float wc_k_buf[GFANC_S_MAX * GFANC_L_MAX];
+
+    if (n > (int)(sizeof(wc_k_buf) / sizeof(wc_k_buf[0]))) {
+        /* 理论上不会发生: S*L 超过缓冲上限. 回退到 argmax 单场景. */
         int best = 0;
         for (int k = 1; k < K; k++) if (probs[k] > probs[best]) best = k;
         scene_ctrl_construct_wc(sc, best, wc_out);
         return;
     }
+    float *wc_k = wc_k_buf;
 
     memset(wc_out, 0, n * sizeof(float));
     float total_weight = 0.0f;
@@ -88,8 +95,6 @@ static void scene_ctrl_blend_wc(const scene_ctrl_t *sc, const float *probs,
         for (int k = 1; k < K; k++) if (probs[k] > probs[best]) best = k;
         scene_ctrl_construct_wc(sc, best, wc_out);
     }
-
-    free(wc_k);
 }
 
 int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
@@ -119,13 +124,15 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
         return 0;
     }
 
-    float *cnn_in = (float *)malloc(16000 * sizeof(float));
+    /* R-24: CNN 输入缓冲改为静态 (消除每秒 64KB malloc/free).
+       单调用者 (主线程), 无重入风险. */
+    static float cnn_in_buf[16000];
+    float *cnn_in = cnn_in_buf;
     for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
 
     /* CNN 前向 */
     float logits[SC_K_MAX];
     int cnn_ret = cnn_m5_forward(cnn_in, logits);
-    free(cnn_in);
 
     if (cnn_ret != 0) {
         /* CNN 推理失败 (malloc 失败等), 保持上一帧概率分布 */
