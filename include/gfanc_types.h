@@ -81,10 +81,9 @@ typedef struct {
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
-    0.0000005f, 2e-5f,  /* step_size, leak. R-58: leak 5e-6→2e-5 适配实测 Ŝ (μ_eff 4×, 需更强正则化防 Wc 漂移) */ \
-    0.005f,             /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
-                           配合实测 Ŝ (RMS≈0.02): ref=0.17→anti≈0.03, 留足headroom.
-                           LMS 会在10-30s 内自行收敛到工作点. */ \
+    0.0000005f, 5e-6f,  /* step_size, leak */ \
+    0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
+                           Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
     30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
