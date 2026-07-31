@@ -51,8 +51,9 @@ static float biquad_tick(biquad_t *f, float x)
 #define E        3
 #define S        2
 #define L        1024
-#define BP_LEN   1024
-#define SEC_LEN  1024
+#define BP_LEN       1024   /* CNN 带通 (分类需频率分辨率) */
+#define BP_ANC_LEN   256    /* R-13: ANC 带通 (群延迟 8ms vs 32ms, 宽带NR+3-5dB) */
+#define SEC_LEN      1024
 /* DSP_DELAY 由 cfg.dsp_delay 管理, 默认 16, 环境变量 GFANC_DSP_DELAY 可覆盖 */
 /* R-9: 以下参数统一由 cfg (gfanc_config_t) 管理, env 变量可直接生效
    GFANC_RAMP_MS / GFANC_MUTE_MS / GFANC_FADE_LEN / GFANC_MIC_GAIN */
@@ -73,10 +74,12 @@ typedef struct {
     /* ANC 模块 */
     scene_ctrl_t  sc;
     fxnlms_mimo_t fx;
-    fir_filter_t  bp_fir;        /* ref 带通 */
-    fir_filter_t  bp_err[E];     /* err 带通 */
+    fir_filter_t  bp_fir;        /* ref 带通 CNN (1024tap, 分类用) */
+    fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (256tap, 群延迟8ms) */
+    fir_filter_t  bp_err[E];     /* err 带通 ANC (256tap) */
     fir_filter_t *sec_firs;      /* [E*S] 次级路径 */
     float        *sec_coeffs;
+    float        *bp_anc_coeffs; /* R-13: ANC 带通系数 (256tap, 与 CNN 1024tap 独立) */
 
     /* 反馈抵消 (逐扬声器独立 FIR, F-G修复) */
     fir_filter_t     fb_fir[GFANC_S_MAX];      /* [spk] 扬声器→参考麦反馈路径 FIR */
@@ -218,13 +221,17 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         if      (ref_sample >  MIC_CLIP_MAX) ref_sample =  tanhf(ref_sample);
         else if (ref_sample < -MIC_CLIP_MAX) ref_sample = -tanhf(-ref_sample);
 
-        /* 带通滤波 (预增益已应用, 不造成反馈) */
-        float ref_filt = fir_tick(&ctx->bp_fir, ref_sample);
+        /* 带通滤波 (预增益已应用, 不造成反馈).
+           R-13: CNN 和 ANC 使用不同长度的带通滤波器.
+           CNN 保留 1024tap (分类需要频率分辨率),
+           ANC 使用 256tap (群延迟 32→8ms, 宽带 NR+3-5dB). */
+        float ref_cnn = fir_tick(&ctx->bp_fir, ref_sample);
+        float ref_anc = fir_tick(&ctx->bp_fir_anc, ref_sample);
 
         /* CNN 累积 */
         /* CNN 双缓冲: 填满一块→原子标记就绪→切到另一块 */
         if (ctx->cnn_cnt < FS_ANC) {
-            ctx->cnn_buf[ctx->cnn_fill_idx][ctx->cnn_cnt++] = ref_filt;
+            ctx->cnn_buf[ctx->cnn_fill_idx][ctx->cnn_cnt++] = ref_cnn;
             if (ctx->cnn_cnt >= FS_ANC) {
                 /* R-20: 检测主线程超1s未消费 → 记录丢帧 */
                 if (ctx->cnn_buf_ready >= 0) ctx->cnn_drop_cnt++;
@@ -243,11 +250,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 memcpy(ctx->fx.wc, ctx->wc_cur, S*L*sizeof(float));
         }
 
-        /* Fx = Sec ⊗ ref_filt */
+        /* R-13: Fx = Ŝ ⊗ ref_anc (256tap 带通, 群延迟 8ms) */
         float Fx_arr[E*S];
         for (int e = 0; e < E; e++)
             for (int s = 0; s < S; s++)
-                Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_filt);
+                Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_anc);
 
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
         float err_meas[E];
@@ -260,11 +267,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
         }
 
-        /* FxNLMS 实时路径: anti=Wc⊗ref, 梯度用err_meas直接驱动 (不合成err)
+        /* FxNLMS 实时路径: anti=Wc⊗ref_anc, 梯度用err_meas直接驱动 (不合成err)
            R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路. */
         if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
             || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
-            fxnlms_forward_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
+            fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
             /* 静音/啸叫期间 Wc 持续衰减 — 反馈事件后 Wc 自行退回到安全区 */
             if (ctx->safety_mute || ctx->peak_mute
                 || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
@@ -272,7 +279,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= dk;
             }
         } else {
-            fxnlms_tick_rt(&ctx->fx, ref_filt, Fx_arr, err_meas, anti_spk);
+            fxnlms_tick_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
         }
 
         /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
@@ -288,6 +295,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->nan_out_hold++;
             if (ctx->nan_out_hold > FS_ANC) {
                 fir_reset(&ctx->bp_fir);
+                fir_reset(&ctx->bp_fir_anc);  /* R-13 */
                 for (int e = 0; e < E; e++) fir_reset(&ctx->bp_err[e]);
                 for (int i = 0; i < E*S; i++) fir_reset(&ctx->sec_firs[i]);
                 for (int s = 0; s < S; s++)
@@ -335,7 +343,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         ctx->acc_ch[0] += ref_raw * ref_raw;
         for (int e = 0; e < E; e++)
             ctx->acc_ch[1+e] += ctx->err_buf[n*E+e] * ctx->err_buf[n*E+e];
-        ctx->acc_ref += ref_filt * ref_filt;
+        ctx->acc_ref += ref_cnn * ref_cnn;  /* CNN 带通参考 (诊断用) */
         ctx->acc_fb  += fb_est * fb_est;
         for (int e = 0; e < E; e++) {
             ctx->acc_err  += err_meas[e] * err_meas[e];
@@ -689,6 +697,10 @@ int main(void) {
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
     int n_scene = bin_load_float("data/scene_defs.bin", &centroids);
     int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
+    /* R-13: 尝试加载 ANC 专用短带通 (256tap). 无文件时截取 1024tap 前 256 点作为近似. */
+    float *bp_anc_coeff = NULL;
+    int bp_anc_loaded = bin_load_float("data/bandpass_anc.bin", &bp_anc_coeff);
+    int bp_anc_ok = (bp_anc_loaded >= BP_ANC_LEN);
 
     if (sec_len < E*S*SEC_LEN) {
         fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
@@ -735,12 +747,28 @@ int main(void) {
     ctx->running = 1; ctx->first_sec = 1;
     InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));  /* 启动抑制 safety_mute */
 
+    /* ── R-13: CNN 带通 1024tap (分类用) ── */
     ctx->bp_fir.coeffs = bp_coeff; ctx->bp_fir.n_taps = BP_LEN;
     ctx->bp_fir.delay_line = (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t));
     if (!ctx->bp_fir.delay_line) { fprintf(stderr, "OOM: bp_fir\n"); ret = 1; goto cleanup; }
+
+    /* ── R-13: ANC 带通 256tap (群延迟 32→8ms) ── */
+    {
+        float *anc_coeff = bp_anc_ok ? bp_anc_coeff : bp_coeff;  /* 回退: 1024tap 截断 */
+        ctx->bp_fir_anc.coeffs = anc_coeff; ctx->bp_fir_anc.n_taps = BP_ANC_LEN;
+        ctx->bp_fir_anc.delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
+        if (!ctx->bp_fir_anc.delay_line) { fprintf(stderr, "OOM: bp_fir_anc\n"); ret = 1; goto cleanup; }
+        ctx->bp_anc_coeffs = bp_anc_ok ? bp_anc_coeff : NULL;  /* 仅当独立文件时持有所有权 */
+        printf("  BP ANC: %s (%dtap, gd=%.1fms vs 1024tap gd=32ms)\n",
+               bp_anc_ok ? "bandpass_anc.bin" : "fallback(1024tap truncated)",
+               BP_ANC_LEN, (BP_ANC_LEN-1)/(2.0f*FS_ANC)*1000.0f);
+    }
+
+    /* ── R-13: 误差带通 256tap (ANC 通路, 与 ref_anc 一致) ── */
     for (int e = 0; e < E; e++) {
-        ctx->bp_err[e].coeffs = bp_coeff; ctx->bp_err[e].n_taps = BP_LEN;
-        ctx->bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t));
+        float *ec = bp_anc_ok ? bp_anc_coeff : bp_coeff;
+        ctx->bp_err[e].coeffs = ec; ctx->bp_err[e].n_taps = BP_ANC_LEN;
+        ctx->bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
         if (!ctx->bp_err[e].delay_line) { fprintf(stderr, "OOM: bp_err[%d]\n", e); ret = 1; goto cleanup; }
     }
 
@@ -984,6 +1012,8 @@ cleanup:
     if (ctx) {
         FILE *lf = ctx->log_file;  /* R-10: free(ctx) 前取出, 避免 use-after-free */
         free(ctx->bp_fir.delay_line);
+        free(ctx->bp_fir_anc.delay_line);  /* R-13 */
+        free(ctx->bp_anc_coeffs);          /* R-13: bandpass_anc.bin 所有权 */
         for (int e = 0; e < E; e++) free(ctx->bp_err[e].delay_line);
         if (ctx->sec_firs) {
             for (int i = 0; i < E*S; i++) free(ctx->sec_firs[i].delay_line);
