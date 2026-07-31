@@ -280,7 +280,9 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 ├─ 辅助 ───────────────────────────────────────────────────────┤
 │                                                               │
 │  反馈抵消: fb_fir[2] FIR(256tap) 逐扬声器校准                  │
-│  啸叫检测: DFT 256pt + IIR notch ×2, 15dB阈值                 │
+│  啸叫检测: DFT 256pt + IIR notch ×2, 可配阈值 (默认10dB)       │
+│  在线Ŝ辨识: sec_online NLMS, μ=5e-6, 零探测噪声                │
+│  冷启动保护: cold_hold 2s anti±0.12硬限幅 + wc_cold_start衰减  │
 │  anti_total = anti_ff + anti_fb → 限幅±1.0 → ZOH×3 → DAC     │
 │                                                               │
 └──────────────────────────────────────────────────────────────┘
@@ -295,6 +297,38 @@ Feedback spk1: 256 taps, RMS=0.0006
 ```
 
 文件缺失时反馈抵消自动禁用，日志显示 `Feedback cancel: disabled`，不影响降噪但可能引发啸叫。
+
+## 次级路径测量（Python，Farina 扫频法）
+
+提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦：
+
+```bash
+python export/measure_secondary.py --interactive   # 首次配置
+python export/measure_secondary.py                 # 日常测量
+python export/export_bin.py                        # 导出 .npy → data/*.bin
+```
+
+方法: Farina 2000 AES 指数扫频，5s 扫频 20-7500Hz，多次重复时域平均，自动反卷积提取脉冲响应。相比白噪声 NLMS 法，SNR 高 10-20dB，天然免疫时钟滑移。
+
+## 在线次级路径辨识
+
+系统启动后持续跟踪 Ŝ（扬声器→误差麦）的缓慢变化（温湿度、老化）：
+
+- **算法**: NLMS，μ=5e-6（极慢，~0.1%/s），零探测噪声
+- **激励**: 利用 ANC 自身 anti 输出作为宽带激励信号
+- **更新**: 仅在正常模式（非 mute/fade/howling）下更新 sec_coeffs 原地
+- **禁用**: `$env:GFANC_SEC_MU = "0"`
+
+## 冷启动保护
+
+首次进入某场景时，CNN 预设 Wc 可能与当前噪声不匹配，导致 anti 瞬时 overshoot（可闻嗡嗡）。两层保护：
+
+| 机制 | 参数 | 作用 |
+|------|------|------|
+| Wc 衰减 | `GFANC_WC_COLD` (默认 0.3) | CNN 预设 × 衰减系数，LMS 从低向上收敛 |
+| anti 硬限幅 | cold_hold 2s | 新场景前 2 秒 anti 上限 ±0.12，LMS 在安全范围收敛 |
+
+二次进入已收敛场景时跳过保护，直接恢复记忆 Wc，零延迟。
 
 ## 啸叫检测
 
@@ -317,16 +351,20 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 场景类型 (K) | 3 (运行时从数据推导) | CNN 可识别的噪声环境数 |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
-| 输入预增益 | 3x (+9.5dB) | MIC_PRE_GAIN, 可调 |
-| 步长 (μ) | 0.0001 | LMS 自适应步长 |
-| 泄漏因子 | 1e-6 (~1.5%/秒) | Wc 正则化, 与 step_size 解耦 |
+| 输入预增益 | 自适应 (env: GFANC_MIC_GAIN) | 自动标定到 TARGET_REF_RMS=0.03 |
+| 步长 (μ) | 5e-7 (基准, Ŝ RMS 自动缩放) | LMS 自适应步长 |
+| 泄漏因子 | 5e-6 (基准, Ŝ RMS 自动缩放) | Wc 正则化 |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
 | 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
-| Wc 发散阈值 | max\|Wc\| > 30×wc_init_max | 自动冻结 LMS 梯度 (自适应基准) |
+| 冷启动 Wc 衰减 | 0.3 (env: GFANC_WC_COLD) | CNN 预设衰减系数 |
+| 冷启动 anti 限幅 | ±0.12, 2s | cold_hold 防瞬时 overshoot |
+| Wc 发散救援 | anti_rms > 阈值持续 2s | 回滚 Wc + 重新 ramp |
+| Wc 发散冻结 | max\|Wc\| > 30×wc_init_max | 自动冻结 LMS 梯度 (自适应基准) |
+| 在线 Ŝ 辨识 | μ=5e-6 (env: GFANC_SEC_MU) | NLMS, 零探测噪声 |
 | 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
-| 啸叫陷波 | DFT 256pt, IIR ×2 | 15dB 峰均值阈值, 逐扬声器独立状态 |
+| 啸叫陷波 | DFT 256pt, IIR ×2 | 可配阈值 (env: GFANC_HW_THRESH, 默认 10dB) |
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
 | 回调预算 | ~30-45% (SIMD ~5-10%) | 已优化: 双段循环零取模, 含安全边际 |
 
@@ -339,13 +377,24 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick` 仿真路径 |
 | `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, 场景状态机 |
 | `src/scene_controller.c` | CNN M5 推理 → softmax → max 归一化 Blend → Wc 构造 (RMS 对齐) |
-| `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, Wc 发散冻结) |
-| `src/cnn_m5_forward.c` | M5 CNN 前向推理 (静态缓冲, 1Hz) |
-| `src/fir_filter.c` | FIR 滤波器 (双段线性循环, 零取模) |
+| `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) |
+| `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏) |
+| `src/fir_filter.c` | FIR 滤波器 (gfanc_delay_t 双精度累加) |
 | `src/howling_detect.c` | DFT 频谱峰值检测 + IIR 双二阶陷波 (逐扬声器独立状态) |
+| `src/sec_online.c` | 在线 Ŝ NLMS 辨识 (零探测噪声, 原地更新 sec_coeffs) |
 | `src/pa_loader.c` | PortAudio ASIO DLL 运行时加载 |
 | `src/calibrate_feedback.c` | 反馈路径 NLMS 校准 (逐扬声器, 16k ZOH×3 激励) |
-| `src/binary_loader.c` | .bin 二进制权重文件加载 |
+| `src/calibrate_secondary.c` | 次级路径 C 版白噪声校准 + 延迟/滑移诊断 |
+| `src/binary_loader.c` | .bin 二进制权重文件加载 (v2 格式, GFNC 头+CRC32) |
+| `include/gfanc_types.h` | 集中参数 + 分级日志 + 维度宏 |
+| `include/scene_manager.h` | 共享场景管理纯函数 (main.c + main_realtime.c 共用) |
+| `include/sec_online.h` | 在线 Ŝ 辨识 API |
+| `include/cnn_m5_forward.h` | CNN 实例化 API |
+| `export/export_bin.py` | PyTorch → C .bin 导出 |
+| `export/measure_secondary.py` | Python 次级路径测量 (Farina 扫频法) |
+| `export/measure_primary.py` | Python 初级路径测量 |
+| `export/measurement/` | 测量核心模块 (扫频生成/反卷积/质量检验) |
+| `GFANC_Scene/` | Python 项目 (训练代码 + 模型权重 + 声学路径测量数据) |
 
 ## 离线验证
 
