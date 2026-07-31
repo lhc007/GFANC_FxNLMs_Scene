@@ -829,9 +829,9 @@ int main(void) {
                 float fb_rms = 0;
                 for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
                 fb_rms = sqrtf(fb_rms / FB_LEN);
-                /* R-57: FIR RMS < 0.0005 时反馈抵消形同虚设, 加载无效 FIR
+                /* R-57: FIR RMS < 0.00005 时反馈抵消形同虚设, 加载无效 FIR
                    会在高增益下产生虚假 fb_est, 干扰 ref 信号. */
-                if (fb_rms < 0.0005f) {
+                if (fb_rms < 0.00005f) {
                     printf("  Feedback spk%d: RMS=%.6f too weak, skipping (re-run calibrate)\n", spk, fb_rms);
                     bin_free(fb_raw);
                     continue;
