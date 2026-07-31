@@ -279,6 +279,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             err_meas[e] = fir_tick(&ctx->bp_err[e], es);
         }
 
+        /* 自适应 leak: anti RMS 偏高时自动加强正则化, 防 Wc 慢性漂移.
+           平时 leak 不变, anti>0.06 时逐渐加大 (max 10×). 滞后释放防抖动. */
+        {   float ar = ctx->anti_rms;  /* 上一帧平滑值 */
+            float mult = 1.0f;
+            if      (ar > 0.15f) mult = 10.0f;
+            else if (ar > 0.10f) mult = 5.0f;
+            else if (ar > 0.06f) mult = 2.0f;
+            ctx->fx.leak = cfg.leak * mult;
+        }
+
         /* FxNLMS 实时路径: anti=Wc⊗ref_anc, 梯度用err_meas直接驱动 (不合成err)
            R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路. */
         if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
