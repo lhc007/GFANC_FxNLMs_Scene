@@ -124,7 +124,8 @@ typedef struct {
     volatile int peak_rollback_cnt; /* peak_mute 上升沿 Wc 减半次数 (主线程显示) */
     float  out_gain;              /* 静音包络 0..1 (slew~4ms, 替代硬切零, 消除开关咔哒声) */
     float  ref_env;               /* ref 包络 (~16ms), AGC 防饱和 */
-    int    diverge_sec;           /* anti_rms 连续超限秒数 (≥3s 触发 Wc 救援) */
+    volatile LONG cold_hold;     /* cold start anti 硬限幅保护, 2s 后释放 */
+    int    diverge_sec;           /* anti_rms 连续超限秒数 (≥2s 触发 Wc 救援) */
     volatile int diverged;        /* 1=当前处于发散态 (pa>>pe 且 anti 大), NR 显示 DIV */
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
     int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
@@ -314,6 +315,17 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
            驱动毛刺 → NaN 进入 FIR 延迟线 → 永久 NaN 输出 (延迟线无自恢复能力)
            看门狗: 连续 >1s NaN 输出 → 复位全部 FIR 延迟线 (memset+指针归零, <10μs) */
+        /* 冷启动 anti 硬限幅: 新场景首次 2s 内 caps 0.12,
+           防 CNN 预设 Wc 过强→瞬时 overshoot→可闻嗡嗡.
+           LMS 在限幅内安全收敛, 2s 后自动释放. */
+        if (ctx->cold_hold > 0) {
+            InterlockedDecrement(&ctx->cold_hold);
+            for (int s = 0; s < S; s++) {
+                if      (anti_spk[s] >  0.12f) anti_spk[s] =  0.12f;
+                else if (anti_spk[s] < -0.12f) anti_spk[s] = -0.12f;
+            }
+        }
+
         int nan_anti = 0;
         for (int s = 0; s < S; s++) {
             if (!isfinite(anti_spk[s])) { anti_spk[s] = 0.0f; nan_anti = 1; }
@@ -582,7 +594,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
        阈值随 mic_pre_gain 自适应收缩 (R-54). */
     float div_thresh = cfg.diverge_anti_rms / (cfg.mic_pre_gain > 0.1f ? cfg.mic_pre_gain : 1.0f);
     if (ctx->anti_rms > div_thresh) {
-        if (++ctx->diverge_sec >= 3) {
+        if (++ctx->diverge_sec >= 2) {
             if (ctx->scene_wc_valid[ctx->cur_scene_id])
                 memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
             else
@@ -592,9 +604,9 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
             ctx->diverge_sec = 0;
             ctx->peak_rollback_cnt = 0;
             if (ctx->log_file)
-                fprintf(ctx->log_file, "# EVENT: Wc RESCUE anti_rms=%.3f > %.2f x3s\n",
+                fprintf(ctx->log_file, "# EVENT: Wc RESCUE anti_rms=%.3f > %.2f x2s\n",
                         ctx->anti_rms, div_thresh);
-            printf("[WARN] anti_rms %.3f > %.2f for 3s — Wc rescued (rollback + ramp)\n",
+            printf("[WARN] anti_rms %.3f > %.2f for 2s — Wc rescued (rollback + ramp)\n",
                    ctx->anti_rms, div_thresh);
         }
     } else {
@@ -671,6 +683,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
     printf("  -> RESET s%d→s%d (%s)\n",
            ctx->cur_scene_id, new_scene,
            restored ? "restored adapted Wc" : "new scene, CNN preset");
+    if (!restored) InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);
 
     /* CrossFader + 保护重置 (实时版特有: Interlocked 跨线程) */
     InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
@@ -1005,6 +1018,7 @@ int main(void) {
             int init_ramp_ms = cfg.ramp_ms * 2;
             InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * init_ramp_ms / 1000));
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
+            InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);  /* 冷启动 anti 限幅 */
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
                    new_scene, probs[new_scene], init_ramp_ms, cfg.mute_hold_ms);
             /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */

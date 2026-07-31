@@ -1,0 +1,26 @@
+{
+  "input_device": 23,
+  "output_device": 23,
+  "output_device_map": {},
+  "spk_channels": [
+    0,
+    1
+  ],
+  "mic_channels": [
+    1,
+    2,
+    3
+  ],
+  "ref_mic_channels": [
+    0
+  ],
+  "source_channel": null,
+  "source_device": null,
+  "fs": 44100,
+  "target_fs": 16000,
+  "sweep_duration": 5.0,
+  "sweep_amplitude": 0.9,
+  "repetitions": 3,
+  "force_exclusive": false,
+  "timestamp": "2026-07-21T12:43:54.422444"
+}
