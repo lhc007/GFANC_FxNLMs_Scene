@@ -307,14 +307,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->nan_out_hold = 0;
         }
 
-        /* 峰值快检测: 连续10样本|anti|>0.95 → 立即静音 (CR-12, 0.6ms响应 vs 原1秒)
-           P0-1 极限环修复:
-           a) 触发上升沿 Wc×0.5 — 旧代码冻结 Wc, 解除静音瞬间必然再次饱和,
-              形成 0.5~2Hz 硬门控 ("嘟嘟嘟" 的直接来源); 减半后逐次指数收敛
-           b) 释放迟滞 160样本(10ms) — 旧代码单样本低于阈值即释放, 防抖 */
+        /* 峰值快检测: 连续10样本|anti|>0.99 → Wc×0.5 (仅真正clipping触发).
+           阈值从 0.95→0.99: 正常降噪时瞬时峰值可达 0.95, 频繁误触导致可闻嗡嗡.
+           软限幅(tanh→±1.0) + anti-windup(|anti|>1.2→200×leak) 已提供足够保护. */
         {   int peak = 0;
             for (int s = 0; s < S; s++)
-                if (fabsf(anti_spk[s]) > 0.95f) peak = 1;
+                if (fabsf(anti_spk[s]) > 0.99f) peak = 1;
             if (peak) {
                 ctx->peak_release_cnt = 0;
                 if (++ctx->peak_hold_cnt >= 10 && !ctx->peak_mute) {
