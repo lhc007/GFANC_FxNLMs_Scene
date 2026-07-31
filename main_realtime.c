@@ -218,13 +218,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                     fb_est += fir_tick(&ctx->fb_fir[s], anti_spk[s]);
         }
         /* AGC: 平滑包络追踪 ref 峰值, 突增时自动压低增益防饱和.
-           时间常数 ~16ms (attack fast), 最大衰减 20dB.
-           稳态噪声不受影响 (ref_env 稳定在目标以下). */
+           attack ~5ms (快), release ~50ms (慢, 防增益 pumping).
+           稳态噪声不受影响 (ref_env 稳定在阈值以下). */
         {   float ra = fabsf(ref_raw - fb_est);
-            ctx->ref_env += (ra - ctx->ref_env) * 0.001f;
+            float tc = (ra > ctx->ref_env) ? 0.003f : 0.0003f;
+            ctx->ref_env += (ra - ctx->ref_env) * tc;
             float agc = 1.0f;
-            if (ctx->ref_env > 0.08f) agc = 0.08f / ctx->ref_env;
-            if (agc < 0.1f) agc = 0.1f;
+            if (ctx->ref_env > 0.06f) agc = 0.06f / ctx->ref_env;
+            if (agc < 0.08f) agc = 0.08f;
             ref_raw = (ref_raw - fb_est) * agc;
         }
         float ref_sample  = ref_raw * cfg.mic_pre_gain;
