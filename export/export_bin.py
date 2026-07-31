@@ -3,12 +3,20 @@
 用法: python export/export_bin.py
 
 输出: data/*.bin + data/cnn_info.json + data/gfanc_config.json
+
+R-16-②: v2 格式添加 16B 头 {magic"GFNC", version, n_floats, crc32}.
+C 端 bin_load_float 自动检测 magic — 新格式校验, 旧格式直接加载.
 """
-import os, sys, json, struct
+import os, sys, json, struct, zlib
 import numpy as np
 import scipy.io as sio
 import torch
 from pathlib import Path
+
+# R-16-②: .bin v2 格式常量
+BIN_MAGIC   = b'GFNC'          # 4 bytes magic
+BIN_VERSION = 1                 # uint32 LE
+BIN_HDR_FMT = '<4sIII'          # magic(4s) + version(I) + n_floats(I) + crc32(I) = 16B
 
 # ═══════════════════════════════════════════════════════════════
 # 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则默认同级目录
@@ -61,9 +69,15 @@ if ckpt_k != K:
 print(f'CNN checkpoint K={ckpt_k} OK')
 
 def write_bin(name, arr):
+    """R-16-②: v2 格式 — 16B 头 + float32 payload."""
     arr = np.asarray(arr, dtype=np.float32)
     path = OUT_DIR / f'{name}.bin'
-    arr.tofile(path)
+    payload = arr.tobytes()
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    header = struct.pack(BIN_HDR_FMT, BIN_MAGIC, BIN_VERSION, arr.size, crc)
+    with open(path, 'wb') as f:
+        f.write(header)
+        f.write(payload)
     return arr.size  # 总元素数 (不是 len, 多维数组 len 只返回第一维)
 
 def write_json(name, data):
