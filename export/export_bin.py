@@ -19,13 +19,14 @@ BIN_VERSION = 1                 # uint32 LE
 BIN_HDR_FMT = '<4sIII'          # magic(4s) + version(I) + n_floats(I) + crc32(I) = 16B
 
 # ═══════════════════════════════════════════════════════════════
-# 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则默认同级目录
+# 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则查找项目内
 # ═══════════════════════════════════════════════════════════════
 _env_proj = os.environ.get('GFANC_PYTHON_PROJ', '')
 if _env_proj:
     PY_PROJ = Path(_env_proj)
 else:
-    PY_PROJ = Path(r'D:\VSCodeRepository\GFANC_Scene')  # 默认路径
+    # 默认: 项目根目录下的 GFANC_Scene
+    PY_PROJ = Path(os.path.dirname(os.path.abspath(__file__))).parent / 'GFANC_Scene'
 
 # CNN 模型
 CNN_MODEL  = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
