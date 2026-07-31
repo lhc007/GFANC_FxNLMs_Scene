@@ -98,7 +98,7 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
         out[i*2+0] = (cal->spk == 0) ? nz : 0.0f;
         out[i*2+1] = (cal->spk == 1) ? nz : 0.0f;
         for (int c = 0; c < NMIC; c++)
-            cal->mic_hw[c * cal->total + cal->idx] = in[i*6 + c];
+            cal->mic_hw[c * cal->total + cal->idx] = in[i*4 + c];  /* UMC 4ch */
         cal->idx++;
     }
     return 0;
@@ -306,7 +306,7 @@ int main(void) {
         printf("\n── Speaker %d: 播放白噪声 %d 秒, 保持安静! ──\n", s, CAL_SEC);
         cal_data_t cal = { noise_hw, mic_hw, 0, total_hw, s };
         /* 流参数与运行时完全一致 (bulk 延迟才能对应) */
-        PaStreamParams in_p  = { in_dev,  6, paFloat32, 0.2, NULL };
+        PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.2, NULL };  /* UMC 4ch: ch0=ref, ch1-3=err */
         PaStreamParams out_p = { out_dev, 2, paFloat32, 0.2, NULL };
         PaStream *stream = NULL;
         int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 960, paNoFlag, cal_cb, &cal);
