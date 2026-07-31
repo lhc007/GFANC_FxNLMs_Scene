@@ -121,6 +121,7 @@ typedef struct {
     int    peak_release_cnt;      /* peak_mute 释放迟滞: 连续低于阈值的样本数 (10ms 防抖) */
     volatile int peak_rollback_cnt; /* peak_mute 上升沿 Wc 减半次数 (主线程显示) */
     float  out_gain;              /* 静音包络 0..1 (slew~4ms, 替代硬切零, 消除开关咔哒声) */
+    float  ref_env;               /* ref 包络 (~16ms), AGC 防饱和 */
     int    diverge_sec;           /* anti_rms 连续超限秒数 (≥3s 触发 Wc 救援) */
     volatile int diverged;        /* 1=当前处于发散态 (pa>>pe 且 anti 大), NR 显示 DIV */
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
@@ -216,7 +217,17 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 if (ctx->fb_fir[s].coeffs)
                     fb_est += fir_tick(&ctx->fb_fir[s], anti_spk[s]);
         }
-        float ref_sample  = (ref_raw - fb_est) * cfg.mic_pre_gain;
+        /* AGC: 平滑包络追踪 ref 峰值, 突增时自动压低增益防饱和.
+           时间常数 ~16ms (attack fast), 最大衰减 20dB.
+           稳态噪声不受影响 (ref_env 稳定在目标以下). */
+        {   float ra = fabsf(ref_raw - fb_est);
+            ctx->ref_env += (ra - ctx->ref_env) * 0.001f;
+            float agc = 1.0f;
+            if (ctx->ref_env > 0.08f) agc = 0.08f / ctx->ref_env;
+            if (agc < 0.1f) agc = 0.1f;
+            ref_raw = (ref_raw - fb_est) * agc;
+        }
+        float ref_sample  = ref_raw * cfg.mic_pre_gain;
         /* 输入软限幅: tanh 防止吹气/冲击导致 FIR 饱和 → 非线性失真 → 发散 */
         if      (ref_sample >  MIC_CLIP_MAX) ref_sample =  tanhf(ref_sample);
         else if (ref_sample < -MIC_CLIP_MAX) ref_sample = -tanhf(-ref_sample);
