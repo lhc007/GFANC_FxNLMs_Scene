@@ -946,10 +946,13 @@ int main(void) {
             InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_probs, probs, K * sizeof(float));
-            InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
+            /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
+               RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
+            int init_ramp_ms = cfg.ramp_ms * 2;
+            InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * init_ramp_ms / 1000));
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
-                   new_scene, probs[new_scene], cfg.ramp_ms, cfg.mute_hold_ms);
+                   new_scene, probs[new_scene], init_ramp_ms, cfg.mute_hold_ms);
             /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */
             if (!getenv("GFANC_MIC_GAIN")) {
                 /* 自动增益标定: 目标 ref≈0.03 (-30dBFS), 上限 5×.
