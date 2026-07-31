@@ -82,9 +82,9 @@ typedef struct {
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
     0.0000005f, 5e-6f,  /* step_size, leak */ \
-    0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
-                           ref=0.025→anti≈0.008 (−42dBFS), 留足headroom防饱和.
-                           安静时几乎无声, LMS会自行增长到工作点. */ \
+    0.005f,             /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
+                           配合实测 Ŝ (RMS≈0.02): ref=0.17→anti≈0.03, 留足headroom.
+                           LMS 会在10-30s 内自行收敛到工作点. */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
     30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
