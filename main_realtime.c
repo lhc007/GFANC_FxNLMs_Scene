@@ -804,9 +804,21 @@ int main(void) {
         }
         printf("  Ŝ: peak=%.4f RMS=%.4f → norm peak=1.00 RMS=%.4f\n", s_peak,
                s_peak > 0.001f ? s_rms * s_peak : s_rms, s_rms);
+        /* ── 自适应 step: Ŝ RMS 越大 → Xd 越大 → power 越大 → μ_eff 越小.
+           补偿: step ∝ 1/s_rms², 使得 μ_eff 在不同 Ŝ 间保持一致.
+           设计目标 s_rms≈0.02 (根据 C 实测 Ŝ 标定). GFANC_STEP 可覆盖. */
+        if (!getenv("GFANC_STEP")) {
+            float s_target = 0.02f;  /* 设计参考 Ŝ_RMS */
+            float s_scale = (s_target * s_target) / (s_rms * s_rms + 1e-10f);
+            if (s_scale > 4.0f) s_scale = 4.0f;    /* 上限防过冲 */
+            if (s_scale < 0.1f) s_scale = 0.1f;    /* 下限保收敛 */
+            cfg.step_size *= s_scale;
+            cfg.leak      *= s_scale;  /* leak 同步缩放, 保持正则化强度一致 */
+        }
     }
     if (getenv("GFANC_STEP")) cfg.step_size = (float)atof(getenv("GFANC_STEP"));
-    printf("  step=%.2e (μ_eff≈%.1f @ epsilon floor)\n", cfg.step_size, cfg.step_size * 1e6f);
+    printf("  step=%.2e leak=%.1e (μ_eff≈%.1f @ floor, auto-scaled by Ŝ RMS)\n",
+           cfg.step_size, cfg.leak, cfg.step_size * 1e6f);
     ctx->sec_firs = (fir_filter_t *)calloc(E*S, sizeof(fir_filter_t));
     ctx->sec_coeffs = (float *)calloc(E*S*sp, sizeof(float));
     if (!ctx->sec_firs || !ctx->sec_coeffs) {

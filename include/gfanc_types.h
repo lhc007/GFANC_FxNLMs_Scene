@@ -81,7 +81,7 @@ typedef struct {
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
-    0.0000002f, 1e-5f,  /* step_size, leak. step 5e-7→2e-7: Python Ŝ RMS≈0.039 使 μ_eff 2× 偏大, 收敛后 Wc 每秒漂移 0.011 最终饱和 */ \
+    0.0000005f, 5e-6f,  /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放 */ \
     0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
                            Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
