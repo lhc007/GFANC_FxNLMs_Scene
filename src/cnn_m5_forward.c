@@ -262,18 +262,29 @@ int cnn_forward(cnn_instance_t *cnn, const float *audio, float *logits)
 {
     model_t *m = &cnn->model;
     int K = cnn->K;
-    int max_buf = CH * STEM_OUT_LEN; /* 64*4000 = 256000 */
+
+    /* R-25: 缓冲区分级分配.
+       只有 stem conv 输出需要 256K (CH*STEM_OUT_LEN=64*4000).
+       Stem pool 之后所有特征图 ≤ CH*STEM_POOL_LEN=64*500=32K.
+       旧方案: 4×256K=4MB → 新方案: 1×256K+3×32K≈1.34MB (−66%).
+       缓冲迁移: stem_buf 在 b[0]↔b[1] 交换中迁移, 容量始终 ≥ 当前需要. */
+    const int stem_sz = CH * STEM_OUT_LEN;   /* 256,000 floats = 1MB */
+    const int feat_sz = CH * STEM_POOL_LEN;  /*  32,000 floats = 128KB */
+    const int total_sz = stem_sz + 3 * feat_sz;  /* ~1.34MB */
 
     /* C2: 激活缓冲移到实例内, 支持多实例 */
-    static int b_len = 0;  /* 分配尺寸追踪 (全局, 因所有实例共享相同架构) */
-    if (!cnn->act_buf || b_len < max_buf * 4) {
+    static int b_len = 0;
+    if (!cnn->act_buf || b_len < total_sz) {
         free(cnn->act_buf);
-        cnn->act_buf = (float *)calloc(max_buf * 4, sizeof(float));
+        cnn->act_buf = (float *)calloc(total_sz, sizeof(float));
         if (!cnn->act_buf) return -1;
-        b_len = max_buf * 4;
+        b_len = total_sz;
     }
     float *b[4];
-    for (int i = 0; i < 4; i++) b[i] = cnn->act_buf + i * max_buf;
+    b[0] = cnn->act_buf;                       /* stem 区: 256K */
+    b[1] = cnn->act_buf + stem_sz;             /* feat 区 0: 32K */
+    b[2] = cnn->act_buf + stem_sz + feat_sz;   /* feat 区 1: 32K */
+    b[3] = cnn->act_buf + stem_sz + 2*feat_sz; /* feat 区 2: 32K */
 
     /* Stem: Conv → BN → ReLU → MaxPool (in:b[0] tmp, out:b[1]) */
     int slen, plen;
