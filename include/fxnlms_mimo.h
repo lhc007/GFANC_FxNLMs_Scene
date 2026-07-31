@@ -13,7 +13,7 @@ typedef struct {
     int          x_hist_ptr; /* R-12: x_hist 环形写指针 */
     float        step_size;
     float        leak;
-    volatile long freeze_lms; /* 发散检测: 1=冻结梯度更新, 0=正常 */
+    volatile int freeze_lms;  /* 发散检测: 1=冻结 (R-28: int 跨平台32-bit, long在LP64为64) */
 } fxnlms_mimo_t;
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,

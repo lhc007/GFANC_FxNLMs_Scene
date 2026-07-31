@@ -11,6 +11,7 @@
 #include <time.h>
 #include <windows.h>
 
+#include "os_port.h"        /* R-28: gf_sleep_ms + gf_log_timestamp */
 #include "fir_filter.h"
 #include "binary_loader.h"
 #include "cnn_m5_forward.h"
@@ -571,7 +572,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
                                             &ctx->freeze_timer, &ctx->freeze_permanent);
     if (freeze_action == 1) {
         /* 刚触发 freeze — 设置 LMS 冻结 */
-        InterlockedExchange(&ctx->fx.freeze_lms, 1);
+        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 1);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc diverged max=%.3f init=%.3f\n",
                                    wc_max, ctx->wc_init_max);
         printf("[WARN] Wc diverged! max|Wc|=%.3f "
@@ -587,12 +588,12 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
             printf("[INFO] Wc freeze retry — rollback to CNN preset scene=%d\n", ctx->cur_scene_id);
         }
         InterlockedExchangeAdd(&ctx->wc_seq, 2);
-        InterlockedExchange(&ctx->fx.freeze_lms, 0);
+        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry (rolled back)\n");
         printf("[INFO] Wc unfrozen, watching 3s...\n");
     } else if (freeze_action == 2) {
         /* 永久冻结 */
-        InterlockedExchange(&ctx->fx.freeze_lms, 1);
+        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 1);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc freeze PERMANENT\n");
         printf("[WARN] Wc diverged again during watch period! "
                "LMS permanently frozen until scene switch\n");
@@ -636,7 +637,7 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
            restored ? "restored adapted Wc" : "new scene, CNN preset");
 
     /* CrossFader + 保护重置 (实时版特有: Interlocked 跨线程) */
-    InterlockedExchange(&ctx->fx.freeze_lms, 0);
+    InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_probs, probs, ctx->sc.K * sizeof(float));
     InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
@@ -880,8 +881,7 @@ int main(void) {
     /* 运行时统计日志 (C1) */
     ctx->log_file = fopen("gfanc_log.csv", "a");
     if (ctx->log_file) {
-        time_t now = time(NULL);
-        fprintf(ctx->log_file, "# GFANC session start: %s", ctime(&now));
+        gf_log_timestamp(ctx->log_file, "start");  /* R-28: 可移植时间戳 */
         fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event\n");
         fflush(ctx->log_file);
     }
@@ -890,7 +890,7 @@ int main(void) {
     int log_sec = 0;
     int scene_cand = -1, scene_cand_cnt = 0;  /* P4: 场景切换滞回候选状态 */
     while (ctx->running) {
-        Sleep(100);
+        gf_sleep_ms(100);  /* R-28: 可移植睡眠 */
         LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
         if (ready < 0) continue;
 
@@ -915,7 +915,7 @@ int main(void) {
             /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
             memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
-            InterlockedExchange(&ctx->fx.freeze_lms, 0);
+            InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_probs, probs, K * sizeof(float));
             InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
@@ -996,8 +996,7 @@ cleanup:
         free(ctx);
         ctx = NULL;
         if (lf) {
-            time_t now = time(NULL);
-            fprintf(lf, "# GFANC session end: %s\n", ctime(&now));
+            gf_log_timestamp(lf, "end");  /* R-28: 可移植时间戳 */
             fclose(lf);
         }
     }

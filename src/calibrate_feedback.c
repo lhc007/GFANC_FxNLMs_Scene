@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <windows.h>
+#include "os_port.h"        /* R-28: gf_sleep_ms 可移植睡眠 */
 
 #include "fir_filter.h"
 #include "binary_loader.h"
@@ -240,7 +241,7 @@ int main(void) {
         int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
         if (err) { fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err)); return 1; }
         p_Pa_StartStream(stream);
-        while (cal.idx < total_hw) Sleep(100);
+        while (cal.idx < total_hw) gf_sleep_ms(100);  /* R-28 */
         p_Pa_StopStream(stream);
         p_Pa_CloseStream(stream);
 
