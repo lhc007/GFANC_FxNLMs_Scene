@@ -188,12 +188,22 @@ bp_coeff = bp['fir_bandpass_coeff'].flatten().astype(np.float32)
 write_bin('bandpass_fir', bp_coeff)
 print(f'  bandpass_fir.bin: {len(bp_coeff)} taps')
 
+# ── 5b. ANC 专用短带通 FIR (R-13: 256tap, 群延迟 8ms vs 32ms) ──
+print('Exporting ANC bandpass FIR (256tap)...')
+from scipy.signal import firwin
+bp_anc_coeff = firwin(256, [20, 1500], fs=16000, pass_zero='bandpass',
+                       window='hamming').astype(np.float32)
+write_bin('bandpass_anc', bp_anc_coeff)
+print(f'  bandpass_anc.bin: {len(bp_anc_coeff)} taps, '
+      f'gd={(256-1)/(2*16000)*1000:.1f}ms (vs 1024tap gd={(1024-1)/(2*16000)*1000:.1f}ms)')
+
 # ── 6. 全局配置 ──
 config = {
     'fs': 16000, 'E': E, 'S': S, 'C': C, 'K': K,
     'filter_len': int(Wc_v.shape[2]),
     'pri_len': int(Pri.shape[2]), 'sec_len': int(Sec.shape[2]),
     'input_len': 16000, 'bp_len': int(len(bp_coeff)),
+    'bp_anc_len': 256,
     'dsp_delay': 16, 'fade_len': 1600, 'sc_dim': S * C,
 }
 write_json('gfanc_config.json', config)
