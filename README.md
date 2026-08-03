@@ -118,12 +118,22 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 
 **实时版** — 实时抵消环境噪声：
 ```bash
-$env:GFANC_WC_TARGET = "0.03"
-$env:GFANC_STEP = "3e-7"
+$env:GFANC_WC_TARGET = "0.01"
+$env:GFANC_STEP = "1e-7"
 $env:GFANC_WC_COLD = "0.3"
 $env:GFANC_HW_THRESH = "10"
+$env:GFANC_MIC_GAIN=20
+$env:GFANC_DIVERGE_ANTI=5
 
 ./gfanc_realtime.exe
+
+下一轮参数
+GFANC_WC_TARGET=0.01
+GFANC_STEP=3e-7       # 追噪音动态
+GFANC_WC_COLD=0.3
+GFANC_MIC_GAIN=20     # 保持到硬件确认
+GFANC_DIVERGE_ANTI=5
+
 ```
 
 运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `23`），然后开始实时降噪。按 `Ctrl+C` 停止。
