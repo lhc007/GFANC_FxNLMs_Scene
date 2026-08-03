@@ -305,11 +305,13 @@ int main(void) {
     for (int s = 0; s < S; s++) {
         printf("\n── Speaker %d: 播放白噪声 %d 秒, 保持安静! ──\n", s, CAL_SEC);
         cal_data_t cal = { noise_hw, mic_hw, 0, total_hw, s };
-        /* 流参数与运行时完全一致 (bulk 延迟才能对应) */
-        PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.2, NULL };  /* UMC 4ch: ch0=ref, ch1-3=err */
-        PaStreamParams out_p = { out_dev, 2, paFloat32, 0.2, NULL };
+        /* BUG-2: 流参数与运行时完全一致 (96帧@48k / 0.01s), bulk 延迟才能对应.
+           旧 960帧/0.2s 测出的 bulk (~112ms) 远大于运行时实际环路 (~4-6ms),
+           sec_bulk_delay.bin 无法用于运行时 dsp_delay 补偿. */
+        PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.01, NULL };  /* UMC 4ch: ch0=ref, ch1-3=err */
+        PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };
         PaStream *stream = NULL;
-        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 960, paNoFlag, cal_cb, &cal);
+        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
         if (err != 0) { fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err)); return 1; }
         p_Pa_StartStream(stream);
         while (cal.idx < total_hw) Sleep(100);
@@ -384,8 +386,11 @@ int main(void) {
     printf("\n  Saved: %s\n", SEC_OUT_FILE);
 
     f = fopen(DLY_OUT_FILE, "wb");
-    if (f) { float d = (float)bulk; fwrite(&d, sizeof(float), 1, f); fclose(f);
-             printf("  Saved: %s (bulk=%d = %.2fms)\n", DLY_OUT_FILE, bulk, bulk*1000.0f/FS_CAL); }
+    if (f) { /* BUG-2: 存总环路延迟 (anchor = bulk + GUARD), 运行时按 Ŝ 峰位补偿 */
+             float d = (float)(bulk + GUARD);
+             fwrite(&d, sizeof(float), 1, f); fclose(f);
+             printf("  Saved: %s (loop_delay=%d = %.2fms @16k)\n",
+                    DLY_OUT_FILE, bulk + GUARD, (float)(bulk + GUARD) * 1000.0f / FS_CAL); }
 
     for (int s = 0; s < S; s++) {
         char path[64];

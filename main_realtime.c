@@ -9,6 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>   /* BUG-8: Ŝ 文件选择 (stat mtime) */
 #include <windows.h>
 
 #include "os_port.h"        /* R-28: gf_sleep_ms + gf_log_timestamp */
@@ -144,8 +145,9 @@ typedef struct {
     volatile float acc_ch[4], acc_anti, acc_anti_est;
     volatile float acc_d_est;    /* 扰动估计功率 Σ(err-anti_est)² (诚实NR分子) */
     volatile float acc_err_cross;/* Σ(err × anti_est), Ŝ 校准后重构 d_cal 用 */
+    volatile float acc_err_win;  /* BUG-1: 分散采样窗口误差功率 Σerr² (与 pa/cross 同源) */
     /* s_cal 已移除: Ŝ 保持物理尺度, anti_est 无需去归一化校准 */
-    int    anti_est_offset;   /* R-55: anti_est 采样窗口起始偏移 (每帧随机化) */
+    int    anti_est_offset;   /* BUG-1: anti_est 分散采样相位 (0..63, 每帧随机化) */
     float  wc_init_max;           /* INIT 后 Wc 的 max|系数| (freeze 阈值基准) */
     volatile float fb_rms;       /* 反馈抵消量 RMS */
     volatile float anti_est_rms; /* 模型估计反噪声 RMS (NR计算用) */
@@ -293,8 +295,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         }
 
         /* FxNLMS 实时路径: anti=Wc⊗ref_anc, 梯度用err_meas直接驱动 (不合成err)
-           R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路. */
+           R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路.
+           BUG-3: cold_hold 冷启动**硬限幅段**(前1s, cold_hold>FS_ANC)冻结梯度 —
+           输出被钳到 ±0.12 时若继续用 err 驱动 Wc, 强噪声下 Wc 开环增长;
+           软释放段(后1s, cap 0.12→1.0)梯度活跃, Wc 在输出受界内自适应收敛. */
         if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
+            || ctx->cold_hold > FS_ANC
             || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
             fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
             /* 静音/啸叫期间 Wc 持续衰减 — 反馈事件后 Wc 自行退回到安全区 */
@@ -315,14 +321,21 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* R-8: NaN/Inf 保护 + 输出钳位 + 看门狗
            驱动毛刺 → NaN 进入 FIR 延迟线 → 永久 NaN 输出 (延迟线无自恢复能力)
            看门狗: 连续 >1s NaN 输出 → 复位全部 FIR 延迟线 (memset+指针归零, <10μs) */
-        /* 冷启动 anti 硬限幅: 新场景首次 2s 内 caps 0.12,
-           防 CNN 预设 Wc 过强→瞬时 overshoot→可闻嗡嗡.
-           LMS 在限幅内安全收敛, 2s 后自动释放. */
+        /* 冷启动 anti 软释放: 新场景首次 2s.
+           前 1s (cold_hold>FS_ANC): cap=0.12, 梯度冻结, 输出极小;
+           后 1s (0<remain<=FS_ANC): cap 线性 0.12→1.0, 梯度活跃 —
+           Wc 在输出受界内自适应收敛, 避免硬释放时未收敛 Wc 的瞬态
+           输出激起扬声器→参考麦反馈啸叫 (降噪耳机用固定滤波器无此瞬态). */
         if (ctx->cold_hold > 0) {
-            InterlockedDecrement(&ctx->cold_hold);
+            int remain = (int)InterlockedDecrement(&ctx->cold_hold);
+            float cap;
+            if (remain > FS_ANC)
+                cap = 0.12f;
+            else
+                cap = 0.12f + 0.88f * (1.0f - (float)remain / FS_ANC);
             for (int s = 0; s < S; s++) {
-                if      (anti_spk[s] >  0.12f) anti_spk[s] =  0.12f;
-                else if (anti_spk[s] < -0.12f) anti_spk[s] = -0.12f;
+                if      (anti_spk[s] >  cap) anti_spk[s] =  cap;
+                else if (anti_spk[s] < -cap) anti_spk[s] = -cap;
             }
         }
 
@@ -388,10 +401,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->acc_err  += err_meas[e] * err_meas[e];
             ctx->acc_dist += err_meas[e] * err_meas[e];  /* 实测误差功率 (用于NR参考) */
         }
-        /* R-11+R-55: anti_est 每帧随机窗口 250 样本计算 (消除系统性偏差).
-           使用 LCG 伪随机偏移, 避免与 1s 边界对齐引入的周期性采样偏差. */
-        {   int aoffs = ctx->anti_est_offset;
-            if (ctx->acc_cnt >= aoffs && ctx->acc_cnt < aoffs + 250) {
+        /* BUG-1: 分散采样 — 每 64 样本取 1 个 (整帧恰好 250 个), 覆盖整秒.
+           替代 R-55 的连续 250 样本窗口: 连续窗口 + int 溢出 LCG 产生负偏移时
+           整帧不采样 (NR 恒 0), 且窗口落在局部收敛区时误差功率失真.
+           每帧 250 个样本均匀分布, 与 1s 边界无系统对齐, 相位每帧随机化. */
+        if (((ctx->acc_cnt + ctx->anti_est_offset) & 63) == 0) {
             float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
             int xp = ctx->fx.xd_ptr;
             int seg1 = (xp == 0) ? L - 1 : xp - 1;
@@ -414,19 +428,31 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 float dv = err_meas[e] - anti_est[e];
                 ctx->acc_d_est += dv * dv;
                 ctx->acc_err_cross += err_meas[e] * anti_est[e];
+                /* BUG-1: pe/pa/cross 必须来自同一组采样样本, NR 比值才成立 */
+                ctx->acc_err_win += err_meas[e] * err_meas[e];
             }
-            } /* R-55: end if(acc_cnt in window) */
-        } /* R-55: end outer scope (aoffs) */
+        }
         if ((ctx->acc_cnt += 1) >= FS_ANC) {
-            float pe = ctx->acc_err;
-            float pa = ctx->acc_anti_est * (float)FS_ANC / 250.0f;
-            float cross = ctx->acc_err_cross * (float)FS_ANC / 250.0f;
+            /* BUG-1: pe/pa/cross 全部来自同一组分散采样样本 (250个/帧), 外推因子在
+               比值中抵消. 原实现混用全帧 pe 与窗口 pa/cross, 窗口未命中时 pd≈pe →
+               NR 恒 0; 窗口命中局部收敛区时 NR 虚高至 40-80dB. */
+            float pe = ctx->acc_err_win;
+            float pa = ctx->acc_anti_est;
+            float cross = ctx->acc_err_cross;
             float pd = pe + pa - 2.0f * cross;               /* d = err - anti_est (Ŝ 物理尺度) */
-            ctx->nr_level = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
-            ctx->anti_est_rms = sqrtf(pa / (FS_ANC * E));
+            if (pd < 0.0f) pd = 0.0f;                        /* 数值保护: 完美对消时 pd 可为负 */
+            /* 残差接近数值基底时 pd/pe 无意义, 限制读数范围防噪声基底虚高 */
+            if (pe < 1e-10f) {
+                ctx->nr_level = 0.0f;
+            } else {
+                ctx->nr_level = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
+                if (ctx->nr_level > 30.0f) ctx->nr_level = 30.0f;
+                if (ctx->nr_level < -30.0f) ctx->nr_level = -30.0f;
+            }
+            ctx->anti_est_rms = sqrtf(pa / (250.0f * E));
             ctx->ref_rms  = sqrtf(ctx->acc_ref  / FS_ANC);
-            ctx->err_rms  = sqrtf(pe / (FS_ANC * E));
-            ctx->dist_rms = sqrtf(pd / (FS_ANC * E));
+            ctx->err_rms  = sqrtf(ctx->acc_err  / (FS_ANC * E));
+            ctx->dist_rms = sqrtf(pd / (250.0f * E));
             ctx->fb_rms   = sqrtf(ctx->acc_fb   / FS_ANC);
             for (int c = 0; c < 4; c++)
                 ctx->ch_rms[c] = sqrtf(ctx->acc_ch[c] / FS_ANC);
@@ -439,9 +465,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                                 && ctx->mute_hold <= 0);
             ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0;
             ctx->acc_anti = ctx->acc_anti_est = ctx->acc_d_est = ctx->acc_err_cross = 0;
+            ctx->acc_err_win = 0;
             ctx->acc_cnt = 0;
-            /* R-55: LCG 伪随机偏移, 每帧随机化 anti_est 采样窗口位置 [0, 15750] */
-            ctx->anti_est_offset = (ctx->anti_est_offset * 1103515245 + 12345) % 15751;
+            /* BUG-1: 相位随机化 (0..63). 无符号运算避免 int 溢出 (原 LCG 有符号
+               溢出产生负偏移, 使连续窗口整帧不采样). */
+            ctx->anti_est_offset = (int)((ctx->anti_est_offset * 1103515245u + 12345u) & 63u);
             for (int c = 0; c < 4; c++) ctx->acc_ch[c] = 0;
         }
 
@@ -614,6 +642,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     }
 
     /* C1: 使用共享 freeze 状态机 */
+    int was_watching = (ctx->freeze_timer < 0);  /* 调用前是否处于观察期 (-3..-1) */
     int freeze_action = sm_check_divergence(wc_max, ctx->wc_init_max, cfg.freeze_ratio,
                                             cfg.freeze_retry_sec,
                                             &ctx->freeze_timer, &ctx->freeze_permanent);
@@ -644,10 +673,10 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc freeze PERMANENT\n");
         printf("[WARN] Wc diverged again during watch period! "
                "LMS permanently frozen until scene switch\n");
-    } else if (freeze_action == 0 && ctx->freeze_timer == 0
-               && !ctx->fx.freeze_lms && !ctx->freeze_permanent) {
-        /* 观察期安全度过 — sm_check_divergence 已将 freeze_timer 归零 */
-        if (ctx->freeze_timer >= 0 && ctx->freeze_timer > -3)
+    } else if (freeze_action == 0 && !ctx->fx.freeze_lms && !ctx->freeze_permanent) {
+        /* 观察期安全度过 (freeze_timer 从 -1 回到 0) 才打印 — 正常态 freeze_timer==0
+           满足旧条件导致每秒刷屏 "[INFO] Wc stable", 改为仅在观察期结束时刻打印 */
+        if (was_watching && ctx->freeze_timer == 0)
             printf("[INFO] Wc stable after unfreeze, normal operation resumed\n");
     }
 }
@@ -670,11 +699,17 @@ static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
                                float cos_sim, float *probs) {
     if (cos_sim >= 0.8f || new_scene == ctx->cur_scene_id) return;
 
+    /* BUG-7: 发散/静音/peak_mute 削半/冻结期的 Wc 快照不保存进场景记忆 (防污染).
+       nr_level>=0 补充 freshness: diverged 标志有 1s 滞后, 本秒刚开始发散时
+       diverged 尚未置位, 但 nr_level 已转负. */
+    int wc_trusted = !ctx->diverged && !ctx->safety_mute
+                     && !ctx->peak_mute && !ctx->fx.freeze_lms
+                     && ctx->nr_level >= 0.0f;
     int restored = sm_scene_switch_execute(
         (float *)ctx->scene_wc, ctx->scene_wc_valid,
         &ctx->cur_scene_id, new_scene,
         ctx->wc_snapshot, ctx->wc_cur, ctx->wc_old, S * L,
-        cfg.wc_cold_start);
+        cfg.wc_cold_start, wc_trusted);
 
     if (ctx->log_file)
         fprintf(ctx->log_file, "# EVENT: scene switch %d→%d cos=%.3f restored=%d\n",
@@ -732,9 +767,24 @@ int main(void) {
 
     /* 加载权重 (R-3: 逐文件校验长度, 缺/截断文件 → FATAL 而非崩溃) */
     int ret = 0;
+    rt_ctx_t *ctx = NULL;   /* BUG-4: 提前声明置 NULL — 权重校验失败的 goto cleanup
+                                在 ctx=calloc 之前跳转, 未初始化则 cleanup 解引用野指针 */
     printf("Loading weights...\n");
+    /* BUG-8: Ŝ 文件选择 — 优先最新的实测文件.
+       calibrate_secondary.exe 写 secondary_path_measured.bin (C 实测, bench/窗户),
+       measure_secondary.py → export_bin.py 写 secondary_path.bin (Farina 实测/导出).
+       两者都存在时取修改时间较新的, 保证最近一次校准生效 (用户跑完校准即生效). */
+    const char *sec_file = "data/secondary_path.bin";
+    {
+        struct stat st_m, st_e;
+        int has_m = (stat("data/secondary_path_measured.bin", &st_m) == 0);
+        int has_e = (stat("data/secondary_path.bin", &st_e) == 0);
+        if (has_m && (!has_e || st_m.st_mtime > st_e.st_mtime))
+            sec_file = "data/secondary_path_measured.bin";
+    }
     float *sec_path, *sub_filters, *centroids, *bp_coeff;
-    int sec_len = bin_load_float("data/secondary_path.bin", &sec_path);
+    int sec_len = bin_load_float(sec_file, &sec_path);
+    printf("  Ŝ file: %s\n", sec_file);
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
     int n_scene = bin_load_float("data/scene_defs.bin", &centroids);
     int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
@@ -744,7 +794,7 @@ int main(void) {
     int bp_anc_ok = (bp_anc_loaded >= BP_ANC_LEN);
 
     if (sec_len < E*S*SEC_LEN) {
-        fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
+        fprintf(stderr, "FATAL: %s too short/load failed (%d<%d)\n", sec_file, sec_len, E*S*SEC_LEN);
         ret = 1; goto cleanup;
     }
     if (sub_len < SC_C*SC_S || sub_len % (SC_C*SC_S) != 0) {
@@ -778,10 +828,10 @@ int main(void) {
 
     /* 初始化 ANC 模块 */
     PaStream *stream = NULL;
-    rt_ctx_t *ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
+    ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */
     if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
-    ctx->anti_est_offset = 0;  /* R-55: 首次从 0 开始, 每帧 LCG 随机化 */
+    ctx->anti_est_offset = 0;  /* BUG-1: 分散采样相位, 每帧随机化 (0..63) */
     /* R-14: 初始化 4 通道抗混叠低通 (fc=6.5kHz @48k, 2阶 Butterworth) */
     for (int c = 0; c < 4; c++) biquad_init_lpf(&ctx->aa_filt[c], 6500.0f, 48000.0f);
     g_ctx = ctx;
@@ -813,6 +863,60 @@ int main(void) {
         if (!ctx->bp_err[e].delay_line) { fprintf(stderr, "OOM: bp_err[%d]\n", e); ret = 1; goto cleanup; }
     }
 
+    /* ── BUG-2: Ŝ 健康检查 + 环路延迟自动补偿 ──
+       FxLMS 对齐要求: 模型延迟(dsp_delay + Ŝ峰位) = 真实环路延迟.
+       若 Ŝ 在测量时被对齐抹掉了环路延迟 (管道测量 / 校准对齐), 模型延迟偏小,
+       FxLMS 滤波参考 xd 早于真实误差到达 → 收敛偏移 + 高频稳定域压缩.
+       这是离线 15dB → 实时 4-9dB 的未消除根因之一. ── */
+    {
+        /* 每条路径的峰值位置 (模型延迟 = dsp_delay + min峰位) */
+        int peak_min = SEC_LEN;
+        for (int e = 0; e < E; e++)
+            for (int s = 0; s < S; s++) {
+                const float *p = sec_path + (e*S+s)*SEC_LEN;
+                int bp = 0; float bm = 0.0f;
+                for (int k = 0; k < SEC_LEN; k++)
+                    if (fabsf(p[k]) > bm) { bm = fabsf(p[k]); bp = k; }
+                if (bp < peak_min) peak_min = bp;
+                printf("    S(e%d,s%d): peak@tap %d (%.2fms)\n",
+                       e, s, bp, (float)bp / FS_ANC * 1000.0f);
+            }
+
+        /* 环路延迟: GFANC_DSP_DELAY 手动覆盖优先, 否则读 sec_bulk_delay.bin
+           (calibrate_secondary 以与运行时一致的 96帧@48k 流参数实测). */
+        if (!getenv("GFANC_DSP_DELAY")) {
+            float *ld = NULL;
+            int n = bin_load_float("data/sec_bulk_delay.bin", &ld);
+            if (n >= 1 && ld) {
+                int loop = (int)ld[0];   /* 总环路延迟 @16k (样本) */
+                bin_free(ld);
+                if (loop > 512) {   /* 陈旧/大缓冲测量值 (>32ms): 钳制并警告 */
+                    fprintf(stderr, "[WARN] sec_bulk_delay=%d (%dms) 超合理范围 — 请用\n"
+                            "      与运行时一致的流参数 (96帧@48k) 重新运行 calibrate_secondary\n",
+                            loop, loop * 1000 / FS_ANC);
+                    loop = 0;
+                }
+                /* dsp_delay = 环路延迟 - Ŝ自带延迟(峰位), 使模型延迟 = 真实环路 */
+                cfg.dsp_delay = loop - peak_min;
+                if (cfg.dsp_delay < 0) cfg.dsp_delay = 0;
+                printf("  Loop delay auto-loaded: %d (%dms), dsp_delay=%d\n",
+                       loop, loop * 1000 / FS_ANC, cfg.dsp_delay);
+            }
+        }
+
+        /* 诊断: 模型延迟过小 → Ŝ 疑似缺少环路延迟 */
+        float model_ms = ((float)cfg.dsp_delay + peak_min) / FS_ANC * 1000.0f;
+        printf("  Ŝ model delay = %.2fms (dsp_delay=%d + peak@%d), 期望环路≈4-6ms\n",
+               model_ms, cfg.dsp_delay, peak_min);
+        if (model_ms < 2.5f) {
+            fprintf(stderr, "[WARN] Ŝ 模型延迟仅 %.1fms — 疑似未包含环路延迟!\n"
+                    "      当前 Ŝ 在管道/对齐测量下可能无法代表真实声学路径.\n"
+                    "      建议: ① 安装到窗户后重新测量 (measure_secondary.py);\n"
+                    "      ② 运行 calibrate_secondary.exe 生成 sec_bulk_delay.bin 自动补偿;\n"
+                    "      ③ 或手动设 GFANC_DSP_DELAY=环路延迟ms×16-%.1f.\n",
+                    model_ms, (float)peak_min / FS_ANC * 1000.0f);
+        }
+    }
     int dsp_delay = cfg.dsp_delay;
     int sp = SEC_LEN + dsp_delay;
     /* ── Ŝ peak→1.0 归一化: 消除训练/实测间的尺度差异, 使 power 在可预测范围.

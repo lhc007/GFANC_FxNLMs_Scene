@@ -80,6 +80,8 @@ static inline float sm_wc_rms(const float *wc, int n)
  *  @param wc_old          CrossFader 旧端 Wc (输出: 被当前快照覆盖)
  *  @param wc_n            每个扬声器的系数数 (=S*L)
  *  @param wc_cold_start   首次场景衰减 (0.3=30%起步, 1.0=关闭)
+ *  @param wc_trusted      当前 Wc 是否可信 (非发散/非静音/非冻结). 0 时旧场景
+ *                         记忆不覆盖 (保留旧记忆或待初始化), 防发散快照污染.
  *  @return 1=使用了已收敛记忆, 0=使用了 CNN 预设 (首次)
  */
 static inline int sm_scene_switch_execute(
@@ -87,13 +89,20 @@ static inline int sm_scene_switch_execute(
     int *cur_scene_id, int new_scene,
     const float *wc_snapshot,
     float *wc_cur, float *wc_old,
-    int wc_n, float wc_cold_start)
+    int wc_n, float wc_cold_start, int wc_trusted)
 {
     int restored = 0;
 
-    /* 保存旧场景的当前 Wc (快照是回调最新值, 比 wc_cur 更实时) */
-    memcpy(scene_wc + (*cur_scene_id) * wc_n, wc_snapshot, wc_n * sizeof(float));
-    scene_wc_valid[*cur_scene_id] = 1;
+    /* 保存旧场景的当前 Wc (快照是回调最新值, 比 wc_cur 更实时).
+       BUG-7: 仅当当前 Wc 可信 (非发散/非静音/非冻结) 时保存.
+       发散/peak_mute 削半/冻结期的 Wc 快照保存进记忆会污染场景记忆,
+       切回该场景时恢复发散滤波器 → 再次发散, 形成永久坏记忆. */
+    if (wc_trusted) {
+        memcpy(scene_wc + (*cur_scene_id) * wc_n, wc_snapshot, wc_n * sizeof(float));
+        scene_wc_valid[*cur_scene_id] = 1;
+    }
+    /* 不可信时保留旧记忆 (若有) — scene_wc_valid 不置位, 下次恢复走 CNN 预设
+       而非发散快照. wc_old 仍取自 wc_snapshot (CrossFader 需从当前位置平滑过渡). */
 
     /* 新场景: 有收敛记忆就用记忆, 否则用 CNN 预设 (已在 wc_cur 中) */
     if (scene_wc_valid[new_scene]) {

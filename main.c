@@ -141,7 +141,8 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define S       2
 #define C       15
 #define FS      16000
-#define BP_LEN  1024
+#define BP_LEN  1024   /* CNN 带通 (分类需频率分辨率) */
+#define BP_ANC_LEN 256 /* BUG-6: ANC 带通 (与实时版一致, 群延迟 8ms vs 32ms) */
 #define PRI_LEN 1024
 #define SEC_LEN 1024
 #define DSP_DELAY 0  /* 与实时版一致: Ŝ 已含声学延迟, 无硬件 I/O 延迟需补偿 */
@@ -170,6 +171,14 @@ int main(int argc, char **argv)
     int sub_len  = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len   = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     int n_scene  = bin_load_float("data/scene_defs.bin", &centroids);
+    /* BUG-6: ANC 专用短带通 (256tap, 与实时版一致). 无文件时截取 1024tap 前 256 点. */
+    float *bp_anc_coeff = NULL;
+    int bp_anc_loaded = bin_load_float("data/bandpass_anc.bin", &bp_anc_coeff);
+    int bp_anc_ok = (bp_anc_loaded >= BP_ANC_LEN);
+    if (!bp_anc_ok) { bp_anc_coeff = bp_coeff; }  /* 回退: 截取用同一指针 */
+    printf("  BP ANC: %s (%dtap, gd=%.1fms)\n",
+           bp_anc_ok ? "bandpass_anc.bin" : "fallback(1024tap truncated)",
+           BP_ANC_LEN, (BP_ANC_LEN-1)/(2.0f*FS)*1000.0f);
 
     if (sec_len < E*S*SEC_LEN) {
         fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
@@ -280,16 +289,20 @@ int main(int argc, char **argv)
     /* 预处理: ref_filt_all = bandpass(noise × pre_gain)
        匹配实时版 ref_filt 信号链: pre_gain → soft_clip → bandpass
        注意: 不做峰值归一化 (实时版 ADC 输入无归一化) */
-    float *ref_filt_all = (float *)malloc(N * sizeof(float));
+    float *ref_filt_all = (float *)malloc(N * sizeof(float));   /* 1024tap: CNN 分类用 */
+    float *ref_anc_all  = (float *)malloc(N * sizeof(float));   /* 256tap: FxLMS/anti 用 (BUG-6, 与实时版一致) */
     {
         fir_filter_t bp_tmp = { bp_fir.coeffs, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
+        fir_filter_t bp_anc = { bp_anc_coeff, (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t)), BP_ANC_LEN, 0 };
         for (int i = 0; i < N; i++) {
             float rs = ref[i] * cfg.mic_pre_gain;
             if      (rs >  1.0f) rs =  tanhf(rs);
             else if (rs < -1.0f) rs = -tanhf(-rs);
             ref_filt_all[i] = fir_tick(&bp_tmp, rs);
+            ref_anc_all[i]  = fir_tick(&bp_anc, rs);
         }
         free(bp_tmp.delay_line);
+        free(bp_anc.delay_line);
     }
 
     /* 次级路径 FIR — 误差合成用 (独立延迟线, 同 sec 系数)
@@ -303,12 +316,12 @@ int main(int argc, char **argv)
             sec_firs_err[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
-    /* 误差麦带通 FIR (匹配实时版 bp_err[E]) */
+    /* 误差麦带通 FIR (匹配实时版 bp_err[E], BUG-6: 256tap ANC 带通) */
     fir_filter_t bp_err[E];
     for (int e = 0; e < E; e++) {
-        bp_err[e].coeffs = bp_coeff;
-        bp_err[e].n_taps = BP_LEN;
-        bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t));
+        bp_err[e].coeffs = bp_anc_coeff;
+        bp_err[e].n_taps = BP_ANC_LEN;
+        bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
         bp_err[e].ptr = 0;
     }
 
@@ -333,9 +346,11 @@ int main(int argc, char **argv)
     /* ── NR 累积 (诚实NR, 匹配实时版) ── */
     float acc_err = 0, acc_anti_est = 0, acc_d_est = 0, acc_err_cross = 0;
     float acc_anti = 0, acc_ref = 0;
+    float acc_err_win = 0;   /* BUG-1: 分散采样窗口误差功率 (与 pa/cross 同源) */
     int   acc_cnt = 0;
-    int   anti_est_offset = 0;  /* R-55: 随机化采样窗口 */
+    int   anti_est_offset = 0;  /* BUG-1: 分散采样相位 (0..63, 每帧随机化) */
     int   diverged = 0;
+    float prev_nr_est = 0.0f;   /* BUG-7: 上一秒 NR (场景切换时判断 Wc 是否可信) */
 
     float sum_nr_db = 0;
     clock_t t0 = clock();
@@ -390,11 +405,13 @@ int main(int argc, char **argv)
             if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
                                        new_scene, cur_scene_id,
                                        &scene_cand, &scene_cand_cnt, 3)) {
-                /* C1: 使用共享场景切换 */
+                /* C1: 使用共享场景切换
+                   BUG-7: 发散期的 Wc 快照不保存进场景记忆 (防污染) */
                 int restored = sm_scene_switch_execute(
                     (float *)scene_wc, scene_wc_valid,
                     &cur_scene_id, new_scene,
-                    fx.wc, wc_cur, wc_old, S * L, 1.0f);
+                    fx.wc, wc_cur, wc_old, S * L, 1.0f,
+                    !diverged && prev_nr_est >= 0.0f);
                 fade_cnt = cfg.fade_len;
                 memcpy(anchor_probs, probs, K * sizeof(float));
                 converged_frames = 0;
@@ -406,11 +423,12 @@ int main(int argc, char **argv)
         /* 4c. 逐样本 FxNLMS (匹配实时版 audio_cb) */
         float err_pwr = 0, dis_pwr = 0;
         acc_err = acc_anti_est = acc_d_est = acc_err_cross = 0;
+        acc_err_win = 0;
         acc_anti = acc_ref = 0; acc_cnt = 0;
         for (int n = 0; n < len; n++) {
             int idx = start + n;
-            float ref_filt = ref_filt_all[idx];
-            acc_ref += ref_filt * ref_filt;
+            float ref_filt = ref_anc_all[idx];   /* BUG-6: 256tap ANC 带通 (匹配实时) */
+            acc_ref += ref_filt_all[idx] * ref_filt_all[idx];  /* 1024tap CNN 带通 (匹配实时 ref_rms 显示) */
 
             /* CrossFader */
             if (fade_cnt > 0) {
@@ -451,8 +469,10 @@ int main(int argc, char **argv)
                 dis_pwr += dis_val[e] * dis_val[e];  /* 已知真值扰动 (Pri模型) */
             }
 
-            /* R-55: anti_est 随机窗口 250 样本 (匹配实时版 诚实NR) */
-            if (acc_cnt >= anti_est_offset && acc_cnt < anti_est_offset + 250) {
+            /* BUG-1: 分散采样 (匹配实时版) — 每 64 样本取 1 个, 整帧 250 个覆盖整秒.
+               原 R-55 连续 250 窗口 + int 溢出 LCG 产生负偏移时整帧不采样 (NR 恒 0),
+               且窗口落在局部收敛区时误差功率失真. */
+            if (((acc_cnt + anti_est_offset) & 63) == 0) {
                 float anti_est[E];
                 fxnlms_get_anti_est(&fx, anti_est);
                 for (int e = 0; e < E; e++) {
@@ -460,6 +480,7 @@ int main(int argc, char **argv)
                     float dv = err_meas[e] - anti_est[e];
                     acc_d_est += dv * dv;
                     acc_err_cross += err_meas[e] * anti_est[e];
+                    acc_err_win += err_meas[e] * err_meas[e];
                 }
             }
             acc_cnt++;
@@ -480,19 +501,30 @@ int main(int argc, char **argv)
             fxnlms_get_anti_est(&fx, anti_est_prev);
         }
 
-        /* ── 诚实NR (匹配实时版, 估计扰动) ── */
-        float pe = err_pwr;
-        float pa = acc_anti_est * (float)FS / 250.0f;
-        float cross = acc_err_cross * (float)FS / 250.0f;
+        /* ── 诚实NR (匹配实时版, 分散采样一致指标) ──
+           BUG-1: pe/pa/cross 全部来自同一组分散采样样本, 外推因子在比值中抵消.
+           原实现混用全帧 pe 与窗口 pa/cross, 窗口未命中时 pd≈pe → NR 恒 0. */
+        float pe = acc_err_win;
+        float pa = acc_anti_est;
+        float cross = acc_err_cross;
         float pd = pe + pa - 2.0f * cross;
-        float nr_est = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
-        float err_rms = sqrtf(pe / (len * E));
+        if (pd < 0.0f) pd = 0.0f;   /* 数值保护: 完美对消时 pd 可为负 */
+        float nr_est;
+        if (pe < 1e-10f) {
+            nr_est = 0.0f;           /* 残差接近数值基底, 比值无意义 */
+        } else {
+            nr_est = 10.0f * log10f((pd + 1e-12f) / (pe + 1e-12f));
+            if (nr_est > 30.0f) nr_est = 30.0f;
+            if (nr_est < -30.0f) nr_est = -30.0f;
+        }
+        prev_nr_est = nr_est;                          /* BUG-7: 供下个场景切换判断 */
+        float err_rms = sqrtf(err_pwr / (len * E));   /* 显示用全帧误差 RMS */
         float ref_rms = sqrtf(acc_ref / len);
         float anti_rms = sqrtf(acc_anti / (len * S));
 
         /* ── 已知真值NR (仅离线可用: 利用 Pri 模型精确计算扰动) ── */
         dis_pwr /= (len * E);
-        float nr_true = 10.0f * log10f((dis_pwr + 1e-12f) / (pe / (len * E) + 1e-12f));
+        float nr_true = 10.0f * log10f((dis_pwr + 1e-12f) / (err_pwr / (len * E) + 1e-12f));
 
         /* 发散检测 (基于诚实NR, 匹配实时版) */
         diverged = (pa > 9.0f * pe && anti_rms > 0.05f && nr_est < 0.0f);
@@ -517,8 +549,9 @@ int main(int argc, char **argv)
         printf("\n");
 
         sum_nr_db += nr_true;  /* 平均值用已知真值NR (离线评估标准) */
-        /* R-55: LCG 随机化下一帧的 anti_est 采样窗口 */
-        anti_est_offset = (anti_est_offset * 1103515245 + 12345) % 15751;
+        /* BUG-1: 分散采样相位随机化 (0..63). 无符号运算避免 int 溢出
+           (原 LCG 有符号溢出产生负偏移, 使连续窗口整帧不采样). */
+        anti_est_offset = (int)((anti_est_offset * 1103515245u + 12345u) & 63u);
     }
 
     clock_t t1 = clock();
@@ -536,7 +569,7 @@ int main(int argc, char **argv)
     printf("Output: anti_out.wav (%d ch), error_out.wav (%d ch)\n", S, E);
 
     /* ── 6. 清理 ── */
-    free(anti_out); free(err_out); free(ref_filt_all);
+    free(anti_out); free(err_out); free(ref_filt_all); free(ref_anc_all);
     for (int e = 0; e < E; e++) free(bp_err[e].delay_line);
     fxnlms_free(&fx);
     scene_ctrl_free(&sc);
@@ -547,6 +580,7 @@ int main(int argc, char **argv)
     free(wav.data); if (ref_resampled) free(ref_resampled);
     bin_free(sec_path); bin_free(pri_path); bin_free(sub_filters);
     bin_free(centroids); bin_free(bp_coeff);
+    if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
     printf("Done.\n");
     return 0;
 }
