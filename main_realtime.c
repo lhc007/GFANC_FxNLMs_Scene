@@ -373,6 +373,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                     ctx->peak_mute = 1;
                     for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= 0.5f;
                     ctx->wc_init_max *= 0.5f;  /* R-52: 同步收紧 freeze 基准, 防止膨胀逃逸 */
+                    if (ctx->wc_init_max < 0.001f) ctx->wc_init_max = 0.001f;  /* 防连减到 ~0 → 假 freeze */
                     ctx->peak_rollback_cnt++;
                 }
             } else {

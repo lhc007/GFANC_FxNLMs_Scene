@@ -18,6 +18,7 @@ int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
     fx->x_hist = (float *)calloc(L,         sizeof(float));
     fx->xd_ptr = 0; fx->x_hist_ptr = 0;
     fx->freeze_lms = 0;
+    fx->err_env = 1e-4f;   /* 误差功率包络初值 (err RMS≈0.01) */
     if (!fx->wc || !fx->xd || !fx->x_hist) {
         free(fx->wc); free(fx->xd); free(fx->x_hist);
         fx->wc = NULL; fx->xd = NULL; fx->x_hist = NULL;
@@ -118,18 +119,27 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
         power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
+    /* 误差归一化: err_env 平滑跟踪误差功率, 梯度除以 sqrt(err_env),
+       使更新幅度与误差麦绝对电平无关 (调旋钮不重调 step) + 抑制突发过冲. */
+    float ep = 0;
+    for (int e = 0; e < E; e++) ep += err_out[e] * err_out[e];
+    fx->err_env += (ep - fx->err_env) * 0.01f;
+    if (fx->err_env < 1e-6f) fx->err_env = 1e-6f;
+    float err_inv = 1.0f / (sqrtf(fx->err_env) + 1e-6f);
+
     /* 梯度更新 */
     for (int s = 0; s < S; s++) {
         float inv_pwr = 1.0f / power[s];
         for (int e = 0; e < E; e++) {
             float *base = fx->xd + (e * S + s) * L;
             float *wc_s = fx->wc + s * L;
+            float eg = err_out[e] * err_inv;
             int k = 0;
             for (int idx = seg1; idx >= 0; idx--, k++)
-                wc_s[k] -= fx->step_size * err_out[e] * base[idx] * inv_pwr;
+                wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
             if (p > 0)
                 for (int idx = L - 1; idx >= p; idx--, k++)
-                    wc_s[k] -= fx->step_size * err_out[e] * base[idx] * inv_pwr;
+                    wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
         }
         for (int k = 0; k < L; k++)
             fx->wc[s * L + k] *= (1.0f - fx->leak);
@@ -214,6 +224,16 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     for (int s = 0; s < S; s++)
         if (fabsf(anti_out[s]) > 1.2f) saturated = 1;
 
+    /* 误差归一化: err_env 平滑跟踪误差功率, 梯度除以 sqrt(err_env).
+       ① 使更新幅度与误差麦绝对增益无关 (调 UMC 旋钮不重调 step);
+       ② 抑制扬声器→误差麦反馈耦合导致的突发过冲 (err 突增时归一化同步增大,
+          更新幅度受界, 不再触发 peak_mute 极限环/啸叫). */
+    float ep = 0;
+    for (int e = 0; e < E; e++) ep += err_meas[e] * err_meas[e];
+    fx->err_env += (ep - fx->err_env) * 0.01f;
+    if (fx->err_env < 1e-6f) fx->err_env = 1e-6f;
+    float err_inv = 1.0f / (sqrtf(fx->err_env) + 1e-6f);
+
     if (!fx->freeze_lms) {
         if (!saturated) {
             for (int s = 0; s < S; s++) {
@@ -221,12 +241,13 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                 for (int e = 0; e < E; e++) {
                     float *base = fx->xd + (e * S + s) * L;
                     float *wc_s = fx->wc + s * L;
+                    float eg = err_meas[e] * err_inv;
                     int k = 0;
                     for (int idx = seg1; idx >= 0; idx--, k++)
-                        wc_s[k] -= fx->step_size * err_meas[e] * base[idx] * inv_pwr;
+                        wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
                     if (p > 0)
                         for (int idx = L - 1; idx >= p; idx--, k++)
-                            wc_s[k] -= fx->step_size * err_meas[e] * base[idx] * inv_pwr;
+                            wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
                 }
             }
         }
