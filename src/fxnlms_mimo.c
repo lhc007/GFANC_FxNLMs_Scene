@@ -119,13 +119,10 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
         power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
-    /* 误差归一化: err_env 平滑跟踪误差功率, 梯度除以 sqrt(err_env),
-       使更新幅度与误差麦绝对电平无关 (调旋钮不重调 step) + 抑制突发过冲. */
+    /* 误差归一化 (瞬时): 梯度除以 err 的瞬时 2-范数, 更新幅度恒 ≤ step/power. */
     float ep = 0;
     for (int e = 0; e < E; e++) ep += err_out[e] * err_out[e];
-    fx->err_env += (ep - fx->err_env) * 0.01f;
-    if (fx->err_env < 1e-6f) fx->err_env = 1e-6f;
-    float err_inv = 1.0f / (sqrtf(fx->err_env) + 1e-6f);
+    float err_inv = 1.0f / (sqrtf(ep) + 1e-6f);
 
     /* 梯度更新 */
     for (int s = 0; s < S; s++) {
@@ -224,15 +221,13 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     for (int s = 0; s < S; s++)
         if (fabsf(anti_out[s]) > 1.2f) saturated = 1;
 
-    /* 误差归一化: err_env 平滑跟踪误差功率, 梯度除以 sqrt(err_env).
+    /* 误差归一化 (瞬时): 梯度除以 err 的瞬时 2-范数, 更新幅度恒 ≤ step/power.
        ① 使更新幅度与误差麦绝对增益无关 (调 UMC 旋钮不重调 step);
-       ② 抑制扬声器→误差麦反馈耦合导致的突发过冲 (err 突增时归一化同步增大,
-          更新幅度受界, 不再触发 peak_mute 极限环/啸叫). */
+       ② 突发/反馈耦合时 err 突增, 瞬时范数同步增大 → 更新幅度受界,
+          抑制 peak_mute 极限环/啸叫 (EMA 版在突发起点有 ~9× 放大, 瞬时版消除). */
     float ep = 0;
     for (int e = 0; e < E; e++) ep += err_meas[e] * err_meas[e];
-    fx->err_env += (ep - fx->err_env) * 0.01f;
-    if (fx->err_env < 1e-6f) fx->err_env = 1e-6f;
-    float err_inv = 1.0f / (sqrtf(fx->err_env) + 1e-6f);
+    float err_inv = 1.0f / (sqrtf(ep) + 1e-6f);
 
     if (!fx->freeze_lms) {
         if (!saturated) {
