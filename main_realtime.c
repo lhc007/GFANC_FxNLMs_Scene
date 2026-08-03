@@ -141,7 +141,7 @@ typedef struct {
     volatile float nr_level, ref_rms, err_rms, dist_rms;
     volatile float ch_rms[4];    /* 原始声道 RMS: ch0=ref, ch1-3=err */
     volatile float anti_rms;     /* 反噪声 RMS */
-    volatile float acc_ref, acc_err, acc_dist, acc_fb;
+    volatile float acc_ref, acc_err, acc_fb;
     volatile float acc_ch[4], acc_anti, acc_anti_est;
     volatile float acc_d_est;    /* 扰动估计功率 Σ(err-anti_est)² (诚实NR分子) */
     volatile float acc_err_cross;/* Σ(err × anti_est), Ŝ 校准后重构 d_cal 用 */
@@ -399,7 +399,6 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         ctx->acc_fb  += fb_est * fb_est;
         for (int e = 0; e < E; e++) {
             ctx->acc_err  += err_meas[e] * err_meas[e];
-            ctx->acc_dist += err_meas[e] * err_meas[e];  /* 实测误差功率 (用于NR参考) */
         }
         /* BUG-1: 分散采样 — 每 64 样本取 1 个 (整帧恰好 250 个), 覆盖整秒.
            替代 R-55 的连续 250 样本窗口: 连续窗口 + int 溢出 LCG 产生负偏移时
@@ -463,7 +462,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             ctx->safety_mute = (ctx->err_rms > ctx->ref_rms * 2.0f
                                 && ctx->ref_rms > 0.001f
                                 && ctx->mute_hold <= 0);
-            ctx->acc_ref = ctx->acc_err = ctx->acc_dist = ctx->acc_fb = 0;
+            ctx->acc_ref = ctx->acc_err = ctx->acc_fb = 0;
             ctx->acc_anti = ctx->acc_anti_est = ctx->acc_d_est = ctx->acc_err_cross = 0;
             ctx->acc_err_win = 0;
             ctx->acc_cnt = 0;

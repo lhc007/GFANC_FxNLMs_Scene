@@ -358,6 +358,14 @@ int main(void) {
     if (bulk < 0) bulk = 0;
     printf("\n  bulk 延迟 = %d 样本 (%.2fms)\n", bulk, bulk * 1000.0f / FS_CAL);
 
+    /* ── R-16-③: Ŝ 质量门禁 — ERLE 低于阈值的次级路径拒绝写入 (置零).
+       弱辨识路径多为噪声拟合, 写入 Ŝ 会拖累 FxLMS 收敛 (bench 实测 S(e2,s1)=5.8dB 即此例).
+       反馈路径 (c==0) 本身耦合弱 (ERLE 2-3dB 正常), 不门禁. env: GFANC_SEC_MIN_ERLE */
+    float sec_min_erle = 8.0f;
+    {   const char *se = getenv("GFANC_SEC_MIN_ERLE");
+        if (se && atof(se) > 0) sec_min_erle = (float)atof(se); }
+    int sec_rejected = 0;
+
     /* ── 逐块对齐 + NLMS ── */
     float *sec = (float *)calloc((size_t)E * S * SEC_TAPS, sizeof(float));
     float *fb  = (float *)calloc((size_t)S * SEC_TAPS, sizeof(float));
@@ -375,12 +383,32 @@ int main(void) {
             float erle = nlms_identify(xa, ya, n_al, dst, SEC_TAPS);
             free(xa); free(ya);
 
+            /* R-16-③: ERLE 门禁 — 弱次级路径置零 (运行时该通道耦合被忽略) */
+            int rejected = 0;
+            if (c >= 1 && erle < sec_min_erle) {
+                memset(dst, 0, SEC_TAPS * sizeof(float));
+                rejected = 1;
+                sec_rejected++;
+            }
+
             char tag[32];
             if (c == 0) snprintf(tag, sizeof(tag), "FB (s%d)", s);
             else        snprintf(tag, sizeof(tag), "S(e%d,s%d)", c-1, s);
             /* 注意: 对齐后 IR peak 恒在 GUARD 附近, 总延迟 = anchor±声学差 */
             print_ir_info(tag, dst, SEC_TAPS, erle, anchor[s] - GUARD);
+            if (rejected)
+                printf("       ⚠ ERLE %.1fdB < %.1fdB — 路径置零, 运行时忽略该扬声器→误差麦耦合\n",
+                       erle, sec_min_erle);
         }
+    }
+
+    /* R-16-③: 全部次级路径被拒 → Ŝ 无有效内容, 放弃保存 */
+    if (sec_rejected >= E * S) {
+        fprintf(stderr, "ERROR: 全部 %d 条次级路径 ERLE 低于 %.1fdB, 放弃保存.\n"
+                "      检查: 扬声器音量 / 误差麦信号 / 距离; 或调低 GFANC_SEC_MIN_ERLE.\n",
+                E * S, sec_min_erle);
+        free(noise_16k); free(noise_hw); free(mic_hw); free(mic16); free(sec); free(fb);
+        return 1;
     }
 
     /* ── 保存 ── */
@@ -405,8 +433,11 @@ int main(void) {
                  printf("  Saved: %s\n", path); }
     }
 
-    printf("\n  !! 注意: 环路延迟 ~%.0fms + 流滑移 → 宽带随机噪声无法前馈抵消;\n"
-           "     低频周期性噪声 (<150Hz) 可自适应跟踪. 根治需共时钟低延迟声卡.\n",
+    printf("\n  !! 注意: 环路延迟 %.1fms (GFANC_BUFFER 可调, 默认 128 样本).\n"
+           "     宽带随机噪声的实时前馈抵消受预览时间限制:\n"
+           "     预览 = 参考→误差声学延迟(当前几何 ~1.9ms) − 环路延迟 − 带通(8ms).\n"
+           "     当前环路下仅能实时对消 <~55Hz 宽带 + 窄带/周期成分;\n"
+           "     中高频宽带需低延迟嵌入式 (Phase-2) + 更多通道.\n",
            (float)(bulk + GUARD) * 1000.0f / FS_CAL);
 
     free(noise_16k); free(noise_hw); free(mic_hw); free(mic16);
