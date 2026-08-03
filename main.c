@@ -394,7 +394,7 @@ int main(int argc, char **argv)
             if (!getenv("GFANC_MIC_GAIN")) {
                 float auto_gain = TARGET_REF_RMS / (sqrtf(acc_ref / (len + 1e-10f)) + 1e-10f);
                 if (auto_gain < 1.0f) auto_gain = 1.0f;
-                if (auto_gain > 5.0f) auto_gain = 5.0f;
+                if (auto_gain > 20.0f) auto_gain = 20.0f;
                 cfg.mic_pre_gain = auto_gain;
             }
         } else {

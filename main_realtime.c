@@ -1139,12 +1139,12 @@ int main(void) {
                    超过 5× 的部分需通过 UMC 物理旋钮提升 — 数字增益同步放大反馈残余. */
                 float auto_gain = TARGET_REF_RMS / (ctx->ch_rms[0] + 1e-10f);
                 if (auto_gain < 1.0f) auto_gain = 1.0f;
-                int capped = (auto_gain > 5.0f);
-                if (capped) auto_gain = 5.0f;
+                int capped = (auto_gain > 20.0f);
+                if (capped) auto_gain = 20.0f;
                 cfg.mic_pre_gain = auto_gain;
                 printf("       Auto gain=%.1fx from ref_rms=%.4f%s\n",
                        auto_gain, ctx->ch_rms[0],
-                       capped ? " (capped@5x — 提高 UMC 物理旋钮)" : "");
+                       capped ? " (capped@20x — 提高 UMC 物理旋钮)" : "");
             }
             ctx->first_sec = 0;
         } else {
