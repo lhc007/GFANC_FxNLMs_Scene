@@ -1,6 +1,6 @@
 # GFANC FxNLMS — MIMO 主动降噪系统
 
-> **版本**: v1.1 (2026-07-31) | **分支**: realtime-io
+> **版本**: v1.2 (2026-08-03) | **分支**: realtime-io
 
 一个**主动降噪引擎**的纯 C 语言实现，从 Python 项目 [GFANC_Scene](GFANC_Scene) 移植。
 
@@ -25,7 +25,7 @@
 > 当前使用单设备 ASIO 声卡（共时钟驱动所有 ADC/DAC），时钟同步问题已解决。
 > 反馈抵消需运行 `calibrate_feedback.exe` 逐扬声器校准。
 
-**噪声源必须同时覆盖参考麦克风和误差麦克风**——ANC 只能抵消两个位置都能"听到"的噪声。参考麦朝向噪声源，误差麦和扬声器朝向听音区。系统总长约 50cm，建议安装在窗户开口处（参考麦朝向窗外，误差麦+扬声器朝向室内）。
+**噪声源必须同时覆盖参考麦克风和误差麦克风**——ANC 只能抵消两个位置都能"听到"的噪声。参考麦朝向噪声源，误差麦和扬声器朝向听音区。系统几何：**参考麦↔误差麦 64cm、扬声器↔误差麦 15cm**，建议安装在窗户开口处（参考麦朝向窗外，误差麦+扬声器朝向室内）。
 
 ### 软件
 
@@ -94,6 +94,13 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 
 > **只在麦克风或扬声器位置变化时需要重新校准**。文件缺失时反馈抵消自动禁用，不影响降噪效果但可能引发啸叫。
 
+> 💡 **首次运行前还需测环路延迟**（FxLMS 对齐必需）：
+> ```bash
+> gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+> ./calibrate_secondary.exe   # 生成 data/sec_bulk_delay.bin (环路延迟) + secondary_path_measured.bin
+> ```
+> 运行时自动加载最新的实测 Ŝ 并补偿环路延迟（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。**每次换安装位置/几何后都要重测**（详见 [次级路径测量](#次级路径测量python-farina-扫频法)）。
+
 ### 5. 运行
 
 **离线版** — 处理一段噪声录音：
@@ -126,25 +133,25 @@ $env:GFANC_HW_THRESH = "10"
 ```
 PS D:\VSCodeRepository\GFANC_FxNLMs_Scene> ./main.exe "Noise Examples/road_noise-15.wav"
 Loading weights...
+  BP ANC: bandpass_anc.bin (256tap, gd=8.0ms)
   OK: sec=6144 pri=6144 sub=30720 bp=1024 L=1024
   CNN loaded.
-  System ready.
+  System ready (CNN loaded).
 
-Input: 16000 Hz, 1 ch, 240000 samples (15.0s)
+Input: 44100 Hz, 1 ch, 661500 samples (15.0s)
+Resampled: 44100 Hz -> 16000 Hz (240000 samples)
 
- Sec |              Top-3 Scenes |   dB(Band) |   dB(Full) | Action
+ Sec | Scene | NR_est | NR_true |    err | refFilt |   anti | Note
 -------------------------------------------------------------------------------------
-[Diag] Wc_new RMS: 0.0346
-[Diag] Dis (带内) RMS: 1.6262
-   1 |      0:0.33,6:0.26,3:0.10 |    14.44 dB |    16.20 dB | INIT
-   2 |      0:0.36,6:0.26,3:0.10 |    15.18 dB |    16.69 dB | -
-   3 |      0:0.34,6:0.25,3:0.10 |    15.10 dB |    16.81 dB | -
+   1 |     0 |    2.3 |    2.1 | 0.215 | 0.0098 | 0.0211 | INIT [FxRMS=0.0098]
+   2 |     0 |    4.6 |    4.4 | 0.179 | 0.0099 | 0.0370 | -
+   3 |     1 |    4.9 |    4.8 | 0.189 | 0.0142 | 0.0596 | -
   ...
-  15 |      0:0.32,3:0.28,7:0.19 |    15.89 dB |    17.89 dB | -
+  15 |     0 |    8.4 |    8.3 | 0.181 | 0.0144 | 0.1018 | -
 -------------------------------------------------------------------------------------
-  Avg |                           |    15.00 dB |    16.52 dB |
+  Avg |                           |        |    7.0 |
 
-Processing: 6.1s for 15.0s audio (2.5x)
+Processing: 4.6s for 15.0s audio (3.2x)
 Output: anti_out.wav (2 ch), error_out.wav (3 ch)
 Done.
 ```
@@ -156,14 +163,14 @@ Done.
 | 列 | 含义 | 举例 |
 |----|------|------|
 | `Sec` | 第几秒 | `1` |
-| `Top-3 Scenes` | AI 识别出的噪声类型（及其置信度） | `0:0.33` = 场景 0 置信度 33% |
-| `dB(Band)` | **实际降噪量**（数字越大越好） | `14.44 dB` = 噪声被压低了 14.44 分贝 |
-| `dB(Full)` | 全频段参考值（包含不可控的高频） | `16.20 dB` |
-| `Action` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(噪声类型变了，切换策略) |
+| `Scene` | CNN 识别的场景 ID | `0` |
+| `NR_est` | **估计降噪量**（与实时版同公式，数字越大越好） | `4.6 dB` = 估计压低了 4.6 分贝 |
+| `NR_true` | **已知真值降噪量**（仅离线可用，Pri 模型精确计算扰动，最可信） | `4.4 dB` |
+| `err` / `refFilt` / `anti` | 残差 / 带通参考 / 反噪声 RMS | |
+| `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(切换场景) |
 
-- **dB(Band) 是最重要的指标**：它告诉你 20-1500Hz 范围内的噪声被压了多少
-- 10 dB 意味着噪声能量降到原来的 1/10，20 dB 意味着降到 1/100
-- 这个系统在测试文件上平均达到 **15 dB**（噪声能量降到约 1/30）
+- **NR_true 是最可信的指标**（离线用 Pri 模型精确算出扰动，NR_est 与它逐秒偏差 <0.5dB）；10 dB 意味着噪声能量降到 1/10，20 dB 意味着降到 1/100
+- 注意：**离线 NR_true 是无因果缺口的模型上限**，不代表实时能达到——实时受 12.4ms 环路延迟限制（见下文"离线验证"）
 
 ## 项目结构
 
@@ -200,9 +207,9 @@ GFANC_FxNLMs_Scene/
 │   └── ...
 │
 ├── docs/                  文档
-│   ├── COMPREHENSIVE_REVIEW.md  综合审查报告（架构·算法·问题追踪）
-│   ├── UPGRADE_ROADMAP.md 升级路线图
-│   └── micphone.md        麦克风数据手册
+│   ├── GFANC_综合审查报告_合并版.md  综合审查（唯一审查文档，七段式）
+│   ├── micphone.md        麦克风数据手册
+│   └── 2026-07-28_硬件调试记录.md  UMC404HD 面板操作指引 + 调试记录
 │
 └── export/                工具脚本（Python → C 格式转换）
     └── export_bin.py      导出为 .bin 文件
@@ -227,22 +234,22 @@ CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（K
 
 F-A 修复后，实时和离线使用独立路径，互不影响：
 
-**实时路径**（`fxnlms_tick_rt`）：
+**实时路径**（`fxnlms_tick_rt`，ANC 带通 256tap 群延迟 8ms）：
 ```
-ref → bp_fir → x_ref ─┬─→ [Wc ⊗ x_ref] → anti (物理扬声器输出)
-                      │
-                      └─→ Ŝ ⊗ ref → Fx → 梯度更新
-                                         ↑
-                           err_meas = bp(err_mic) (实测误差直驱)
+ref → bp_anc(256tap) → x_ref ─┬─→ [Wc ⊗ x_ref] → anti (物理扬声器输出)
+                              │
+                              └─→ Ŝ ⊗ ref → Fx → 梯度更新
+                                                 ↑
+                                   err_meas = bp(err_mic) (实测误差直驱)
 ```
 
-**离线路径**（`fxnlms_tick`，保留）：
+**离线路径**（`fxnlms_tick_rt`，与实时同信号链）：
 ```
-ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
+ref → bp_anc(256tap) → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
               Pri(ref) → Dis → err = Dis + anti → 梯度
 ```
 
-关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。
+关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积 256tap 带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。CNN 分类保留独立的 1024tap 带通（频率分辨率）。
 
 ### 三层架构
 
@@ -268,13 +275,13 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 │    │            ↓                          ↓                  │
 │    │         [Wc⊗ref]                  物理扬声器输出          │
 │    │                                                         │
-│    └→ sec_firs[6] (Ŝ,1040tap) → Xd[E×S×L]                   │
+│    └→ sec_firs[6] (Ŝ,1024+dsp_delay) → Xd[E×S×L]             │
 │                                     ↓                        │
 │                              power = ΣXd²/(E·L)              │
 │                                     ↓                        │
 │  err_meas = bp(err_mic) ──→ ΔWc = -μ·err_meas·Xd/power       │
 │                              (per-sample LMS)                 │
-│                              + leak (5e-6)                    │
+│                              + leak (5e-6, 自适应)             │
 │                              + freeze_lms (max|Wc|>30×wc_init_max) │
 │                                                               │
 ├─ 反馈环路 (规划中, B-1) ─────────────────────────────────────┤
@@ -285,10 +292,12 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 ├─ 辅助 ───────────────────────────────────────────────────────┤
 │                                                               │
 │  反馈抵消: fb_fir[2] FIR(256tap) 逐扬声器校准                  │
-│  啸叫检测: DFT 256pt + IIR notch ×2, 可配阈值 (默认10dB)       │
+│  啸叫检测: DFT 256pt + IIR notch ×2, 可配阈值 (默认14/12)      │
 │  在线Ŝ辨识: sec_online NLMS, μ=5e-6, 零探测噪声                │
-│  冷启动保护: cold_hold 2s anti±0.12硬限幅 + wc_cold_start衰减  │
-│  anti_total = anti_ff + anti_fb → 限幅±1.0 → ZOH×3 → DAC     │
+│  冷启动保护: soft-release 前1s cap0.12(梯度冻结) 后1s cap→1.0  │
+│  Ŝ环路延迟补偿: 自动加载 sec_bulk_delay.bin (dsp_delay)        │
+│  NR指标: 分散采样250点 + ±30dB限幅                             │
+│  anti_total = anti_ff + anti_fb → 限幅±1.0 → 线性内插×3 → DAC │
 │                                                               │
 └──────────────────────────────────────────────────────────────┘
 ## 反馈路径校准
@@ -297,8 +306,8 @@ ref → bp_fir → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
 
 校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
 ```
-Feedback spk0: 256 taps, RMS=0.0005
-Feedback spk1: 256 taps, RMS=0.0006
+Feedback spk0: 256 taps, RMS=0.0012
+Feedback spk1: 256 taps, RMS=0.0011
 ```
 
 文件缺失时反馈抵消自动禁用，日志显示 `Feedback cancel: disabled`，不影响降噪但可能引发啸叫。
@@ -315,6 +324,11 @@ python export/export_bin.py                        # 导出 .npy → data/*.bin
 
 方法: Farina 2000 AES 指数扫频，5s 扫频 20-7500Hz，多次重复时域平均，自动反卷积提取脉冲响应。相比白噪声 NLMS 法，SNR 高 10-20dB，天然免疫时钟滑移。
 
+**Ŝ 文件自动选择 + 环路延迟补偿（v1.2）**：
+- 运行时自动加载**最新的实测 Ŝ**——`secondary_path_measured.bin`（`calibrate_secondary.exe` 产物）与 `secondary_path.bin`（`export_bin.py` 导出）取修改时间较新者，启动日志打印 `Ŝ file: ...`。
+- **必须测环路延迟**：`calibrate_secondary.exe` 会生成 `sec_bulk_delay.bin`（总环路延迟 @16k），运行时自动换算 `dsp_delay` 补偿 FxLMS 对齐（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。缓冲大小用 `GFANC_BUFFER` 调（默认 128 样本），实测 UMC ASIO + 128 帧环路 ≈ **12.4ms**（旧 0.01s suggestedLatency 会把驱动顶到 512 样本 → 30ms，已修复）。
+- ⚠️ **每次换安装位置/几何后必须重测**（管道/桌面/窗户声学不同），否则实时 NR 会下降。
+
 ## 在线次级路径辨识
 
 系统启动后持续跟踪 Ŝ（扬声器→误差麦）的缓慢变化（温湿度、老化）：
@@ -326,12 +340,12 @@ python export/export_bin.py                        # 导出 .npy → data/*.bin
 
 ## 冷启动保护
 
-首次进入某场景时，CNN 预设 Wc 可能与当前噪声不匹配，导致 anti 瞬时 overshoot（可闻嗡嗡）。两层保护：
+首次进入某场景时，CNN 预设 Wc 可能与当前噪声不匹配，导致 anti 瞬时 overshoot（可闻嗡嗡/啸叫）。两层保护 + 软释放（v1.2 消除启动啸叫）：
 
 | 机制 | 参数 | 作用 |
 |------|------|------|
 | Wc 衰减 | `GFANC_WC_COLD` (默认 0.3) | CNN 预设 × 衰减系数，LMS 从低向上收敛 |
-| anti 硬限幅 | cold_hold 2s | 新场景前 2 秒 anti 上限 ±0.12，LMS 在安全范围收敛 |
+| 冷启动软释放 | cold_hold 2s | **前 1s** anti 上限 ±0.12 且梯度冻结；**后 1s** 上限线性 0.12→1.0 且梯度活跃（Wc 在输出受界内自适应收敛）——避免硬释放时未收敛 Wc 的瞬态输出激起反馈啸叫 |
 
 二次进入已收敛场景时跳过保护，直接恢复记忆 Wc，零延迟。
 
@@ -355,21 +369,25 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 子滤波器 (C) | 15 | 预训练滤波器, 按场景混合 |
 | 场景类型 (K) | 3 (运行时从数据推导) | CNN 可识别的噪声环境数 |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
+| CNN 带通 / ANC 带通 | 1024 / 256 tap | 分类用 1024(分辨率), FxLMS 用 256(群延迟 8ms) |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
 | 输入预增益 | 自适应 (env: GFANC_MIC_GAIN) | 自动标定到 TARGET_REF_RMS=0.03 |
-| 步长 (μ) | 5e-7 (基准, Ŝ RMS 自动缩放) | LMS 自适应步长 |
-| 泄漏因子 | 5e-6 (基准, Ŝ RMS 自动缩放) | Wc 正则化 |
+| 步长 (μ) | 5e-7 (基准, Ŝ RMS 自动缩放; env: GFANC_STEP) | LMS 自适应步长 |
+| 泄漏因子 | 5e-6 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
 | 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
 | 冷启动 Wc 衰减 | 0.3 (env: GFANC_WC_COLD) | CNN 预设衰减系数 |
-| 冷启动 anti 限幅 | ±0.12, 2s | cold_hold 防瞬时 overshoot |
+| 冷启动软释放 | 前 1s cap0.12(梯度冻结), 后 1s cap→1.0 | 消除启动啸叫 (v1.2) |
 | Wc 发散救援 | anti_rms > 阈值持续 2s | 回滚 Wc + 重新 ramp |
 | Wc 发散冻结 | max\|Wc\| > 30×wc_init_max | 自动冻结 LMS 梯度 (自适应基准) |
 | 在线 Ŝ 辨识 | μ=5e-6 (env: GFANC_SEC_MU) | NLMS, 零探测噪声 |
+| 音频缓冲 | 128 样本 (env: GFANC_BUFFER, 32-1024) | ASIO buffer; 越小延迟越低但易爆音 (128 稳定甜点, 实测环路 ~12.4ms) |
+| Ŝ 环路延迟补偿 | 自动 (sec_bulk_delay.bin / GFANC_DSP_DELAY) | FxLMS 对齐, bench 实测 ~12.4ms (原 0.01s suggestedLatency 顶回 512 致 30ms, 已修复) |
 | 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
-| 啸叫陷波 | DFT 256pt, IIR ×2 | 可配阈值 (env: GFANC_HW_THRESH, 默认 10dB) |
+| 啸叫陷波 | DFT 256pt, IIR ×2 | 可配阈值 (env: GFANC_HW_THRESH, 默认 14/12) |
+| NR 指标 | 分散采样 250 点 + ±30dB 限幅 | 防噪声基底虚高 (v1.2 BUG-1) |
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
 | 回调预算 | ~30-45% (SIMD ~5-10%) | 已优化: 双段循环零取模, 含安全边际 |
 
@@ -379,8 +397,8 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 
 | 文件 | 功能 |
 |------|------|
-| `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick` 仿真路径 |
-| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, 场景状态机 |
+| `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick_rt` + 256tap ANC 带通 (与实时同信号链) |
+| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, 场景状态机, Ŝ 环路延迟自动补偿 |
 | `src/scene_controller.c` | CNN M5 推理 → softmax → max 归一化 Blend → Wc 构造 (RMS 对齐) |
 | `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) |
 | `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏) |
@@ -403,20 +421,22 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 
 ## 离线验证
 
-离线模式 (`main.exe`) 在 56 秒混合噪声测试文件上：
+离线模式 (`main.exe`)：
 
 | 指标 | 结果 |
 |------|------|
-| 平均降噪量 (dB) | **15.00** |
-| 场景识别 | 4 类, 每秒 1 次 |
-| 处理速度 | 2.5× 实时 (15s 音频 6.1s 完成) |
+| 平均 NR_true (road_noise-15) | **7.0 dB** |
+| 平均 NR_true (mixed_7types_56s) | **5.1 dB** |
+| 场景数 (K) | 3 (运行时从数据推导) |
+| 处理速度 | ~3.2× 实时 |
+| 指标可信度 | NR_est 与 NR_true 逐秒偏差 <0.5dB |
 
-实时模式在 50cm 窗户开口 + ASIO 声卡上实测 NR 4-9dB（稳态噪声），取决于噪声源与参考/误差麦的声学耦合。
+> ⚠️ **离线 NR_true 是无因果缺口的模型上限**（Dis 与 anti 由同一信号驱动），不代表实时可达到。实时受环路延迟限制（`GFANC_BUFFER=128` 下 12.4ms；参考→误差 64cm 仅 1.9ms 预览，宽带噪声前馈不可实时对消）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ 后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
 
 ## 常见问题
 
 **Q: 为什么 error_out.wav 听起来比原噪声还大？**
-A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看 dB(Band) 数字，不要用耳朵直接听 error_out.wav。
+A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看表格里的 NR_true（离线真值）或实时 NR 数字，不要用耳朵直接听 error_out.wav。
 
 **Q: 实时模式怎么验证效果？**
 A: 终端每秒输出 NR(dB)、err/anti RMS、啸叫状态。NR > 3dB 表示有效降噪。

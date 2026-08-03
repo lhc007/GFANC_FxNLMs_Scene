@@ -1058,10 +1058,18 @@ int main(void) {
     printf("  ANC ready: E=%d S=%d L=%d\n", E, S, L);
 
     /* 打开 PortAudio 流 */
-    PaStreamParams in_p = { in_dev, 4, 0x00000001, 0.01, NULL };  /* paFloat32 */
-    PaStreamParams out_p = { out_dev, 2, 0x00000001, 0.01, NULL };
+    /* 缓冲大小: GFANC_BUFFER 可调 (样本), 默认 128 — 与 UMC ASIO 面板匹配.
+       suggestedLatency 由缓冲推导 (128/48k≈2.7ms), 避免旧 0.01s 把 ASIO 驱动
+       顶到 512 样本大缓冲 (往返延迟 ~30ms). 改小缓冲后环路延迟下降,
+       但需重跑 calibrate_secondary 更新 sec_bulk_delay.bin. */
+    int buf_frames = 128;
+    {   const char *s = getenv("GFANC_BUFFER");
+        if (s && atoi(s) >= 32 && atoi(s) <= 1024) buf_frames = atoi(s); }
+    double buf_lat = (double)buf_frames / 48000.0;
+    PaStreamParams in_p = { in_dev, 4, 0x00000001, buf_lat, NULL };  /* paFloat32 */
+    PaStreamParams out_p = { out_dev, 2, 0x00000001, buf_lat, NULL };
     stream = NULL;
-    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, 96, 0, (void*)audio_cb, ctx);
+    int err = p_Pa_OpenStream(&stream, &in_p, &out_p, 48000, buf_frames, 0, (void*)audio_cb, ctx);
     if (err != 0) {
         fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err));
         ret = 1; goto cleanup;

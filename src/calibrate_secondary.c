@@ -305,13 +305,18 @@ int main(void) {
     for (int s = 0; s < S; s++) {
         printf("\n── Speaker %d: 播放白噪声 %d 秒, 保持安静! ──\n", s, CAL_SEC);
         cal_data_t cal = { noise_hw, mic_hw, 0, total_hw, s };
-        /* BUG-2: 流参数与运行时完全一致 (96帧@48k / 0.01s), bulk 延迟才能对应.
-           旧 960帧/0.2s 测出的 bulk (~112ms) 远大于运行时实际环路 (~4-6ms),
-           sec_bulk_delay.bin 无法用于运行时 dsp_delay 补偿. */
-        PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.01, NULL };  /* UMC 4ch: ch0=ref, ch1-3=err */
-        PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };
+        /* BUG-2: 流参数与运行时完全一致 (GFANC_BUFFER / 推导延迟), bulk 延迟才能对应.
+           旧 960帧/0.2s 测出的 bulk (~112ms) 远大于运行时实际环路.
+           旧 96帧/0.01s 的 suggestedLatency 会把 ASIO 驱动顶到 512 样本 → 环路 ~30ms;
+           现由缓冲推导延迟, 与运行时同步可调. */
+        int buf_frames = 128;
+        {   const char *be = getenv("GFANC_BUFFER");
+            if (be && atoi(be) >= 32 && atoi(be) <= 1024) buf_frames = atoi(be); }
+        double buf_lat = (double)buf_frames / FS_HW;
+        PaStreamParams in_p  = { in_dev,  4, paFloat32, buf_lat, NULL };  /* UMC 4ch: ch0=ref, ch1-3=err */
+        PaStreamParams out_p = { out_dev, 2, paFloat32, buf_lat, NULL };
         PaStream *stream = NULL;
-        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
+        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, buf_frames, paNoFlag, cal_cb, &cal);
         if (err != 0) { fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err)); return 1; }
         p_Pa_StartStream(stream);
         while (cal.idx < total_hw) Sleep(100);

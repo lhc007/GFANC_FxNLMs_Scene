@@ -225,8 +225,14 @@ int main(void) {
     for (int i = 0; i < n_16k; i++)
         noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * noise_amp;
 
-    PaStreamParams in_p  = { in_dev,  4, paFloat32, 0.01, NULL };
-    PaStreamParams out_p = { out_dev, 2, paFloat32, 0.01, NULL };
+    /* 缓冲可调: GFANC_BUFFER (样本), 默认 128 — 与运行时同步, suggestedLatency 由缓冲推导
+       (避免旧 0.01s 把 ASIO 驱动顶到 512 样本大缓冲). */
+    int buf_frames = 128;
+    {   const char *s = getenv("GFANC_BUFFER");
+        if (s && atoi(s) >= 32 && atoi(s) <= 1024) buf_frames = atoi(s); }
+    double buf_lat = (double)buf_frames / FS_HW;
+    PaStreamParams in_p  = { in_dev,  4, paFloat32, buf_lat, NULL };
+    PaStreamParams out_p = { out_dev, 2, paFloat32, buf_lat, NULL };
 
     /* ── 逐扬声器校准 (F-G修复) ── */
     for (int spk = 0; spk < 2; spk++) {
@@ -238,7 +244,7 @@ int main(void) {
         cal_data_t cal = { noise_16k, ref_hw, 0, total_hw, spk };
 
         PaStream *stream = NULL;
-        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, 96, paNoFlag, cal_cb, &cal);
+        int err = p_Pa_OpenStream(&stream, &in_p, &out_p, FS_HW, buf_frames, paNoFlag, cal_cb, &cal);
         if (err) { fprintf(stderr, "PA open error: %s\n", p_Pa_GetErrorText(err)); return 1; }
         p_Pa_StartStream(stream);
         while (cal.idx < total_hw) gf_sleep_ms(100);  /* R-28 */
