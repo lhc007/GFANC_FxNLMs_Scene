@@ -119,18 +119,14 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
         power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
-    /* 误差归一化 (瞬时): 梯度除以 err 的瞬时 2-范数, 更新幅度恒 ≤ step/power. */
-    float ep = 0;
-    for (int e = 0; e < E; e++) ep += err_out[e] * err_out[e];
-    float err_inv = 1.0f / (sqrtf(ep) + 1e-6f);
-
-    /* 梯度更新 */
+    /* 梯度更新 (inv_pwr 上限与实时版一致, 弱信号有效步长受界) */
     for (int s = 0; s < S; s++) {
         float inv_pwr = 1.0f / power[s];
+        if (inv_pwr > 1000.0f) inv_pwr = 1000.0f;
         for (int e = 0; e < E; e++) {
             float *base = fx->xd + (e * S + s) * L;
             float *wc_s = fx->wc + s * L;
-            float eg = err_out[e] * err_inv;
+            float eg = err_out[e];
             int k = 0;
             for (int idx = seg1; idx >= 0; idx--, k++)
                 wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
@@ -221,22 +217,18 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     for (int s = 0; s < S; s++)
         if (fabsf(anti_out[s]) > 1.2f) saturated = 1;
 
-    /* 误差归一化 (瞬时): 梯度除以 err 的瞬时 2-范数, 更新幅度恒 ≤ step/power.
-       ① 使更新幅度与误差麦绝对增益无关 (调 UMC 旋钮不重调 step);
-       ② 突发/反馈耦合时 err 突增, 瞬时范数同步增大 → 更新幅度受界,
-          抑制 peak_mute 极限环/啸叫 (EMA 版在突发起点有 ~9× 放大, 瞬时版消除). */
-    float ep = 0;
-    for (int e = 0; e < E; e++) ep += err_meas[e] * err_meas[e];
-    float err_inv = 1.0f / (sqrtf(ep) + 1e-6f);
-
     if (!fx->freeze_lms) {
         if (!saturated) {
             for (int s = 0; s < S; s++) {
+                /* BUG: 限制有效步长 — 弱信号时 NLMS 功率归一化把 inv_pwr 放大到 ~1e4,
+                   有效步长 = step×1e4 爆炸 → Wc 失控增长 → 反馈极限环.
+                   上限 1000 使有效步长 ≤ step×1000, 弱信号更新受界. */
                 float inv_pwr = 1.0f / power[s];
+                if (inv_pwr > 1000.0f) inv_pwr = 1000.0f;
                 for (int e = 0; e < E; e++) {
                     float *base = fx->xd + (e * S + s) * L;
                     float *wc_s = fx->wc + s * L;
-                    float eg = err_meas[e] * err_inv;
+                    float eg = err_meas[e];
                     int k = 0;
                     for (int idx = seg1; idx >= 0; idx--, k++)
                         wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
