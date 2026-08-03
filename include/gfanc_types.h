@@ -83,14 +83,16 @@ typedef struct {
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
-    0.0000005f, 5e-6f,  /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放 */ \
+    1e-7f, 5e-6f,       /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放.
+                           step=1e-7 + inv_pwr≤1000 上限 → 弱信号有效步长受界,
+                           无需手动调参即可稳定. 需要更快收敛可 GFANC_STEP=3e-7 */ \
     0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
                            Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
     30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
     0.25f,              /* diverge_anti_rms */ \
-    15.0f, 4, 8, 0.96f, /* hw_thresh_db, hw_persist, hw_release, hw_notch_r */ \
+    12.0f, 4, 8, 0.96f, /* hw_thresh_db(12), hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
     0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
