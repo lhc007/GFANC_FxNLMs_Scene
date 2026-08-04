@@ -292,9 +292,14 @@ int main(void) {
     float *noise_16k = (float *)malloc(n_16k * sizeof(float));
     float *noise_hw  = (float *)malloc(total_hw * sizeof(float));
     float *mic_hw    = (float *)malloc((size_t)NMIC * total_hw * sizeof(float));
+    /* 探针幅度可调: GFANC_CAL_NOISE (与反馈校准一致), 默认 0.9 */
+    float noise_amp = NOISE_AMP;
+    {   const char *s = getenv("GFANC_CAL_NOISE");
+        if (s) noise_amp = (float)atof(s); }
+    printf("Noise amplitude: %.2f (set GFANC_CAL_NOISE to override)\n", noise_amp);
     srand(42);
     for (int i = 0; i < n_16k; i++)
-        noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * NOISE_AMP;
+        noise_16k[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * noise_amp;
     for (int i = 0; i < n_16k; i++)
         noise_hw[i*3] = noise_hw[i*3+1] = noise_hw[i*3+2] = noise_16k[i];
 

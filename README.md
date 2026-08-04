@@ -101,6 +101,10 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 > ```
 > 运行时自动加载最新的实测 Ŝ 并补偿环路延迟（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。**每次换安装位置/几何后都要重测**（详见 [次级路径测量](#次级路径测量python-farina-扫频法)）。
 
+> 📏 **校准质量规则**：校准时声卡输入 **SIG 常亮、CLIP 不亮**。CLIP 亮 = 输入削波，会污染路径辨识。
+> 探针响度由 `GFANC_CAL_NOISE` 控制（默认 0.9，反馈/次级两个校准程序都支持）：削波就调小（如 0.4），SNR 不足就调大。
+> ERLE < 8dB 的弱耦合路径会被自动置零（运行时忽略该扬声器→误差麦耦合），属正常保护。
+
 ### 5. 运行
 
 **离线版** — 处理一段噪声录音：
@@ -116,25 +120,18 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 - `anti_out.wav` — 反噪声信号（2 声道，这是播放到扬声器的声音）
 - `error_out.wav` — 残差信号（3 声道，降噪后剩余的声音）
 
-**实时版** — 实时抵消环境噪声：
+**实时版** — 实时抵消环境噪声（默认参数即可，自动增益）：
 ```bash
-$env:GFANC_WC_TARGET = "0.01"
-$env:GFANC_STEP = "1e-7"
-$env:GFANC_WC_COLD = "0.3"
-$env:GFANC_HW_THRESH = "10"
-$env:GFANC_MIC_GAIN=20
-$env:GFANC_DIVERGE_ANTI=5
-
 ./gfanc_realtime.exe
-
-下一轮参数
-GFANC_WC_TARGET=0.01
-GFANC_STEP=3e-7       # 追噪音动态
-GFANC_WC_COLD=0.3
-GFANC_MIC_GAIN=20     # 保持到硬件确认
-GFANC_DIVERGE_ANTI=5
-
 ```
+
+关键操作要点：
+
+- **模拟增益旋钮是灵敏度关键**：ECM8000 弱信号，输入增益旋钮要调到能清晰收音（启动日志 `refFilt≈0.03`、无「输入电平过低」警告）。**校准与运行必须用同一旋钮位置**（路径系数嵌入模拟增益）。
+- **误差麦克风 = 安静区目标，不是测试拾音器**：在误差麦旁说话/拍手（参考麦预测不到的突发）会触发静音保护，属正常。噪声源应在参考麦上游（保持「参考麦 → 误差麦」的前馈几何）。
+- **啸叫陷波（~125Hz）**：扬声器→误差麦反馈会在 ~125Hz 形成临界啸叫，由啸叫检测陷波压制。**不要调高 `GFANC_HW_THRESH`（默认 12）** —— 调高会放开反馈，导致周期性「收敛→爆炸→静音」循环。
+- **几何限制**：环路延迟 ~12.4ms vs 参考→误差预览 ~1.9ms → 只能实时消 <~55Hz 宽带 + 周期/窄带成分（实测 NR 约 4-6dB）。要更高需拉大参考麦与误差麦距离，或缩短 ANC 带通。
+- 可选调参：`GFANC_MIC_GAIN`（输入预增益）、`GFANC_STEP`、`GFANC_WC_TARGET` 等见[系统参数表](#系统参数)。
 
 运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `23`），然后开始实时降噪。按 `Ctrl+C` 停止。
 
