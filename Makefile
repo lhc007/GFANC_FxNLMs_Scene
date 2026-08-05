@@ -17,6 +17,7 @@ LDFLAGS_RT = -lm -lole32
 MODULES = src/scene_controller.c src/fxnlms_mimo.c \
           src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c \
           src/howling_detect.c
+RT_MODULES = src/sec_online.c src/pa_loader.c   # 仅实时版需要 (与 README 编译命令一致)
 CAL_MODULES = src/fir_filter.c src/binary_loader.c src/pa_loader.c
 
 .PHONY: all realtime calibrate clean test test-accept
@@ -26,8 +27,8 @@ all: main.exe realtime calibrate
 main.exe: main.c $(MODULES)
 	$(CC) $(CFLAGS) main.c $(MODULES) $(LDFLAGS) -o $@
 
-gfanc_realtime.exe: main_realtime.c $(MODULES)
-	$(CC) $(CFLAGS_RT) main_realtime.c $(MODULES) $(LDFLAGS_RT) -o $@
+gfanc_realtime.exe: main_realtime.c $(MODULES) $(RT_MODULES)
+	$(CC) $(CFLAGS_RT) main_realtime.c $(MODULES) $(RT_MODULES) $(LDFLAGS_RT) -o $@
 realtime: gfanc_realtime.exe
 
 calibrate_feedback.exe: src/calibrate_feedback.c $(CAL_MODULES)

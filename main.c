@@ -171,7 +171,7 @@ int main(int argc, char **argv)
     int sub_len  = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len   = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     int n_scene  = bin_load_float("data/scene_defs.bin", &centroids);
-    /* BUG-6: ANC 专用短带通 (256tap, 与实时版一致). 无文件时截取 1024tap 前 256 点. */
+    /* BUG-6: ANC 专用短带通 (64tap, 与实时版一致). 无文件时截取 1024tap 前 64 点. */
     float *bp_anc_coeff = NULL;
     int bp_anc_loaded = bin_load_float("data/bandpass_anc.bin", &bp_anc_coeff);
     int bp_anc_ok = (bp_anc_loaded >= BP_ANC_LEN);
@@ -306,7 +306,7 @@ int main(int argc, char **argv)
        匹配实时版 ref_filt 信号链: pre_gain → soft_clip → bandpass
        注意: 不做峰值归一化 (实时版 ADC 输入无归一化) */
     float *ref_filt_all = (float *)malloc(N * sizeof(float));   /* 1024tap: CNN 分类用 */
-    float *ref_anc_all  = (float *)malloc(N * sizeof(float));   /* 256tap: FxLMS/anti 用 (BUG-6, 与实时版一致) */
+    float *ref_anc_all  = (float *)malloc(N * sizeof(float));   /* 64tap: FxLMS/anti 用 (BUG-6, 与实时版一致) */
     {
         fir_filter_t bp_tmp = { bp_fir.coeffs, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
         fir_filter_t bp_anc = { bp_anc_coeff, (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t)), BP_ANC_LEN, 0 };
@@ -332,7 +332,7 @@ int main(int argc, char **argv)
             sec_firs_err[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
-    /* 误差麦带通 FIR (匹配实时版 bp_err[E], BUG-6: 256tap ANC 带通) */
+    /* 误差麦带通 FIR (匹配实时版 bp_err[E], BUG-6: 64tap ANC 带通) */
     fir_filter_t bp_err[E];
     for (int e = 0; e < E; e++) {
         bp_err[e].coeffs = bp_anc_coeff;
@@ -443,7 +443,7 @@ int main(int argc, char **argv)
         acc_anti = acc_ref = 0; acc_cnt = 0;
         for (int n = 0; n < len; n++) {
             int idx = start + n;
-            float ref_filt = ref_anc_all[idx];   /* BUG-6: 256tap ANC 带通 (匹配实时) */
+            float ref_filt = ref_anc_all[idx];   /* BUG-6: 64tap ANC 带通 (匹配实时) */
             acc_ref += ref_filt_all[idx] * ref_filt_all[idx];  /* 1024tap CNN 带通 (匹配实时 ref_rms 显示) */
 
             /* CrossFader */

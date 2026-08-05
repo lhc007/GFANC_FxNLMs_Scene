@@ -4,6 +4,10 @@
 *.obj
 build/
 
+# Python caches
+__pycache__/
+*.pyc
+
 # Runtime output
 anti_out.wav
 error_out.wav

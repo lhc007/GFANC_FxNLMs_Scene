@@ -22,6 +22,35 @@
 #include "howling_detect.h"
 #include "sec_online.h"
 
+/* ── ADV-F3: 回调 WCET 监控 (诊断). GFANC_WCET=1 开启 (默认关, 零开销).
+   rdtsc 仅 x86/x64; 其他平台编译为恒 0, WCET 显示 0. ── */
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#  define GFANC_RDTSC() ((unsigned long long)__rdtsc())
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#  include <x86intrin.h>
+#  define GFANC_RDTSC() ((unsigned long long)__rdtsc())
+#else
+#  define GFANC_RDTSC() ((unsigned long long)0)
+#endif
+static int    g_wcet_on = 0;       /* GFANC_WCET=1 开启 */
+static double g_wcet_cps = 1.0;    /* 启动校准: cycles/µs */
+static volatile unsigned long long g_wcet_min, g_wcet_max, g_wcet_sum; /* 回调耗时(cycles) */
+static volatile int g_wcet_cnt;    /* 回调累计计数 (≈375/s @128帧) */
+
+/* 一次性校准 cycles/µs: rdtsc delta / QPC delta 50ms */
+static void wcet_calibrate(void)
+{
+    LARGE_INTEGER freq, t0, t1;
+    unsigned long long c0, c1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0); c0 = GFANC_RDTSC();
+    gf_sleep_ms(50);
+    QueryPerformanceCounter(&t1); c1 = GFANC_RDTSC();
+    double secs = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    g_wcet_cps = (secs > 0.0 && (c1 - c0) > 0) ? (double)(c1 - c0) / secs / 1e6 : 1.0;
+}
+
 /* R-14: 2阶 Butterworth 低通 biquad (48kHz侧抗混叠, fc≈6kHz) */
 typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
 
@@ -172,6 +201,10 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     (void)ti; (void)flags;
 
     if (!ctx->running) { memset(out, 0, c48k * 2 * sizeof(float)); return 1; }
+
+    /* ADV-F3: WCET 计时起点 (正常路径; 关闭时零开销) */
+    unsigned long long cb_t0 = 0;
+    if (g_wcet_on) cb_t0 = GFANC_RDTSC();
 
     /* R-5: 3:1 抽取 + 跨回调相位保持 — WASAPI/WDM-KS 可变帧长不再破坏相位连续性
        R-14: 抽取前 2阶 Butterworth 低通抗混叠 (fc≈6kHz, 防止>8kHz折叠入通带) */
@@ -535,6 +568,18 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
     }
 
     InterlockedIncrement(&ctx->callback_count);
+
+    /* ADV-F3: WCET 累计 (cb 线程写; 主线程 1Hz print_diagnostics 读+清零) */
+    if (g_wcet_on) {
+        unsigned long long dt = GFANC_RDTSC() - cb_t0;
+        if (g_wcet_cnt == 0) { g_wcet_min = g_wcet_max = dt; }
+        else {
+            if (dt < g_wcet_min) g_wcet_min = dt;
+            if (dt > g_wcet_max) g_wcet_max = dt;
+        }
+        g_wcet_sum += dt;
+        g_wcet_cnt++;
+    }
     return 0; /* paContinue */
 }
 
@@ -582,6 +627,16 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
     printf("       raw: ch0(ref)=%.4f ch1=%.4f ch2=%.4f ch3=%.4f (refFilt=%.4f gain=%.1f)\n",
            ctx->ch_rms[0], ctx->ch_rms[1], ctx->ch_rms[2], ctx->ch_rms[3],
            ctx->ref_rms, cfg.mic_pre_gain);
+    /* ADV-F3: WCET 诊断 (GFANC_WCET=1) — 回调耗时 vs 128帧@48k=2.67ms 预算 */
+    if (g_wcet_on && g_wcet_cnt > 0) {
+        unsigned long long mn = g_wcet_min, mx = g_wcet_max, sm = g_wcet_sum;
+        int cn = g_wcet_cnt;
+        printf("       WCET: min=%.0f avg=%.0f max=%.0f us  (%d cb/s, max=%.1f%% of 2.67ms budget)\n",
+               (double)mn / g_wcet_cps, (double)sm / cn / g_wcet_cps,
+               (double)mx / g_wcet_cps, cn,
+               100.0 * (double)mx / g_wcet_cps / 2666.7);
+        g_wcet_min = g_wcet_max = g_wcet_sum = 0; g_wcet_cnt = 0;
+    }
     /* P1: 输入电平诊断 — ref RMS 过低则 ANC 环路增益不足, 受限于 ADC 量化噪声.
        目标 ref_rms ∈ [0.01, 0.1] (-40~-20dBFS). 通过 GFANC_MIC_GAIN 环境变量调节.
        注意: 提高增益前需确保反馈抵消已标定, 否则可能触发啸叫. */
@@ -734,6 +789,9 @@ int main(void) {
     gfanc_config_load_env(&cfg);
     LOG_INFO("Runtime config: gain=%.1f step=%.2e leak=%.0e ramp=%dms mute=%dms dsp=%d",
              cfg.mic_pre_gain, cfg.step_size, cfg.leak, cfg.ramp_ms, cfg.mute_hold_ms, cfg.dsp_delay);
+    /* ADV-F3: WCET 监控开关 (GFANC_WCET=1) + 一次性 cycles/µs 校准 */
+    {   const char *w = getenv("GFANC_WCET");
+        if (w && w[0] == '1') { g_wcet_on = 1; wcet_calibrate(); } }
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
 

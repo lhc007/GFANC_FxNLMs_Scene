@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>  /* gf_log (ADV-D4: LOG 宏去 GCC ##__VA_ARGS__ 扩展) */
 
 typedef float gfanc_float_t;
 
@@ -34,11 +35,22 @@ typedef struct {
     int            ptr;
 } fir_filter_t;
 
-/* ── 分级日志宏 (CR-20) ── */
-#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  printf(  "[INFO]  " fmt "\n", ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) /* disabled in release */ ((void)0)
+/* ── 分级日志宏 (CR-20) — C99 标准兼容 (ADV-D4: 去掉 GCC `##__VA_ARGS__` 扩展).
+   实现: 变参函数 + 变参宏, 支持任意参数 (含零参数), MSVC/IAR/Keil 兼容.
+   用法: LOG_INFO("msg") 或 LOG_INFO("val=%d", x) ── */
+static inline void gf_log(FILE *fp, const char *tag, const char *fmt, ...)
+{
+    va_list ap;
+    fputs(tag, fp);
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+}
+#define LOG_ERROR(...) gf_log(stderr, "[ERROR] ", __VA_ARGS__)
+#define LOG_WARN(...)  gf_log(stderr, "[WARN]  ", __VA_ARGS__)
+#define LOG_INFO(...)  gf_log(stdout, "[INFO]  ", __VA_ARGS__)
+#define LOG_DEBUG(...) /* disabled in release */ ((void)0)
 
 /* ── 算法常数 (非用户调节, 表达物理/设计约束) ── */
 #define TARGET_REF_RMS  0.03f   /* 自动增益标定目标 ref RMS (-30dBFS) */
