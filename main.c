@@ -142,7 +142,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define C       15
 #define FS      16000
 #define BP_LEN  1024   /* CNN 带通 (分类需频率分辨率) */
-#define BP_ANC_LEN 256 /* BUG-6: ANC 带通 (与实时版一致, 群延迟 8ms vs 32ms) */
+#define BP_ANC_LEN 64 /* BUG-6: ANC 带通 (与实时版一致, 64tap 群延迟 2ms vs 8ms — 砍环路延迟) */
 #define PRI_LEN 1024
 #define SEC_LEN 1024
 #define DSP_DELAY 0  /* 与实时版一致: Ŝ 已含声学延迟, 无硬件 I/O 延迟需补偿 */
