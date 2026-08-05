@@ -8,6 +8,14 @@
 #include <math.h>
 #include "fxnlms_mimo.h"
 
+/* ── 变步长 (VS-LMS): 误差相对自身基线跳变 (突发/反馈过冲) 时降步, 平滑收敛全速.
+   双 EMA 尖峰检测: err_env(快,~4ms) vs err_base(慢,~31ms).
+   err_env >> err_base → 尖峰 → 降步防反馈过冲; 平滑收敛 err≈base → 全速.
+   解决 "step 高→反馈振荡, step 低→收敛慢" 的矛盾. ── */
+#define VS_EMA      0.01f   /* 快 EMA (~4ms, 抓突发) */
+#define VS_BASE_EMA 0.002f  /* 慢 EMA (~31ms, 基线) */
+#define VS_MIN      0.05f   /* 变步长下限 (不低于 5%, 保留收敛能力) */
+
 int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak)
 {
@@ -18,7 +26,7 @@ int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
     fx->x_hist = (float *)calloc(L,         sizeof(float));
     fx->xd_ptr = 0; fx->x_hist_ptr = 0;
     fx->freeze_lms = 0;
-    fx->err_env = 1e-4f;   /* 误差功率包络初值 (err RMS≈0.01) */
+    fx->err_env = fx->err_base = 1e-4f;   /* 误差功率包络初值 (err RMS≈0.01) */
     if (!fx->wc || !fx->xd || !fx->x_hist) {
         free(fx->wc); free(fx->xd); free(fx->x_hist);
         fx->wc = NULL; fx->xd = NULL; fx->x_hist = NULL;
@@ -219,6 +227,16 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
 
     if (!fx->freeze_lms) {
         if (!saturated) {
+            /* ── 变步长 VS-LMS (2026-08-05): 误差相对自身基线跳变 → 降步防反馈过冲.
+               双 EMA 尖峰检测, 平滑收敛不压 (vs≈1), 突发/反馈 (err_env>>err_base) 时压到 VS_MIN. ── */
+            float err_pow = 0;
+            for (int e = 0; e < E; e++) err_pow += err_meas[e] * err_meas[e];
+            fx->err_env  += (err_pow - fx->err_env)  * VS_EMA;
+            fx->err_base += (err_pow - fx->err_base) * VS_BASE_EMA;
+            float vs = sqrtf(fx->err_base + 1e-12f) / (sqrtf(fx->err_env) + 1e-6f);
+            if (vs > 1.0f) vs = 1.0f;
+            else if (vs < VS_MIN) vs = VS_MIN;
+
             for (int s = 0; s < S; s++) {
                 /* BUG: 限制有效步长 — 弱信号时 NLMS 功率归一化把 inv_pwr 放大到 ~1e4,
                    有效步长 = step×1e4 爆炸 → Wc 失控增长 → 反馈极限环.
@@ -231,10 +249,10 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                     float eg = err_meas[e];
                     int k = 0;
                     for (int idx = seg1; idx >= 0; idx--, k++)
-                        wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
+                        wc_s[k] -= fx->step_size * vs * eg * base[idx] * inv_pwr;
                     if (p > 0)
                         for (int idx = L - 1; idx >= p; idx--, k++)
-                            wc_s[k] -= fx->step_size * eg * base[idx] * inv_pwr;
+                            wc_s[k] -= fx->step_size * vs * eg * base[idx] * inv_pwr;
                 }
             }
         }

@@ -83,9 +83,9 @@ typedef struct {
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
-    1e-7f, 5e-6f,       /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放.
-                           step=1e-7 + inv_pwr≤1000 上限 → 弱信号有效步长受界,
-                           无需手动调参即可稳定. 需要更快收敛可 GFANC_STEP=3e-7 */ \
+    1e-7f, 5e-7f,       /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放.
+                           leak 5e-6→5e-7 (2026-08-05): 弱信号下 leak 压死 Wc 生长
+                           (离线 1.4dB→13dB 的收敛杠杆), 降一档让 Wc 长起来 */ \
     0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
                            Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \

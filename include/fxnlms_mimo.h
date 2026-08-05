@@ -14,7 +14,8 @@ typedef struct {
     float        step_size;
     float        leak;
     volatile int freeze_lms;  /* 发散检测: 1=冻结 (R-28: int 跨平台32-bit, long在LP64为64) */
-    float        err_env;     /* 误差功率包络 (EMA, 梯度归一化用 — 增益无关 + 防突发过冲) */
+    float        err_env;     /* 误差功率包络快 EMA (~4ms, VS-LMS 尖峰检测) */
+    float        err_base;    /* 误差功率包络慢 EMA (~31ms, VS-LMS 基线) */
 } fxnlms_mimo_t;
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,

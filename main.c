@@ -188,6 +188,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "FATAL: primary_path.bin too short/load failed (%d<%d)\n", pri_len, E*2*PRI_LEN);
         return 1;
     }
+    /* 虚拟预览 (GFANC_VIRT_PREVIEW_MS): 参考→误差声学距离. 加在初级路径上,
+       预览越大 → 控制越有时间 → 环路延迟的因果裕量越大. 与 VIRT_DELAY 配合验证. */
+    float *pri_path_used = pri_path;
+    int preview_delay = 0;
+    {   const char *vp = getenv("GFANC_VIRT_PREVIEW_MS");
+        if (vp) { preview_delay = (int)(atof(vp) * FS / 1000.0f);
+            float *pad = (float *)calloc(E*2*PRI_LEN + preview_delay, sizeof(float));
+            memcpy(pad + preview_delay, pri_path, E*2*PRI_LEN*sizeof(float));
+            pri_path_used = pad;
+            printf("  VIRT preview: %s ms → %d samples added to Pri\n", vp, preview_delay); } }
     if (sub_len < C*S || sub_len % (C*S) != 0) {
         fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, C*S);
         return 1;
@@ -228,13 +238,19 @@ int main(int argc, char **argv)
             for (int i = 0; i < E*S*SEC_LEN; i++) sec_path[i] *= inv;
         }
     }
-    int sec_padded = SEC_LEN + DSP_DELAY;
+    /* 虚拟延迟 (GFANC_VIRT_DELAY_MS): 模拟 DSP/处理延迟, 验证算法在不同延迟下的表现.
+       加到 Ŝ 模型 (Fx 对齐 + 误差合成共用), 模拟环路延迟对因果性的消耗. */
+    int virt_delay = 0;
+    {   const char *vd = getenv("GFANC_VIRT_DELAY_MS");
+        if (vd) { virt_delay = (int)(atof(vd) * FS / 1000.0f); /* ms→16k 样本 */
+            printf("  VIRT delay: %s ms → %d samples added to Ŝ\n", vd, virt_delay); } }
+    int sec_padded = SEC_LEN + DSP_DELAY + virt_delay;
     fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
     float *sec_coeffs = (float *)calloc(E * S * sec_padded, sizeof(float));
     for (int e = 0; e < E; e++)
         for (int s = 0; s < S; s++) {
             int idx = e * S + s;
-            memcpy(sec_coeffs + idx * sec_padded + DSP_DELAY,
+            memcpy(sec_coeffs + idx * sec_padded + DSP_DELAY + virt_delay,
                    sec_path + idx * SEC_LEN, SEC_LEN * sizeof(float));
             sec_firs[idx].coeffs = sec_coeffs + idx * sec_padded;
             sec_firs[idx].n_taps = sec_padded;
@@ -244,7 +260,7 @@ int main(int argc, char **argv)
     /* 2c. 初级路径 FIR (R=0, 持久延迟线 — 跨 chunk 连续) */
     fir_filter_t pri_firs[E], pri_raw_firs[E];
     for (int e = 0; e < E; e++) {
-        pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path + e * 2 * PRI_LEN;
+        pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path_used + e * 2 * PRI_LEN;
         pri_firs[e].n_taps = pri_raw_firs[e].n_taps = PRI_LEN;
         pri_firs[e].delay_line     = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
         pri_raw_firs[e].delay_line = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
@@ -578,7 +594,7 @@ int main(int argc, char **argv)
     for (int e = 0; e < E; e++) { free(pri_firs[e].delay_line); free(pri_raw_firs[e].delay_line); }
     free(bp_fir.delay_line);
     free(wav.data); if (ref_resampled) free(ref_resampled);
-    bin_free(sec_path); bin_free(pri_path); bin_free(sub_filters);
+    bin_free(sec_path); if (pri_path_used != pri_path) free(pri_path_used); bin_free(pri_path); bin_free(sub_filters);
     bin_free(centroids); bin_free(bp_coeff);
     if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
     printf("Done.\n");
