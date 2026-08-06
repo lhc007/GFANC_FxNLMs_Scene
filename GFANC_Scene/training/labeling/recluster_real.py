@@ -30,6 +30,12 @@ from sklearn.metrics import silhouette_score
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# 控制台 UTF-8: 修复 GBK 控制台打印 ⚠/✓ 等非 GBK 字符崩溃 (Windows)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = Path(os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..')))
 sys.path.insert(0, str(_PROJECT_ROOT))
