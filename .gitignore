@@ -8,6 +8,9 @@ build/
 __pycache__/
 *.pyc
 
+# Training output (plots)
+figures/
+
 # Runtime output
 anti_out.wav
 error_out.wav

@@ -350,17 +350,22 @@ def ensure_dir(dir_path):
 def main():
     # ── 配置参数 ──────────────────────────────────────────────
     # ================== 全局开关：改这里即可切换 ==================
-    USE_LOG_SPACING = True   # True: 对数间距 (23~1299Hz), False: 均匀间距 (20~1500Hz)
+    # R-13-②: False (均匀间距) — export_bin.py 读 broadband.mat; 保持与现 sub_filters.bin 同间距方案
+    USE_LOG_SPACING = False   # True: 对数间距 (23~1299Hz), False: 均匀间距 (20~1500Hz)
     # =============================================================
 
+    # 路径全部锚定到 GFANC_Scene 项目根 (CWD 无关, 从任意目录可运行)
+    _PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    MODELS_DIR = os.path.join(_PROJ_ROOT, 'models')
+
     if USE_LOG_SPACING:
-        OUTPUT_FILE = 'models/MIMO_Pretrained_Control_filters_logspacing.mat'
+        OUTPUT_FILE = os.path.join(MODELS_DIR, 'MIMO_Pretrained_Control_filters_logspacing.mat')
     else:
-        OUTPUT_FILE = 'models/MIMO_Pretrained_Control_filters_broadband.mat'
+        OUTPUT_FILE = os.path.join(MODELS_DIR, 'MIMO_Pretrained_Control_filters_broadband.mat')
     PRI_PATH_FILE_NAME = 'primary_path.npy'
     SEC_PATH_FILE_NAME = 'secondary_path.npy'
-    FIGURE_DIR = 'figures/broadband/'
-    ensure_dir('models')
+    FIGURE_DIR = os.path.join(_PROJ_ROOT, 'figures', 'broadband')
+    ensure_dir(MODELS_DIR)
     ensure_dir(FIGURE_DIR)
 
     fs = 16000
@@ -370,6 +375,7 @@ def main():
     mu = 0.05                   # sum 归一化 + float64, μ 可放大
     f_low = 20.0                # 训练宽带噪声低频截止
     f_high = 1500.0             # 训练宽带噪声高频截止
+    BP_ANC_TAPS = 64            # R-13-②: 运行时 ANC 带通长度 (data/bandpass_anc.bin, 64tap)
 
     print(f'使用设备: {DEVICE}')
     if DEVICE.type == 'cuda':
@@ -377,9 +383,13 @@ def main():
         print(f'GPU: {torch.cuda.get_device_name(0)}')
 
     # ── Step 1: 创建宽带滤波器 ─────────────────────────────────
-    print(f'\n[Step 1/4] 创建宽带训练滤波器 ({f_low}-{f_high} Hz)...')
+    # R-13-②: 训练参考域对齐运行时 ANC 带通 (64tap = bandpass_anc.bin).
+    #   运行时: ref → bp_anc(64tap) → Wc ⊗ ref; 训练须在同一带通域下生成参考,
+    #   否则 1024tap firwin 的群延迟/过渡带与 64tap 不同 → CNN 预设 Wc 与信号域失配
+    #   (自适应可纠正, 但初始收敛慢). 已验证 firwin(64,[20,1500]) ≡ bandpass_anc.bin.
+    print(f'\n[Step 1/4] 创建宽带训练滤波器 ({f_low}-{f_high} Hz, {BP_ANC_TAPS}tap = 运行时 ANC 带通)...')
     broadband_filter = signal.firwin(
-        Len_control, [f_low, f_high],
+        BP_ANC_TAPS, [f_low, f_high],
         pass_zero='bandpass', window='hamming', fs=fs
     )
 
@@ -399,7 +409,7 @@ def main():
     # ── Step 2: 加载路径、生成宽带训练信号 ─────────────────────
     print('\n[Step 2/4] 加载 MIMO 路径 & 生成宽带训练信号...')
     Pri_path, Secon_path = load_multichannel_paths_with_variable_names(
-        folder='Primary and Secondary Path', subfolder='',
+        folder=os.path.join(_PROJ_ROOT, 'Primary and Secondary Path'), subfolder='',
         Pri_path_file_name=PRI_PATH_FILE_NAME,
         Sec_path_file_name=SEC_PATH_FILE_NAME)
 
