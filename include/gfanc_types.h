@@ -87,6 +87,16 @@ typedef struct {
     int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
     float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
     float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */
+
+    /* 在线聚类闸门 (OCG) — 替代场景切换滞回 (GFANC_OCG 系列 env)
+       方案: Luo et al., ICASSP 2026 "Stabilized Hybrid GFANC+FxNLMS with Online Clustering".
+       0=旧滞回路径(默认), 1=在线聚类闸门. */
+    int   ocg_enable;          /* 1=启用在线聚类闸门 (0=旧滞回, golden 回归不变) */
+    float ocg_alpha;           /* 活动簇漂移学习率 (0.05~0.2, 默认0.10) */
+    float ocg_stay_thresh;     /* 留在活动簇 cos 下限 (默认0.90) */
+    float ocg_rejoin_thresh;   /* 识别已知簇 cos 下限 (默认0.75) */
+    int   ocg_confirm_frames;  /* 确认切换所需连续帧数 (默认3) */
+    int   ocg_max_clusters;    /* 簇数量上限 (默认4, ≤OCG_MAX_CLUSTERS) */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -108,7 +118,9 @@ typedef struct {
     32,                 /* hw_min_hold */ \
     0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
-    0.3f                /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
+    0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
+    0, 0.10f, 0.90f, 0.75f, 3, 4  /* OCG: enable, alpha, stay, rejoin, confirm, max_clusters \
+                                     (默认关=旧滞回路径, GFANC_OCG=1 开启验证) */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -127,6 +139,12 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_SEC_MU")))     cfg->sec_online_mu  = (float)atof(s);
     if ((s = getenv("GFANC_WC_COLD")))   cfg->wc_cold_start  = (float)atof(s);
     if ((s = getenv("GFANC_HW_THRESH"))) cfg->hw_thresh_db   = (float)atof(s);
+    if ((s = getenv("GFANC_OCG")))          cfg->ocg_enable        = atoi(s);
+    if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha         = (float)atof(s);
+    if ((s = getenv("GFANC_OCG_STAY")))     cfg->ocg_stay_thresh   = (float)atof(s);
+    if ((s = getenv("GFANC_OCG_REJOIN")))   cfg->ocg_rejoin_thresh = (float)atof(s);
+    if ((s = getenv("GFANC_OCG_CONFIRM")))  cfg->ocg_confirm_frames = atoi(s);
+    if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters  = atoi(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

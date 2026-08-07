@@ -21,6 +21,7 @@
 #include "fxnlms_mimo.h"
 #include "howling_detect.h"
 #include "sec_online.h"
+#include "ocg.h"
 
 /* ── ADV-F3: 回调 WCET 监控 (诊断). GFANC_WCET=1 开启 (默认关, 零开销).
    rdtsc 仅 x86/x64; 其他平台编译为恒 0, WCET 显示 0. ── */
@@ -146,6 +147,7 @@ typedef struct {
     int    cur_scene_id;
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
     float  anchor_probs[SC_K_MAX];    /* 进入当前场景时的probs锚点 (S-1修复) */
+    ocg_t  ocg;                   /* 在线聚类闸门 (GFANC_OCG=1 时替代滞回决策) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
@@ -752,7 +754,9 @@ static void check_convergence(rt_ctx_t *ctx) {
 
 static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
                                float cos_sim, float *probs) {
-    if (cos_sim >= 0.8f || new_scene == ctx->cur_scene_id) return;
+    /* cos>=0.8 守卫已移除 (历史冗余): 旧滞回路径返回 1 必满足 cos<0.8, 行为中性;
+       但 OCG 的 rejoin 可在 cos_active∈[0.75,0.9) 触发, 旧守卫会误拦合法切换. */
+    if (new_scene == ctx->cur_scene_id) return;
 
     /* BUG-7: 发散/静音/peak_mute 削半/冻结期的 Wc 快照不保存进场景记忆 (防污染).
        nr_level>=0 补充 freshness: diverged 标志有 1s 滞后, 本秒刚开始发散时
@@ -1083,6 +1087,10 @@ int main(void) {
                 cnn_m5_get_K(), ctx->sc.K);
         ret = 1; goto cleanup;
     }
+    /* OCG: 在线聚类闸门 (GFANC_OCG=1 时替代场景切换滞回, ICASSP 2026) */
+    if (ocg_init(&ctx->ocg, &cfg, ctx->sc.K) != 0) {
+        fprintf(stderr, "WARN: ocg_init failed (K=%d), OCG disabled\n", ctx->sc.K);
+    }
     /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
        anti ≈ Wc_RMS × ref_filt × √L. 默认 0.01: ref=0.025→anti≈0.008 (−42dBFS).
        几乎无声, 确保噪声突增时不会饱和; LMS 在 10-30s 内自行收敛到工作点.
@@ -1179,6 +1187,7 @@ int main(void) {
             InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_probs, probs, K * sizeof(float));
+            ocg_reset(&ctx->ocg, probs, new_scene);   /* OCG: 以首帧播种活动簇 */
             /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
                RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
             int init_ramp_ms = cfg.ramp_ms * 2;
@@ -1202,8 +1211,12 @@ int main(void) {
             }
             ctx->first_sec = 0;
         } else {
-            /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur) */
-            float cos_sim = sm_cos_sim(ctx->anchor_probs, probs, K);
+            /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur).
+               OCG 启用时显示对活动簇中心的相似度 (更有意义); anchor_probs 仍
+               在切换时刷新, 供日志与旧路径使用. */
+            float cos_sim = cfg.ocg_enable
+                ? ocg_active_cos(&ctx->ocg, probs)
+                : sm_cos_sim(ctx->anchor_probs, probs, K);
 
             print_diagnostics(ctx, new_scene, cos_sim, probs);
 
@@ -1229,13 +1242,29 @@ int main(void) {
 
             check_wc_divergence(ctx);
             check_convergence(ctx);
-            /* P4: 场景切换滞回 — 候选场景需连续 3 帧一致才 RESET.
-               CNN 在真实噪声边界上 probs 翻转 (实测 max=0.48~0.63 低置信跳变),
-               旧逻辑单帧即切 → fade+mute_hold+Wc重载 循环泵浦 */
-            if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
-                                       new_scene, ctx->cur_scene_id,
-                                       &scene_cand, &scene_cand_cnt, 3)) {
-                check_scene_switch(ctx, new_scene, cos_sim, probs);
+            if (cfg.ocg_enable) {
+                /* OCG: 在线聚类闸门 — 判定"新预测权重向量是否真的该替换当前"
+                   (Luo et al., ICASSP 2026). 自适应簇中心跟踪漂移, 只在噪声真
+                   的进入新聚类时才确认切换; 只返回目标场景, 机制仍走 check_scene_switch. */
+                ocg_reason_t reason = OCG_REASON_NONE;
+                int target = ocg_step(&ctx->ocg, probs, new_scene,
+                                      ctx->cur_scene_id, &reason);
+                if (target >= 0 && target != ctx->cur_scene_id) {
+                    check_scene_switch(ctx, target, cos_sim, probs);
+                    if (ctx->log_file)
+                        fprintf(ctx->log_file, "# EVENT: ocg switch %d→%d reason=%s\n",
+                                ctx->cur_scene_id, target,
+                                reason == OCG_REASON_REJOIN ? "rejoin" : "new");
+                }
+            } else {
+                /* P4: 场景切换滞回 — 候选场景需连续 3 帧一致才 RESET.
+                   CNN 在真实噪声边界上 probs 翻转 (实测 max=0.48~0.63 低置信跳变),
+                   旧逻辑单帧即切 → fade+mute_hold+Wc重载 循环泵浦 */
+                if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
+                                           new_scene, ctx->cur_scene_id,
+                                           &scene_cand, &scene_cand_cnt, 3)) {
+                    check_scene_switch(ctx, new_scene, cos_sim, probs);
+                }
             }
         }
         memcpy(ctx->sc.prev_probs, probs, K * sizeof(float));

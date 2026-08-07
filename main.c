@@ -23,6 +23,7 @@
 #include "scene_controller.h"
 #include "scene_manager.h"
 #include "fxnlms_mimo.h"
+#include "ocg.h"
 
 /* ══════════════════════════════════════════════════════════
    类型
@@ -278,6 +279,11 @@ int main(int argc, char **argv)
                 cnn_m5_get_K(), sc.K);
         return 1;
     }
+    /* OCG: 在线聚类闸门 (GFANC_OCG=1 时替代场景切换滞回, ICASSP 2026) */
+    ocg_t ocg;
+    if (ocg_init(&ocg, &cfg, sc.K) != 0) {
+        fprintf(stderr, "WARN: ocg_init failed (K=%d), OCG disabled\n", sc.K);
+    }
 
     /* 2e. FxNLMS */
     fxnlms_mimo_t fx;
@@ -404,6 +410,7 @@ int main(int argc, char **argv)
                               &cur_scene_id, new_scene,
                               wc_cur, S * L, &wc_init_max, 1.0f);
             memcpy(anchor_probs, probs, K * sizeof(float));
+            ocg_reset(&ocg, probs, new_scene);   /* OCG: 以首帧播种活动簇 */
             fxnlms_set_wc(&fx, wc_cur);
             snprintf(action, sizeof(action), "INIT");
             /* 自动增益标定 (匹配实时版) */
@@ -417,21 +424,40 @@ int main(int argc, char **argv)
             /* S-1: cos(anchor, cur) 替代 cos(prev, cur) */
             float cos_sim = sm_cos_sim(anchor_probs, probs, K);
 
-            /* P4: 场景切换滞回 — 候选需连续3帧一致 */
-            if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
-                                       new_scene, cur_scene_id,
-                                       &scene_cand, &scene_cand_cnt, 3)) {
+            int switch_target = -1;
+            ocg_reason_t switch_reason = OCG_REASON_NONE;
+            if (cfg.ocg_enable) {
+                /* OCG: 在线聚类闸门 — 只在噪声真的进入新聚类时才切换
+                   (Luo et al., ICASSP 2026). 机制与旧路径完全一致. */
+                switch_target = ocg_step(&ocg, probs, new_scene,
+                                         cur_scene_id, &switch_reason);
+            } else if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
+                                              new_scene, cur_scene_id,
+                                              &scene_cand, &scene_cand_cnt, 3)) {
+                /* P4: 场景切换滞回 — 候选需连续3帧一致 */
+                switch_target = new_scene;
+                switch_reason = OCG_REASON_NEW;  /* 仅作 action 标签 */
+            }
+
+            if (switch_target >= 0 && switch_target != cur_scene_id) {
                 /* C1: 使用共享场景切换
                    BUG-7: 发散期的 Wc 快照不保存进场景记忆 (防污染) */
                 int restored = sm_scene_switch_execute(
                     (float *)scene_wc, scene_wc_valid,
-                    &cur_scene_id, new_scene,
+                    &cur_scene_id, switch_target,
                     fx.wc, wc_cur, wc_old, S * L, 1.0f,
                     !diverged && prev_nr_est >= 0.0f);
                 fade_cnt = cfg.fade_len;
                 memcpy(anchor_probs, probs, K * sizeof(float));
                 converged_frames = 0;
-                snprintf(action, sizeof(action), restored ? "RESET(mem)" : "RESET");
+                /* action 后缀标注切换原因 (避免 snprintf 同对象重叠/截断) */
+                const char *ocg_tag = "";
+                if (cfg.ocg_enable) {
+                    if (switch_reason == OCG_REASON_REJOIN) ocg_tag = "/rj";
+                    else if (switch_reason == OCG_REASON_NEW) ocg_tag = "/nw";
+                }
+                snprintf(action, sizeof(action), "%s%s",
+                         restored ? "RESET(mem)" : "RESET", ocg_tag);
             }
         }
         memcpy(sc.prev_probs, probs, K * sizeof(float));

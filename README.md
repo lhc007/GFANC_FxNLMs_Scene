@@ -389,6 +389,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
+| 场景切换 (OCG) | 在线聚类闸门, 默认关 (env: GFANC_OCG, 默认 0) | 替代静态滞回: 自适应簇中心跟踪漂移防误切, 回归场景复用 (Luo et al. ICASSP 2026). 参数: GFANC_OCG_ALPHA(0.10) / _STAY(0.90) / _REJOIN(0.75) / _CONFIRM(3) / _CLUSTERS(4) |
 | 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
 | 冷启动 Wc 衰减 | 0.3 (env: GFANC_WC_COLD) | CNN 预设衰减系数 |

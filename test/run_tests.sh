@@ -19,7 +19,7 @@ echo
 echo "── 1. Build ──"
 gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c \
     src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c \
-    src/howling_detect.c -lm -o main.exe
+    src/howling_detect.c src/ocg.c -lm -o main.exe
 echo "  main.exe OK"
 
 gcc -O2 test/gen_test_wav.c -lm -o test/gen_test_wav.exe
@@ -29,10 +29,14 @@ gcc -O2 -Iinclude test/test_fir.c src/fir_filter.c src/fxnlms_mimo.c \
     -lm -o test/test_fir.exe
 echo "  test_fir.exe OK"
 
+gcc -O2 -Iinclude test/test_ocg.c src/ocg.c -lm -o test/test_ocg.exe
+echo "  test_ocg.exe OK"
+
 # ── 2. 单元测试 ──
 echo
 echo "── 2. Unit Tests ──"
 ./test/test_fir.exe || { echo "  UNIT TESTS FAILED"; FAILED=1; }
+./test/test_ocg.exe || { echo "  UNIT TESTS FAILED"; FAILED=1; }
 
 # ── 3. 黄金回归 ──
 echo
