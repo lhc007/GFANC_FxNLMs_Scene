@@ -6,7 +6,7 @@
       2,
       1024
     ],
-    "timestamp": "2026-07-24 15:47:35",
+    "timestamp": "2026-08-07 13:04:49",
     "config": {
       "fs": 44100,
       "f1": 20.0,
@@ -20,47 +20,47 @@
       "latency_calibration_samples": 0
     },
     "quality": {
-      "_repeatability_SPK_0": 0.9996899088369672,
+      "_repeatability_SPK_0": 0.99976491537577,
       "SPK_0->MIC1": {
-        "snr_db": 39.1,
-        "peak_db": 55.7,
-        "noise_floor_db": 3.8,
+        "snr_db": 27.9,
+        "peak_db": 57.6,
+        "noise_floor_db": 18.4,
         "clipping": false
       },
       "SPK_0->MIC2": {
-        "snr_db": 32.2,
-        "peak_db": 43.8,
-        "noise_floor_db": -1.0,
+        "snr_db": 34.0,
+        "peak_db": 64.3,
+        "noise_floor_db": 16.6,
         "clipping": false
       },
       "SPK_0->MIC3": {
-        "snr_db": 35.2,
-        "peak_db": 55.1,
-        "noise_floor_db": 6.5,
+        "snr_db": 30.0,
+        "peak_db": 61.2,
+        "noise_floor_db": 18.2,
         "clipping": false
       },
-      "_repeatability_SPK_1": 0.9999719860635627,
+      "_repeatability_SPK_1": 0.999779585585582,
       "SPK_1->MIC1": {
-        "snr_db": 30.9,
-        "peak_db": 45.4,
-        "noise_floor_db": 2.7,
+        "snr_db": 35.8,
+        "peak_db": 69.9,
+        "noise_floor_db": 19.9,
         "clipping": false
       },
       "SPK_1->MIC2": {
-        "snr_db": 38.5,
-        "peak_db": 51.6,
-        "noise_floor_db": -0.9,
+        "snr_db": 30.2,
+        "peak_db": 59.8,
+        "noise_floor_db": 17.1,
         "clipping": false
       },
       "SPK_1->MIC3": {
-        "snr_db": 34.8,
-        "peak_db": 53.9,
-        "noise_floor_db": 5.6,
+        "snr_db": 32.2,
+        "peak_db": 64.8,
+        "noise_floor_db": 18.7,
         "clipping": false
       }
     },
     "normalization": {
-      "sec_rms": 23.788,
+      "sec_rms": 89.4431,
       "method": "global_scalar (\u00f7 RMS \u2192 RMS\u22481)",
       "note": "\u7b49\u4ef7\u4e8e lab \u786c\u4ef6\u589e\u76ca\u6821\u51c6, \u9891\u54cd/\u76f8\u4f4d/\u5ef6\u8fdf\u5168\u90e8\u4fdd\u7559"
     }
