@@ -620,7 +620,7 @@
 - **造成的影响**：用户校准白做；延迟补偿靠人工设 env。
 - **修复方案**：① Ŝ 文件按 mtime 自动选最新实测；② sec_bulk_delay 接入运行时（BUG-2）；③ 反馈保留 calibrate_feedback 产物（calibrate_secondary 的 FB ERLE 2-3dB 太弱）。
 - **验证方法**：2026-08-03 bench 运行启动日志显示 `Ŝ file: secondary_path_measured.bin` + `Loop delay auto-loaded: 487`。
-- **修复状态**：✅ 已修复 (2026-08-03)。
+- **修复状态**：✅ 已修复 (2026-08-03)。**2026-08-07 精化**: mtime 比较有缺陷——export_bin.py 每次导出都刷新 `secondary_path.bin`(Farina) 的 mtime, 误判为"更新"覆盖 C 校准 (R-13-② 重训后实时错载 Farina, step 被压至 2.6e-8)。改为**固定优先 `_measured`(C 校准, 匹配当前硬件)**, 缺失时才回退 secondary_path.bin; 修复后 step=7.5e-8。
 
 【BUG-9 日志刷屏（Wc stable 每秒打印）· 低 · [Phase-1]】
 - **位置**：main_realtime.c check_wc_divergence
