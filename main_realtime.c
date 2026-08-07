@@ -828,18 +828,14 @@ int main(void) {
     rt_ctx_t *ctx = NULL;   /* BUG-4: 提前声明置 NULL — 权重校验失败的 goto cleanup
                                 在 ctx=calloc 之前跳转, 未初始化则 cleanup 解引用野指针 */
     printf("Loading weights...\n");
-    /* BUG-8: Ŝ 文件选择 — 优先 C 校准实测 (calibrate_secondary.exe → _measured).
-       measure_secondary.py → export_bin.py 写 secondary_path.bin (Farina 实测/导出),
-       但 export_bin.py **每次导出都会刷新 secondary_path.bin 的 mtime** — 若按 mtime
-       比较会把 Farina 文件误判为"更新"而覆盖 C 校准 (2026-08-07 R-13-② 重训后即发生:
-       实时错载 Farina 文件, 有效步长被压至 2.6e-8).
-       → 固定优先 _measured (C 校准, 匹配当前硬件摆放); 仅当其缺失时回退 secondary_path.bin. */
-    const char *sec_file = "data/secondary_path.bin";
-    {
-        struct stat st_m;
-        if (stat("data/secondary_path_measured.bin", &st_m) == 0)
-            sec_file = "data/secondary_path_measured.bin";
-    }
+    /* BUG-8: Ŝ 文件选择.
+       默认 data/secondary_path.bin = 扫频法 (measure_secondary.py → export_bin.py, 用户主测量法).
+       GFANC_SEC_FILE 可强制指定其它文件 (如 data/secondary_path_measured.bin = C 校准 calibrate_secondary.exe).
+       不用 mtime 比较: export_bin.py 每次导出都会刷新 secondary_path.bin 的 mtime,
+       无法区分"新测量"与"仅重导出" (2026-08-07 教训). */
+    const char *sec_file = getenv("GFANC_SEC_FILE");
+    if (!sec_file || !sec_file[0])
+        sec_file = "data/secondary_path.bin";
     float *sec_path, *sub_filters, *centroids, *bp_coeff;
     int sec_len = bin_load_float(sec_file, &sec_path);
     printf("  Ŝ file: %s\n", sec_file);
