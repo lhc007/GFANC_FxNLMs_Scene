@@ -1,6 +1,6 @@
 # GFANC FxNLMS — MIMO 主动降噪系统
 
-> **版本**: v1.3 (2026-08-05) | **分支**: realtime-io
+> **版本**: v1.4 (2026-08-07) | **分支**: realtime-io
 
 一个**主动降噪引擎**的纯 C 语言实现，从 Python 项目 [GFANC_Scene](GFANC_Scene) 移植。
 
@@ -326,15 +326,18 @@ Feedback spk1: 256 taps, RMS=0.0011
 提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦：
 
 ```bash
-python export/measure_secondary.py --interactive   # 首次配置
-python export/measure_secondary.py                 # 日常测量
-python export/export_bin.py                        # 导出 .npy → data/*.bin
+# 从 GFANC_Scene 目录运行 (脚本用相对路径找 Primary and Secondary Path/)
+cd GFANC_Scene
+python ../export/measure_secondary.py --interactive   # 首次: 配置设备
+python ../export/measure_secondary.py                 # 日常测量 (可加 --duration 10 --repetitions 6 --amplitude 0.95 提高SNR)
+cd ..
+python export/export_bin.py                           # 导出 .npy → data/secondary_path.bin
 ```
 
 方法: Farina 2000 AES 指数扫频，5s 扫频 20-7500Hz，多次重复时域平均，自动反卷积提取脉冲响应。相比白噪声 NLMS 法，SNR 高 10-20dB，天然免疫时钟滑移。
 
-**Ŝ 文件自动选择 + 环路延迟补偿（v1.3）**：
-- 运行时自动加载**最新的实测 Ŝ**——`secondary_path_measured.bin`（`calibrate_secondary.exe` 产物）与 `secondary_path.bin`（`export_bin.py` 导出）取修改时间较新者，启动日志打印 `Ŝ file: ...`。
+**Ŝ 文件选择 + 环路延迟补偿（v1.4）**：
+- 运行时**默认加载 `data/secondary_path.bin`**（扫频法产物）；`GFANC_SEC_FILE` 环境变量可强制指定其它文件（如 C 校准 `data/secondary_path_measured.bin`）。启动日志打印 `Ŝ file: ...`。
 - **必须测环路延迟**：`calibrate_secondary.exe` 会生成 `sec_bulk_delay.bin`（总环路延迟 @16k），运行时自动换算 `dsp_delay` 补偿 FxLMS 对齐（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。缓冲大小用 `GFANC_BUFFER` 调（默认 128 样本），实测 UMC ASIO + 128 帧环路 ≈ **12.4ms**（该值为 I/O+声学环路；控制路径另有 ANC 带通群延迟 2ms。旧 0.01s suggestedLatency 会把驱动顶到 512 样本 → 30ms，已修复）。
 - ⚠️ **每次换安装位置/几何后必须重测**（管道/桌面/窗户声学不同），否则实时 NR 会下降。
 
