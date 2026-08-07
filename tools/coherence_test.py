@@ -49,12 +49,23 @@ def find_umc_input():
 
 def record(dur, out_wav):
     import sounddevice as sd
+    import threading
     dev = find_umc_input()
-    print(f"录音设备: {sd.query_devices(dev)['name']} (4ch, {FS}Hz, {dur}s)")
+    print(f"录音设备: {sd.query_devices(dev)['name']} (4ch, {FS}Hz, 最长{dur:.0f}s)")
     print("摆放: ch0=参考麦(窗外1m朝马路) ch1-3=误差麦(窗内不同位置)")
-    print("提示: 保持安静等车经过, 录 2-3 分钟覆盖多辆车...")
-    data = sd.rec(int(dur * FS), samplerate=FS, channels=4, device=dev, dtype='float32')
-    sd.wait()
+    print("提示: 保持安静等车经过, 录到几辆车后按 Ctrl+C 提前结束即可")
+    frames = []
+    def cb(indata, frames_n, time, status):
+        frames.append(indata.copy())
+        if sum(f.shape[0] for f in frames) >= int(dur * FS):
+            raise sd.CallbackStop
+    with sd.InputStream(samplerate=FS, channels=4, device=dev, dtype='float32',
+                        blocksize=4800, callback=cb):
+        try:
+            sd.sleep(int(dur * 1000))
+        except KeyboardInterrupt:
+            print("\n[中断] 提前结束录音")
+    data = np.concatenate(frames, axis=0) if frames else np.zeros((1, 4), np.float32)
     # float32 子类型: 保精度, 避免 16-bit PCM 量化/削波
     sf.write(out_wav, data, FS, subtype='FLOAT')
     print(f"已保存: {out_wav} ({data.shape[0]/FS:.0f}s, FLOAT32)")
@@ -69,7 +80,7 @@ def coherence_welch(x, y, fs, nperseg=4096):
     return f, c
 
 
-def analyze(wav_path, f1, f2, frame_s=0.5, active_pct=10):
+def analyze(wav_path, f1, f2, frame_s=0.5, active_pct=10, use_all=False):
     data, fs = sf.read(wav_path, always_2d=True)
     if data.shape[1] < 2:
         raise SystemExit("需至少 2 通道 (ch0=参考, ch1=误差)")
@@ -80,16 +91,21 @@ def analyze(wav_path, f1, f2, frame_s=0.5, active_pct=10):
     n_frames = data.shape[0] // frame_n
     ref_rms = np.array([np.sqrt(np.mean(ref[i*frame_n:(i+1)*frame_n]**2))
                         for i in range(n_frames)])
-    # 活动帧 = 参考有信号 (车经过) — 底噪(低百分位) ×5 作为阈值, 跳过安静段
-    # 安静街: 底噪低, 车经过 RMS 高 10-50× → ×5 稳健分离
-    floor = np.percentile(ref_rms, active_pct)
-    thr = max(floor * 5.0, 1e-4)
-    active = ref_rms > thr
-    print(f"活动帧 (车经过): {active.sum()}/{n_frames} ({100*active.sum()/n_frames:.0f}%), "
-          f"底噪={floor:.4f} → 阈值={thr:.4f}")
+    # 活动帧选择:
+    #   use_all=True   → 全部帧 (恒定噪声源如蓝牙音箱, 无"安静/车经过"区分)
+    #   否则 → 底噪(低百分位)×5 (真车流: 安静段 vs 车经过)
+    if use_all:
+        active = np.ones(n_frames, dtype=bool)
+        print(f"全帧分析: {active.sum()}/{n_frames} 帧")
+    else:
+        floor = np.percentile(ref_rms, active_pct)
+        thr = max(floor * 5.0, 1e-4)
+        active = ref_rms > thr
+        print(f"活动帧 (车经过): {active.sum()}/{n_frames} ({100*active.sum()/n_frames:.0f}%), "
+              f"底噪={floor:.4f} → 阈值={thr:.4f}")
 
     if active.sum() < 3:
-        print("⚠️ 活动帧太少 — 录音可能没有车经过, 或阈值太高。用 --active-pct 调低。")
+        print("⚠️ 活动帧太少 — 录音可能没有车经过, 或阈值太高。用 --all 分析全部帧, 或调低阈值。")
         return
 
     print(f"\n通道对 (参考 vs 误差) | 100-800Hz 相干性(活动帧中值) | 相干>0.8 的帧占比")
@@ -121,13 +137,14 @@ def main():
     ap.add_argument('--f1', type=float, default=BAND[0])
     ap.add_argument('--f2', type=float, default=BAND[1])
     ap.add_argument('--active-pct', type=float, default=10, help='底噪百分位 (默认 10, 阈值=底噪×5)')
+    ap.add_argument('--all', action='store_true', help='分析全部帧 (恒定噪声源如蓝牙音箱时用)')
     args = ap.parse_args()
 
     if args.analyze:
-        analyze(args.analyze, args.f1, args.f2)
+        analyze(args.analyze, args.f1, args.f2, use_all=args.all)
     else:
         data = record(args.dur, args.out)
-        analyze(args.out, args.f1, args.f2)
+        analyze(args.out, args.f1, args.f2, use_all=args.all)
 
 
 if __name__ == '__main__':
