@@ -40,7 +40,9 @@ SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat
 # 场景定义 (centroids)
 SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
 
-# 主/次声学路径
+# 主/次声学路径 — R-58-6: 统一到真实硬件录制路径 (用户硬件 3E-2S-1R)!
+# 训练 (Pre_training_broadband_and_decompose.py) 必须同步用这两个文件,
+# 否则运行时 Ŝ/P 与训练世界不同 → Wc 初值错位 → FxNLMS 发散.
 PRI_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'primary_path.npy'
 SEC_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'secondary_path.npy'
 
@@ -187,6 +189,12 @@ print(f'  sub_filters.bin: shape={list(Wc_v.shape)}')
 print('Exporting acoustic paths...')
 Pri = np.load(str(PRI_PATH))
 Sec = np.load(str(SEC_PATH))
+# R-58-7: 主路径裁剪到第 0 参考 (E,1,L) — 训练 (Disturbance_generation.py
+# _multi_channel_filter_pri) 写死用 pri_path[:,0,:], npy 的 (E,2,L) 第二维
+# 是复制占位从不使用; 裁剪后 C 端 e*PRI_LEN 布局与训练语义逐样本一致.
+if Pri.ndim == 3 and Pri.shape[1] > 1:
+    print(f'  primary_path.npy 裁剪: {list(Pri.shape)} → (E,1,L), 取第 0 参考 (与训练一致)')
+    Pri = Pri[:, :1, :]
 write_bin('primary_path', Pri)
 write_bin('secondary_path', Sec)
 print(f'  primary_path.bin: {list(Pri.shape)}')

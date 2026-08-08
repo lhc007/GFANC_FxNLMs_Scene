@@ -197,8 +197,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "FATAL: secondary_path.bin too short/load failed (%d<%d)\n", sec_len, E*S*SEC_LEN);
         return 1;
     }
-    if (pri_len < E*2*PRI_LEN) {
-        fprintf(stderr, "FATAL: primary_path.bin too short/load failed (%d<%d)\n", pri_len, E*2*PRI_LEN);
+    if (pri_len < E*PRI_LEN) {
+        fprintf(stderr, "FATAL: primary_path.bin too short/load failed (%d<%d)\n", pri_len, E*PRI_LEN);
         return 1;
     }
     /* 虚拟预览 (GFANC_VIRT_PREVIEW_MS): 参考→误差声学距离. 加在初级路径上,
@@ -207,8 +207,8 @@ int main(int argc, char **argv)
     int preview_delay = 0;
     {   const char *vp = getenv("GFANC_VIRT_PREVIEW_MS");
         if (vp) { preview_delay = (int)(atof(vp) * FS / 1000.0f);
-            float *pad = (float *)calloc(E*2*PRI_LEN + preview_delay, sizeof(float));
-            memcpy(pad + preview_delay, pri_path, E*2*PRI_LEN*sizeof(float));
+            float *pad = (float *)calloc(E*PRI_LEN + preview_delay, sizeof(float));
+            memcpy(pad + preview_delay, pri_path, E*PRI_LEN*sizeof(float));
             pri_path_used = pad;
             printf("  VIRT preview: %s ms → %d samples added to Pri\n", vp, preview_delay); } }
     if (sub_len < C*S || sub_len % (C*S) != 0) {
@@ -235,16 +235,26 @@ int main(int argc, char **argv)
     /* 2a. 带通 FIR */
     fir_filter_t bp_fir = { bp_coeff, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
 
-    /* 2b. 次级路径 FIR (peak→1.0 归一化, 与实时版一致) */
+    /* 2b. 次级路径 FIR — R-58-6: Ŝ 增益标定必须与训练世界一致!
+       训练 (Disturbance_generation + FxNLMS_MIMO) 用原始 secondary_path 增益,
+       若此处 peak→1.0 归一化 → Ŝ 整体缩小 (真实路径 ÷25.5) → anti 环路增益低 25.5 倍,
+       Wc 必须膨胀才能抵消 pri → 自适应路径上 G×tanh 饱和 → 发散 (road-15 根因).
+       默认不归一化 (与训练一致); GFANC_SEC_NORM=1 恢复峰值归一化 (实时硬件标定兼容). */
     {
-        float s_peak = 0;
-        for (int i = 0; i < E*S*SEC_LEN; i++) {
-            float a = fabsf(sec_path[i]);
-            if (a > s_peak) s_peak = a;
-        }
-        if (s_peak > 0.001f) {
-            float inv = 1.0f / s_peak;
-            for (int i = 0; i < E*S*SEC_LEN; i++) sec_path[i] *= inv;
+        const char *sn = getenv("GFANC_SEC_NORM");
+        if (sn && sn[0] == '1') {
+            float s_peak = 0;
+            for (int i = 0; i < E*S*SEC_LEN; i++) {
+                float a = fabsf(sec_path[i]);
+                if (a > s_peak) s_peak = a;
+            }
+            if (s_peak > 0.001f) {
+                float inv = 1.0f / s_peak;
+                for (int i = 0; i < E*S*SEC_LEN; i++) sec_path[i] *= inv;
+            }
+            printf("  Ŝ: peak→1.0 归一化 (GFANC_SEC_NORM=1 显式开启)\n");
+        } else {
+            printf("  Ŝ: 原始增益 (默认, 与训练世界一致)\n");
         }
     }
     /* 嵌入式处理延迟 (GFANC_EMBED_DELAY_MS, 默认3ms): 模拟 ADC+DSP+DAC 信号链延迟,
@@ -272,7 +282,7 @@ int main(int argc, char **argv)
     /* 因果性报告: 净预览时间 = τ_pri − τ_spk − τ_proc.
        τ_proc = ANC带通群延迟 + 处理延迟 (GFANC_VIRT_DELAY_MS, 嵌入式 DSP/编解码预算). */
     {
-        float tau_pri = path_peak_delay_ms(pri_path_used + 0*2*PRI_LEN, PRI_LEN, FS);
+        float tau_pri = path_peak_delay_ms(pri_path_used + 0*PRI_LEN, PRI_LEN, FS);
         float tau_spk = path_peak_delay_ms(sec_path, SEC_LEN, FS);
         float tau_bp  = (BP_ANC_LEN-1)/(2.0f*FS)*1000.0f;  /* 64tap 线性相位群延迟 */
         float tau_proc = tau_bp + (DSP_DELAY + virt_delay)/(float)FS*1000.0f;
@@ -287,7 +297,7 @@ int main(int argc, char **argv)
     /* 2c. 初级路径 FIR (R=0, 持久延迟线 — 跨 chunk 连续) */
     fir_filter_t pri_firs[E], pri_raw_firs[E];
     for (int e = 0; e < E; e++) {
-        pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path_used + e * 2 * PRI_LEN;
+        pri_firs[e].coeffs = pri_raw_firs[e].coeffs = pri_path_used + e * PRI_LEN;   /* R-58-6: R=1 (硬件 1 参考) */
         pri_firs[e].n_taps = pri_raw_firs[e].n_taps = PRI_LEN;
         pri_firs[e].delay_line     = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
         pri_raw_firs[e].delay_line = (gfanc_delay_t *)calloc(PRI_LEN, sizeof(gfanc_delay_t));
@@ -307,11 +317,27 @@ int main(int argc, char **argv)
     }
     /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
 
-    /* 2e. FxNLMS */
+    /* 2e. FxNLMS — R-58-8: 离线版步长与训练世界解耦 (实测标定).
+       训练 (Pre_training) 用 mu=0.05 + sum 归一化在纯线性 float64 世界收敛;
+       C 端链路含 mic_pre_gain G×tanh 饱和×64tap bp_err, 同样 0.05 会把 Wc
+       从 0.01 推到 0.8 → anti 过量 → 正反馈发散 (G 越大越狠: road-15 G=2.72
+       → -45dB, mixed G=0.21 → -12dB, 发散程度 ∝ G 已验证).
+       实测 step 扫描 (EMBED=0): 0.05→发散, 0.005→-8.4, 0.0005→+16.3,
+       0.00005→+11.1, µ=0→+10.4 — 默认取 0.0005 (收敛最快且稳定).
+       GFANC_STEP / GFANC_LEAK 环境变量可覆盖. */
+    if (!getenv("GFANC_STEP")) {
+        cfg.step_size = 0.0005f; /* R-58-8: C 端链路稳定步长 (训练 0.05 在此链路发散) */
+    }
+    if (!getenv("GFANC_LEAK")) {
+        cfg.leak = 5e-7f;        /* 保持弱泄漏 */
+    }
     fxnlms_mimo_t fx;
     if (fxnlms_init(&fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); return 1;
     }
+    /* R-58-9: 离线仿真走 fxnlms_tick_rt 路径, 显式切到 sum 归一化 (与训练世界一致).
+       实时版 (main_realtime.c) 不调用此函数 → 保持默认 mean+cap 硬件标定语义. */
+    fxnlms_set_norm(&fx, 1);
     printf("  System ready (CNN loaded).\n");
 
     /* ── 3. 读取 WAV ── */
@@ -329,6 +355,31 @@ int main(int argc, char **argv)
         ref = ref_resampled;
         printf("Resampled: %d Hz -> %d Hz (%d samples)\n", wav.sr, FS, N);
     } else N = wav.n;
+
+    /* 自动增益标定 — 预处理前预扫描 (修复 R-58: 原 auto_gain 在 INIT 秒才计算,
+       但预处理早已完成 → gain 从未生效. 修复 R-58-2: 目标电平 0.15 → TARGET_REF_RMS 0.03,
+       与实时版 auto-gain 工作点一致: es_init = 0.03×Pri带内增益(36×) ≈ 1.1 RMS (轻饱和,
+       硬件实测 12-15dB 的工作点). 目标 0.15 使 es 饱和 5 倍 → tanh 截断污染梯度 → anti
+       被推到 ±1 钳位, NR_true 假阳性 12.9dB 实为发散).
+       离线版可整段预扫 1024tap 带通 RMS; 与实时版 [1,20] 钳位不同, 允许 G<1
+       (wav 已是满数字量程, 无物理旋钮约束; 响亮输入需衰减避免饱和). */
+    if (!getenv("GFANC_MIC_GAIN")) {
+        float acc_scan = 0;
+        fir_filter_t bp_scan = { bp_fir.coeffs,
+            (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
+        for (int i = 0; i < N; i++) {
+            float y = fir_tick(&bp_scan, ref[i]);
+            acc_scan += y * y;
+        }
+        free(bp_scan.delay_line);
+        float ref_rms = sqrtf(acc_scan / (N + 1e-10f));
+        float auto_gain = TARGET_REF_RMS / (ref_rms + 1e-10f);
+        if (auto_gain < 0.01f) auto_gain = 0.01f;   /* 响亮输入允许衰减 (实时版为硬件旋钮钳 [1,20]) */
+        if (auto_gain > 20.0f) auto_gain = 20.0f;
+        cfg.mic_pre_gain = auto_gain;
+        printf("Auto-gain: bandpass ref RMS %.4f -> mic_pre_gain %.2f (目标 %.3f, 实时版工作点)\n",
+               ref_rms, auto_gain, TARGET_REF_RMS);
+    }
 
     /* 预处理: ref_filt_all = bandpass(noise × pre_gain)
        匹配实时版 ref_filt 信号链: pre_gain → soft_clip → bandpass
@@ -361,12 +412,16 @@ int main(int argc, char **argv)
         }
 
     /* 误差麦带通 FIR (匹配实时版 bp_err[E], BUG-6: 64tap ANC 带通) */
-    fir_filter_t bp_err[E];
+    fir_filter_t bp_err[E], bp_err_nr[E];   /* bp_err_nr: NR_true 统计口径 (未截断, R-58) */
     for (int e = 0; e < E; e++) {
         bp_err[e].coeffs = bp_anc_coeff;
         bp_err[e].n_taps = BP_ANC_LEN;
         bp_err[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
         bp_err[e].ptr = 0;
+        bp_err_nr[e].coeffs = bp_anc_coeff;
+        bp_err_nr[e].n_taps = BP_ANC_LEN;
+        bp_err_nr[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
+        bp_err_nr[e].ptr = 0;
     }
 
     /* ── 4. 离线 ANC (与实时版 main_realtime.c 信号路径一致, 仅 I/O 不同) ── */
@@ -398,7 +453,6 @@ int main(int argc, char **argv)
 
     /* 跨秒持久状态 */
     float err_meas[E] = {0};
-    float anti_est_prev[E] = {0};
 
     printf("\n%4s | %5s | %6s | %6s | %6s | %7s | %6s | %s\n",
            "Sec", "Band", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
@@ -428,13 +482,7 @@ int main(int argc, char **argv)
             ocg_reset(&ocg, gains);  /* OCG: 首个增益建立簇 0 */
             fxnlms_set_wc(&fx, wc_cur);
             snprintf(action, sizeof(action), "INIT");
-            /* 自动增益标定 (匹配实时版) */
-            if (!getenv("GFANC_MIC_GAIN")) {
-                float auto_gain = TARGET_REF_RMS / (sqrtf(acc_ref / (len + 1e-10f)) + 1e-10f);
-                if (auto_gain < 1.0f) auto_gain = 1.0f;
-                if (auto_gain > 20.0f) auto_gain = 20.0f;
-                cfg.mic_pre_gain = auto_gain;
-            }
+            /* auto_gain 已由预处理前预扫描设定 (R-58: 原此处计算但预处理已完成 → 从未生效) */
             first_sec = 0;
         } else {
             /* S-1: cos(anchor_gains, cur_gains) — 30 维直接权重增益 */
@@ -495,13 +543,36 @@ int main(int argc, char **argv)
                 acc_anti += anti_spk[s] * anti_spk[s];
             }
 
-            /* 合成误差: dis = Pri ⊗ ref_filt, err = dis + anti_est */
+            /* 误差麦信号 (每样本真实, 匹配实时版 ADC 链): es = (Pri⊗ref + Ŝ⊗anti)·G → 64tap 带通.
+               anti 传播延迟由 Ŝ FIR 延迟线体现; 修复 R-58: 原 anti_est_prev 每秒更新 → 误差
+               信号滞后 1s, 时变场景下梯度失效 (离线 NR 1.5dB 根因之一, 实时版无此滞后).
+               修复 R-58-2: anti_spk 直接经 Ŝ 到误差麦 (与实时版 DAC 一致, 无 /gain 除法 —
+               原除法使 anti 环路增益 ∝ 1/G, G=1 时反馈最强 → anti 被推到 ±1 钳位,
+               截断后带内能量被压扁 → NR_true 假阳性 12.9dB). */
             float dis_val[E];
             for (int e = 0; e < E; e++) {
-                dis_val[e] = fir_tick(&pri_firs[e], ref_filt);
-                err_meas[e] = dis_val[e] + anti_est_prev[e];
-                err_pwr += err_meas[e] * err_meas[e];
-                dis_pwr += dis_val[e] * dis_val[e];  /* 已知真值扰动 (Pri模型) */
+                dis_val[e] = fir_tick(&pri_firs[e], ref_filt);         /* 带通扰动 (NR_true 口径) */
+                /* R-58-4: es 的 pri 分支改用 64tap 带通参考 (ref_anc), 与 anti 分支延迟对齐.
+                   原 ref[idx] 全带直通 → pri 群延迟仅 11 样本, anti 分支 (bp_anc 31 + Ŝ 10) ≈ 41 样本
+                   → 梯度 Fx(41) 与 es 主导成分 pri(11) 错位 30 样本 → 带限信号互相关显著,
+                   LMS 试图让 anti 分支"超前" → 因果 FIR 做不到 → 持续正反馈推大 anti 到钳位.
+                   训练世界 d = Pri⊗x_band(带通, 延迟 42) 与 Fx(41) 对齐 → 收敛.
+                   修复: pri 分支用 ref_anc (bp_anc 31 + pri 11 = 42) → 与 anti 分支/Fx 对齐. */
+                float pri_raw = fir_tick(&pri_raw_firs[e], ref_anc_all[idx]); /* R-58-4: 带通参考 (对齐 anti 分支) */
+                float anti_at_mic = 0;
+                for (int s = 0; s < S; s++)
+                    anti_at_mic += fir_tick(&sec_firs_err[e * S + s], anti_spk[s]);
+                float es = (pri_raw + anti_at_mic) * cfg.mic_pre_gain;
+                float es_nr = es;   /* R-58 口径修复: NR_true 统计用未截断信号.
+                                       tanh 是 ADC 饱和模拟, 非声学失真 — 截断把全带能量折叠进带内,
+                                       Wc≈0 (弱信号) 时也报假负 NR. 梯度仍用截断 err_meas (匹配实时版). */
+                if      (es >  1.0f) es =  tanhf(es);
+                else if (es < -1.0f) es = -tanhf(-es);
+                err_meas[e] = fir_tick(&bp_err[e], es);                /* 带通残差: 驱动梯度 (匹配实时版) */
+                float err_nr = fir_tick(&bp_err_nr[e], es_nr);         /* 未截断带通残差: NR_true 统计 */
+                err_pwr += err_nr * err_nr;
+                dis_pwr += dis_val[e] * dis_val[e];                    /* 已知真值扰动 (Pri模型) */
+                err_out[e * N + idx] = err_meas[e];
             }
 
             /* BUG-1: 分散采样 (匹配实时版) — 每 64 样本取 1 个, 整帧 250 个覆盖整秒.
@@ -520,20 +591,6 @@ int main(int argc, char **argv)
             }
             acc_cnt++;
 
-            /* error_out: 匹配实时版误差麦信号链 */
-            for (int e = 0; e < E; e++) {
-                float pri_raw = fir_tick(&pri_raw_firs[e], ref[idx]);
-                float anti_at_mic = 0;
-                for (int s = 0; s < S; s++)
-                    anti_at_mic += fir_tick(&sec_firs_err[e * S + s], anti_spk[s] / cfg.mic_pre_gain);
-                float es = (pri_raw + anti_at_mic) * cfg.mic_pre_gain;
-                if      (es >  1.0f) es =  tanhf(es);
-                else if (es < -1.0f) es = -tanhf(-es);
-                err_out[e * N + idx] = fir_tick(&bp_err[e], es);
-            }
-
-            /* 更新 anti_est_prev */
-            fxnlms_get_anti_est(&fx, anti_est_prev);
         }
 
         /* ── 诚实NR (匹配实时版, 分散采样一致指标) ──
@@ -597,7 +654,7 @@ int main(int argc, char **argv)
 
     /* ── 6. 清理 ── */
     free(anti_out); free(err_out); free(ref_filt_all); free(ref_anc_all);
-    for (int e = 0; e < E; e++) free(bp_err[e].delay_line);
+    for (int e = 0; e < E; e++) { free(bp_err[e].delay_line); free(bp_err_nr[e].delay_line); }
     fxnlms_free(&fx);
     scene_ctrl_free(&sc);
     for (int i = 0; i < E * S; i++) { free(sec_firs[i].delay_line); free(sec_firs_err[i].delay_line); }

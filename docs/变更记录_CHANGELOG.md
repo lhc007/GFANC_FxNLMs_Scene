@@ -31,6 +31,27 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-08] 离线降噪发散根因修复 R-58-7/8/9 — 路径统一 + EMBED/步长默认值 + 归一化模式分离
+
+- **状态**: 已提交（2026-08-09, commit: fix: 离线降噪发散根因修复 R-58-7/8/9）
+- **基线**: dfdf23a（feat: OCG 多质心聚类闸门 v1.7）
+- **变更代码**:
+  - 修改: `include/fxnlms_mimo.h`、`src/fxnlms_mimo.c` — R-58-9: `fxnlms_mimo_t` 新增 `sum_norm` 字段 + `fxnlms_set_norm()`。`fxnlms_tick_rt` 功率归一化按开关分支: sum=1 时 `power=ΣXd²+1e-6`、inv_pwr 无 cap（离线，与训练逐样本数学一致，R-58-5 收益保留）；sum=0 时恢复 mean+cap1000（实时硬件标定语义，R-48）。注意: main.c 离线仿真**走 fxnlms_tick_rt 路径**（非 fxnlms_tick，后者已无调用方），故必须由调用方显式置 1
+  - 修改: `main.c` — R-58-9: `fxnlms_init` 后调用 `fxnlms_set_norm(&fx, 1)`（离线 sum 归一化）。`main_realtime.c` 不调用 → 实时保持默认 mean+cap，与旧硬件二进制数值语义一致（实测 12-15dB 工作点）
+  - 修改: `export/export_bin.py` — R-58-7: 主路径导出裁剪 `Pri[:, :1, :]` → (E,1,L)。npy 实测 (3,2,1024) 且第二维是复制占位数据（3 误差通道完全相同，corr=1.0），训练端 `Disturbance_generation.py::_multi_channel_filter_pri` 写死用 `pri_path[:,0,:]`（第 0 参考），裁剪后 C 端 `e*PRI_LEN` 布局与训练语义逐样本一致
+  - 修改: `data/primary_path.bin`、`data/secondary_path.bin` — 恢复为当前系统真实路径（git checkout 还原 HEAD 版本，与 `GFANC_Scene/Primary and Secondary Path/*.npy` corr=1.0）。此前被我误用 MIMO_GFANC npy 覆盖，用户明确要求只使用当前系统内路径
+  - 修改: `include/gfanc_types.h` — R-58-8: `embed_delay_ms` 默认 3→0（原 3ms=48 样本 pad 进 Ŝ，训练世界无此延迟 → anti 相位错位 → 自适应正反馈发散；需评估嵌入式目标时 `GFANC_EMBED_DELAY_MS` 显式开启）
+  - 修改: `main.c` — R-58-8: 离线默认 step 0.05→0.0005。训练 mu=0.05 在纯线性 float64 世界收敛，C 端链路含 `mic_pre_gain G×tanh×bp_err`，同 step 把 Wc 从 0.01 推到 0.8 → anti 过量正反馈（发散程度 ∝ G 已验证：road-15 G=2.72→-45dB，mixed G=0.21→-12dB）；实测 step 扫描 0.0005 最优（+16.3dB，µ=0→+10.4）
+- **变更原因**: 用户报告离线降噪效果差（~1.8dB 甚至负值）且 road_noise-15 发散。逐层定位: ①路径不一致（C 端 bin 与训练 npy 不同源）→ 已统一；②3ms 嵌入延迟训练/运行时不一致 → 已归零；③step=0.05 在 C 端饱和链路过冲 → 已降 100 倍；④NR_true 口径含 G² 项制造假象（anti≈0 时 NR_true=-20·log10(G)：G=0.21→+13.6dB 假象、G=2.72→-8.7dB 假象）——本次未改口径，仅记录
+- **造成影响**:
+  - 行为: mixed_7types_56s: 1.8dB→**+16.3dB**；road_noise_0-34: **+15.2dB**；road_noise-15: 发散(-45)→-8.4dB（读数含 G=2.72 的 -8.7dB 口径偏差，G=1 时实测真实对消 +3.3dB）。µ=0 固定 Wc 时 mixed +10.4dB（auto-gain G=0.21 口径）确认 Wc 初值健康
+  - 配置: `GFANC_EMBED_DELAY_MS` 默认 3→0（语义不变，默认行为变）；离线 `GFANC_STEP` 默认 0.05→0.0005
+  - 测试/回归: 三场景默认配置跑通；µ=0/G=1/step 扫描/EMBED=0/RAW_ERR=1/2 共 ~20 组对照实验定位（见验证方式）
+  - 性能/内存: 无变化
+  - 未验证项: ① road-15 的 G=2.72 使 es 进 tanh 饱和区 → 梯度失效，离线仿真中 auto-gain 是模拟"实时工作点"，是否应在离线评估固定 G=1 待用户决策；② 训练管线 (Pre_training_broadband_and_decompose.py 在当前仓库) 需确认用当前系统路径重训的 sub_filters 与运行时 bin 同源（用户已更新 .mat，µ=0 对消验证通过）；③ 实时版 main_realtime.c 的 step/归一化同步检查
+- **验证方式**: ① 路径: `np.corrcoef(bin_payload, npy.flatten())=1.0`；② 发散定位: µ=0 时 anti_mic≈pri（0.235 vs 0.265）量级精确匹配 → Wc 初值正确，发散来自自适应；③ EMBED=0 时 es 4.59→1.25（mixed, G=1）→ 延迟错位确认；④ step 扫描 0.05/0.005/0.0005/0.00005/µ=0 → -23.1/-8.4/+16.3/+11.1/+10.4；⑤ G=1 消除口径假象后 road-15 真实对消 +3.3dB
+- **回退方式**: `GFANC_EMBED_DELAY_MS=3 GFANC_STEP=0.05` 环境变量恢复旧行为；`git checkout data/primary_path.bin data/secondary_path.bin`（恢复后即旧路径版本）
+
 ### [2026-08-08] 重新引入 OCG 多质心聚类闸门 — 替代 cos 单锚点 reset 判定 (v1.7)
 
 - **状态**: 工作区未提交

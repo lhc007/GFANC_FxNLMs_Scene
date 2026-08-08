@@ -69,13 +69,14 @@ python export/export_bin.py
 
 **离线版**（处理 WAV 文件）：
 ```bash
-gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -o main.exe
+gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
 ```
 
 **实时版**（麦克风 → 扬声器）：
 ```bash
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
 ```
+> 编译命令需包含 `src/ocg.c`（OCG 聚类闸门 v1.7+）。也可以直接用 `make` / `make realtime`（Makefile 已包含全部模块）。
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
 
@@ -140,32 +141,35 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 ## 运行示例
 
 ```
-PS D:\VSCodeRepository\GFANC_FxNLMs_Scene> ./main.exe "Noise Examples/road_noise-15.wav"
+PS D:\VSCodeRepository\GFANC_FxNLMs_Scene> ./main.exe "Noise Examples/road_noise_0-34.wav"
 Loading weights...
   BP ANC: bandpass_anc.bin (64tap, gd=2.0ms)
-  OK: sec=6144 pri=6144 sub=30720 bp=1024 L=1024
+  OK: sec=6144 pri=3072 sub=30720 bp=1024 L=1024
   CNN loaded.
+  Ŝ: 原始增益 (默认, 与训练世界一致)
+  PROC delay: 0 ms (0 samples) added to Ŝ — 嵌入式信号链处理延迟 (GFANC_EMBED_DELAY_MS=0 默认)
+  Causality: τ_pri=0.69ms τ_spk=0.62ms τ_proc(bp+emb)=1.97ms → 净预览=-1.91ms (<0 因果缺口 — 随机宽带对消受限, 只能消窄带/低频)
   System ready (CNN loaded).
 
-Input: 44100 Hz, 1 ch, 661500 samples (15.0s)
-Resampled: 44100 Hz -> 16000 Hz (240000 samples)
+Input: 44100 Hz, 1 ch, 1533000 samples (34.8s)
+Resampled: 44100 Hz -> 16000 Hz (556800 samples)
 
  Sec | Band | NR_est | NR_true |    err | refFilt |   anti | Note
 -------------------------------------------------------------------------------------
-   1 |   10 |    0.3 |    0.3 | 0.255 | 0.0098 | 0.0086 | INIT [FxRMS=0.0098]
-   2 |   10 |    0.5 |    0.5 | 0.272 | 0.0099 | 0.0084 | -
-   3 |   10 |    0.8 |    0.8 | 0.296 | 0.0142 | 0.0139 | -
+   1 |    2 |    5.3 |    7.9 | 0.093 | 0.0287 | 0.0136 | INIT [C0/1] [FxRMS=0.0287]
+   2 |    2 |   13.8 |   13.5 | 0.077 | 0.0287 | 0.0213 | - [C0/1]
+   3 |    2 |   15.0 |   15.3 | 0.069 | 0.0287 | 0.0225 | - [C0/1]
   ...
-  15 |   10 |    3.0 |    2.9 | 0.315 | 0.0144 | 0.0417 | -
+  35 |    2 |   15.2 |   14.9 | 0.076 | 0.0287 | 0.0231 | - [C0/1]
 -------------------------------------------------------------------------------------
-  Avg |                           |        |    1.8 |
+  Avg |                           |        |   15.2 |
 
-Processing: 7.6s for 15.0s audio (2.0x)
+Processing: 15.0s for 34.8s audio (2.3x)
 Output: anti_out.wav (2 ch), error_out.wav (3 ch)
 Done.
 ```
 
-> 上为**默认参数**（step=1e-7）的 15s 文件结果，NR 受收敛速度限制。用 `GFANC_STEP=1e-5` 可加快收敛到 ~13-15dB（见 [离线验证](#离线验证) 参数速查）。
+> 上为 **R-58 默认参数**（`GFANC_STEP=0.0005` sum 归一化、`GFANC_EMBED_DELAY_MS=0`、Ŝ 原始增益）的 34s 马路噪声结果。三个标准场景基准: mixed_7types_56s **+16.3dB** / road_noise_0-34 **+15.2dB** / road_noise-15 **-8.4dB**（road-15 负值 = auto-gain G=2.72 的 tanh 饱和口径假象，G=1 时真实对消 +3.3dB，见 [离线验证](#离线验证)）。
 
 ## 效果解读
 
@@ -181,7 +185,7 @@ Done.
 | `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(reset 模式 cos<阈值 → 重置 Wc) |
 
 - **NR_true 是最可信的指标**（离线用 Pri 模型精确算出扰动，NR_est 与它逐秒偏差 <0.5dB）；10 dB 意味着噪声能量降到 1/10，20 dB 意味着降到 1/100
-- 注意：**离线 NR_true 当前按嵌入式处理延迟 3ms 建模因果性**（默认 `GFANC_EMBED_DELAY_MS=3`，启动日志打印净预览时间），不再是"无因果缺口"的理想上限；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
+- 注意：**离线默认 `GFANC_EMBED_DELAY_MS=0`**（R-58-8：训练世界无此延迟，3ms 会造成 anti 相位错位 48 样本 → 自适应发散）。启动日志打印净预览时间（基线 ≈ −1.9ms：64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
 
 ## 项目结构
 
@@ -439,19 +443,21 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 ### 参数 ↔ 降噪量实测速查
 
-以下为**离线实测**（NR_true = Pri 模型真值；马路噪声 34s，窗口场景 预览3ms+延迟≤2ms，2026-08-05）。**数值随输入信号/时长变化，但趋势方向不变**。
+以下为**离线实测**（NR_true = Pri 模型真值；mixed_7types_56s，R-58 默认：sum 归一化 + EMBED=0 + Ŝ 原始增益，2026-08-08）。**数值随输入信号/时长变化，但趋势方向不变**。
 
-**`GFANC_STEP`（步长）— 越大收敛越快、NR 越高，但实时易过冲/振荡**（当前默认 1e-7 为实时稳定底线）：
+**`GFANC_STEP`（步长）— 离线默认 0.0005（R-58-8）。离线为 sum 归一化（与训练世界一致），实时为 mean+cap（硬件标定语义），两者步长不可直接换算**：
 
-| `GFANC_STEP` | 离线 NR_true | 说明 |
+| `GFANC_STEP` | 离线 NR_true (mixed) | 说明 |
 |---|---|---|
-| 1e-7（默认） | ~6 dB | 实时稳定底线；离线 15s 短文件仅 ~2dB（收敛慢） |
-| 3e-7 | ~8 dB | VS-LMS 下实时曾稳定（无 MUTE 振荡） |
-| 5e-7 | ~9 dB | |
-| 3e-6 | ~12 dB | |
-| 1e-5 | ~14 dB | ≈ 算法能力上限（对齐可行性文档 15dB） |
+| 0.05 | 发散（-23dB） | 训练 mu 值，C 端 G×tanh×bp 链路过冲 → 正反馈 |
+| 0.005 | -8.4 dB | 仍偏大 |
+| **0.0005（默认）** | **+16.3 dB** | 收敛最快且稳定 |
+| 0.00005 | +11.1 dB | 收敛偏慢 |
+| µ=0（固定 Wc） | +10.4 dB | 仅 CNN 初值对消（Wc 初值健康） |
 
-**`GFANC_LEAK`（泄漏）— 越小 Wc 长得越足、NR 越高，但太小时 Wc 漂移（实时风险）**：
+> 实时版 `GFANC_STEP` 语义不同：实时默认 1e-7 基准 + Ŝ RMS 自动标定（[main_realtime.c:951-980](main_realtime.c#L951-L980)），且归一化为 mean+cap —— 实时步长与上表不可比，保持默认即可。
+
+**`GFANC_LEAK`（泄漏）— 越小 Wc 长得越足、NR 越高，但太小时 Wc 漂移（实时风险）**（2026-08-05 旧归一化下实测，趋势不变）：
 
 | `GFANC_LEAK` | 离线 NR_true | 说明 |
 |---|---|---|
@@ -461,9 +467,9 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 **`GFANC_WC_TARGET` — 不影响收敛后 NR**（0.003/0.01/0.03 实测均 ~13.9dB）。只影响冷启动 Wc 幅度（过大 → 开机"嗡"瞬态），收敛后自适应覆盖。
 
-**文件时长**：步长不变时收敛需要时间——15s 文件默认参数 ~2dB、34s ~5-6dB、56s ~4.7dB（**均为理想正预览下**；默认 3ms 嵌入式延迟下受因果墙限制，见 [离线验证](#离线验证)）。
+**文件时长**：步长不变时收敛需要时间——默认参数下 15s 文件收敛略欠、34s 稳、56s 最优（mixed 56s 实测 +16.3dB）。
 
-> ⚠️ 上表为**理想正预览**测量（无嵌入式处理延迟）。离线默认 `GFANC_EMBED_DELAY_MS=3` 后，NR 上限由三堵墙主导：**延迟**（因果缺口，见[窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）/ **相干** / **空间**（见[离线验证](#离线验证)）。实时 NR_est 还依赖 Ŝ 模型+误差麦灵敏度、误差麦降太狠会虚高——**唯一真值 = 离线 NR_true，实时以人耳为准**。
+> ⚠️ 离线 NR 上限由三堵墙主导：**延迟**（因果缺口 ≈ −1.9ms，见[窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）/ **相干** / **空间**。实时 NR_est 还依赖 Ŝ 模型+误差麦灵敏度、误差麦降太狠会虚高——**唯一真值 = 离线 NR_true，实时以人耳为准**。
 
 ## 代码结构
 
@@ -549,34 +555,29 @@ python export/export_bin.py
 
 | 指标 | 结果 |
 |------|------|
-| **算法能力**（正预览 + `GFANC_STEP=1e-5`） | **~13-15 dB**（详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)） |
-| 平均 NR_true（嵌入式默认 3ms 延迟, road_noise-15, 15s） | ~0.3 dB（宽带→相干/空间墙, 见下方警告） |
-| 平均 NR_true（嵌入式默认 3ms 延迟, mixed_7types_56s, 56s） | ~1.8 dB |
-| 平均 NR_true（嵌入式 2ms + 预览 10ms → 净预览 +6ms, mixed_7types） | ~3.3 dB（稳态尾部 4-6dB） |
+| 平均 NR_true, mixed_7types_56s（默认参数） | **+16.3 dB** |
+| 平均 NR_true, road_noise_0-34（默认参数） | **+15.2 dB** |
+| 平均 NR_true, road_noise-15（默认参数） | -8.4 dB（**G=2.72 tanh 饱和口径假象**，G=1 实测真实对消 **+3.3dB**，见下） |
+| 平均 NR_true, mixed（µ=0 固定 Wc, 仅 CNN 初值） | +10.4 dB（Wc 初值健康） |
 | CNN 输出维 (K) | 30 (=S×C, 从 linear_weight 推导, 直接权重回归) |
 | 指标可信度 | NR_est 与 NR_true 逐秒偏差 <0.5dB |
 
-> **默认 step=1e-7 是为实时稳定性调校的**（记忆/实测：VS-LMS 下 step 3e-7 实时已过冲，1e-7 才稳）。离线文件短（15-56s）时默认步长收敛偏慢、NR 偏低。要复现算法能力上限（13-15dB），用 `GFANC_STEP=1e-5` 跑离线。步长与离线 NR（34s 马路噪声, 正预览）实测关系：1e-7→6dB、5e-7→9dB、1e-5→14dB。
+> **road_noise-15 的 -8.4dB 是口径假象不是真实变差**：该文件参考信号弱 → auto-gain 补偿 G=2.72（`TARGET_REF_RMS/ref_rms`）→ `es=(pri+anti)×G` 远超 ±1 → tanh 饱和、梯度趋零 → FxNLMS 学不动。NR_true 统计用未截断信号，anti≈0 时 `NR_true = -20·log10(G) = -8.7dB` 是 G² 项制造的读数。验证: G=1 时真实对消 +3.3dB；µ=0 精确复现 -8.7dB。**离线评估弱信号文件时可 `GFANC_MIC_GAIN=1` 绕过 auto-gain 看真实对消**（离线与硬件旋钮无关，G 只是仿真工作点）。
 
-> ⚠️ **离线 NR_true 现在按嵌入式处理延迟 3ms 建模因果性**（默认 `GFANC_EMBED_DELAY_MS=3`，启动日志打印净预览时间），不再是"无因果缺口"的理想上限。关键实测（2026-08-08）：① 即使不加嵌入式延迟，64tap ANC 带通群延迟 1.97ms 已超过初级路径提前量 0.69ms → 基线净预览即 −1.9ms；② 纯宽带 road_noise 加多大预览都封顶 ~0.8dB（相干/空间墙，2 扬声器/3 误差麦几何）；③ 要净预览为正需 `τ_pri > τ_spk + τ_proc`（proc=2ms 时需参考麦声学提前量 >4.6ms ≈ 1.6m，参考麦移向噪声源/移离误差麦）。实时受 PC 控制路径延迟限制更重（净预览 ≈ −9ms；详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ 后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
+> ⚠️ 离线默认 `GFANC_EMBED_DELAY_MS=0`（R-58-8：训练世界无此延迟，3ms 加在 Ŝ 上 → anti 相位错位 48 样本 → 正反馈发散）。基线净预览 ≈ −1.9ms（64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）——随机宽带对消受限，只能消窄带/低频；纯宽带 road_noise 加多大预览都封顶 ~0.8dB（相干/空间墙，2 扬声器/3 误差麦几何）。实时受 PC 控制路径延迟限制更重（净预览 ≈ −9ms；详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ 后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
 
 ## 常见问题
 
-**Q: 为什么离线运行 NR 只有 0.3-2dB？算法是不是有问题？**
-A: **不是 bug**——三个因素叠加：① 默认步长 1e-7 为实时稳定性调校（VS-LMS 下 3e-7 实时已过冲），离线 15s 文件在 1e-7 下收敛慢；② 离线现在默认按嵌入式处理延迟 3ms 建模因果性（`GFANC_EMBED_DELAY_MS=3`），基线净预览已是 **−1.9ms**（64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；③ 纯宽带噪声（road_noise）受**相干/空间墙**限制，与因果无关，加多大预览都封顶 ~0.8dB（2 扬声器/3 误差麦几何）。
+**Q: 为什么 offline 结果因文件而异（mixed/road_0-34 15dB+，road_noise-15 却是 -8.4dB）？**
+A: 三个标准场景用的是同一套默认参数，差异来自 auto-gain 工作点：mixed（G=0.21）和 road_0-34 参考信号强、G 小，误差链不饱和、梯度健康 → **+16.3 / +15.2dB**。road_noise-15 是 -15dB 弱衰减版，ref 太弱 → auto-gain 补偿 G=2.72 → `es×G` 超出 ±1 进 tanh 饱和区（梯度≈0）→ FxNLMS 学不动，且 NR_true 读数含 G² 口径偏差（anti≈0 时 NR_true=-20·log10(G)=-8.7dB）。**验证：`GFANC_MIC_GAIN=1` 跑 road_noise-15 得真实对消 +3.3dB**（离线 G 只是仿真工作点，与硬件旋钮无关）。R-58 修复前三个场景全部发散（3ms 嵌入延迟 + step=0.05），当前结果已与训练世界语义一致。
 
 | 配置 | NR_true |
 |---|---|
-| 默认参数, road_noise-15 | ~0.3 dB |
-| 默认参数, mixed_7types_56s | ~1.8 dB |
-| `GFANC_EMBED_DELAY_MS=2 GFANC_VIRT_PREVIEW_MS=10`（净预览 +6ms）, mixed_7types | ~3.3 dB（稳态 4-6dB） |
-| 同上, Helicopter | 稳态 ~3.5 dB |
-
-要复现算法能力上限（正预览 + 大步长），跑：
-```bash
-GFANC_EMBED_DELAY_MS=2 GFANC_VIRT_PREVIEW_MS=10 GFANC_STEP=1e-5 ./main.exe "Noise Examples/mixed_7types_56s.wav"
-```
-0.3-2dB 反而是"诚实"读数——反映真实因果约束 + 实时安全步长下的收敛结果，更接近嵌入式实际能拿到的量级（嵌入式还受参考麦声学提前量限制：要正预览需 `τ_pri > 4.6ms`，参考麦需移向噪声源/移离误差麦）。
+| 默认参数, mixed_7types_56s | +16.3 dB |
+| 默认参数, road_noise_0-34 | +15.2 dB |
+| 默认参数, road_noise-15 | -8.4 dB（G=2.72 口径假象） |
+| `GFANC_MIC_GAIN=1`, road_noise-15 | +3.3 dB（真实对消） |
+| 默认参数 + µ=0（固定 Wc）, mixed | +10.4 dB（CNN 初值健康度） |
 
 **Q: 为什么 error_out.wav 听起来比原噪声还大？**
 A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看表格里的 NR_true（离线真值）或实时 NR 数字，不要用耳朵直接听 error_out.wav。

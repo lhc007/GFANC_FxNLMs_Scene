@@ -122,7 +122,9 @@ typedef struct {
     12.0f, 4, 8, 0.96f, /* hw_thresh_db(12), hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
     0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
-    3,                  /* embed_delay_ms (嵌入式处理延迟默认3ms, GFANC_EMBED_DELAY_MS 覆盖) */ \
+    0,                  /* embed_delay_ms (R-58-8: 默认0 — 训练世界无此延迟! 3ms 加在 Ŝ 上
+                           → anti 相位错位 48 样本 → 自适应正反馈发散; 需评估嵌入式目标时
+                           GFANC_EMBED_DELAY_MS 显式开启) */ \
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \

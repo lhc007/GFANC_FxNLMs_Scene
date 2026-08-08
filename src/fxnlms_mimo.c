@@ -21,6 +21,7 @@ int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
 {
     fx->E = E; fx->S = S; fx->L = L;
     fx->step_size = step_size; fx->leak = leak;
+    fx->sum_norm = 0;   /* R-58-9: 默认 mean+cap (实时硬件标定语义); 离线调用方 fxnlms_set_norm(1) */
     fx->wc     = (float *)calloc(S * L,     sizeof(float));
     fx->xd     = (float *)calloc(E * S * L, sizeof(float));
     fx->x_hist = (float *)calloc(L,         sizeof(float));
@@ -37,6 +38,11 @@ int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
 
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc)
     { memcpy(fx->wc, wc, fx->S * fx->L * sizeof(float)); }
+
+/* R-58-9: 归一化模式 — 1=sum (离线, 与训练逐样本数学一致), 0=mean+cap (实时硬件标定).
+   注意: main.c (离线仿真) 走 fxnlms_tick_rt 路径, 必须显式置 1 才有 R-58-5 的离线收益. */
+void fxnlms_set_norm(fxnlms_mimo_t *fx, int sum_norm)
+    { fx->sum_norm = sum_norm; }
 
 /* ── R-12: 环形缓冲写入 (替代 memmove) ── */
 
@@ -110,9 +116,11 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
     int p = fx->xd_ptr;
     int seg1 = (p == 0) ? L - 1 : p - 1;  /* 最新样本物理位置 */
 
-    /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
-       安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
-       floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
+    /* R-58-5: 功率归一化对齐训练世界 (sum 归一化, 不除 E*L).
+       训练/MIMO_GFANC 用 total_power = ΣXd² (sum), C 原用 mean = ΣXd²/(E*L)
+       → C 更新量比训练大 E*L = 3072 倍, cap 被迫压上限, 弱信号下归一化失效,
+       有效步长恒 = step×cap 与信号功率无关 → 发散驱动之一.
+       修复: power = ΣXd² + floor, 更新 = step·eg·Xd/ΣXd² 与训练逐样本数学一致. */
     float power[GFANC_S_MAX];  /* R-22: VLA → 定长 */
     for (int s = 0; s < S; s++) {
         power[s] = 0.0f;
@@ -124,13 +132,12 @@ void fxnlms_tick(fxnlms_mimo_t *fx, const float *Fx, const float *disturbance,
                 for (int idx = L - 1; idx >= p; idx--)
                     power[s] += base[idx] * base[idx];
         }
-        power[s] = power[s] / (float)(E * L) + 1e-6f;
+        power[s] += 1e-6f;
     }
 
-    /* 梯度更新 (inv_pwr 上限与实时版一致, 弱信号有效步长受界) */
+    /* 梯度更新 (与训练 sum 归一化一致, 无需 cap — ΣXd²>1 时 inv_pwr<1) */
     for (int s = 0; s < S; s++) {
         float inv_pwr = 1.0f / power[s];
-        if (inv_pwr > 1000.0f) inv_pwr = 1000.0f;
         for (int e = 0; e < E; e++) {
             float *base = fx->xd + (e * S + s) * L;
             float *wc_s = fx->wc + s * L;
@@ -202,9 +209,13 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     int p = fx->xd_ptr;
     int seg1 = (p == 0) ? L - 1 : p - 1;
 
-    /* R-48: 功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
-       安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
-       floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
+    /* R-58-9: 归一化模式由 fxnlms_set_norm 决定.
+       sum (离线, 默认 main.c 置 1): power = ΣXd² + floor, 与训练逐样本数学一致,
+           更新 = step·eg·Xd/ΣXd², ΣXd²>1 时 inv_pwr<1 无需 cap (R-58-5).
+       mean (实时, 默认 0): power = ΣXd²/(E*L) + 1e-6, 硬件标定语义 (R-48).
+           功率 floor 必须在 /= (E*L) 之后, 否则有效 floor = 1e-6/3072 ≈ 3.26e-10,
+           安静信号下有效步长可达 step/power ≈ 5e-7/3.26e-10 ≈ 1534 → Wc 失控膨胀.
+           floor=1e-6 后最大有效步长 = 5e-7/1e-6 = 0.5, 安全. */
     float power[GFANC_S_MAX];  /* R-22: VLA → 定长 */
     for (int s = 0; s < S; s++) {
         power[s] = 0.0f;
@@ -216,7 +227,8 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                 for (int idx = L - 1; idx >= p; idx--)
                     power[s] += base[idx] * base[idx];
         }
-        power[s] = power[s] / (float)(E * L) + 1e-6f;
+        if (fx->sum_norm) power[s] += 1e-6f;
+        else              power[s] = power[s] / (float)(E * L) + 1e-6f;
     }
 
     /* anti-windup: 输出超出钳位阈值(±1.2)时冻结梯度 + 快速衰减(200×leak),
@@ -238,11 +250,12 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
             else if (vs < VS_MIN) vs = VS_MIN;
 
             for (int s = 0; s < S; s++) {
-                /* BUG: 限制有效步长 — 弱信号时 NLMS 功率归一化把 inv_pwr 放大到 ~1e4,
-                   有效步长 = step×1e4 爆炸 → Wc 失控增长 → 反馈极限环.
-                   上限 1000 使有效步长 ≤ step×1000, 弱信号更新受界. */
+                /* R-58-9: mean 模式下限制有效步长 — 弱信号时 NLMS 功率归一化把 inv_pwr
+                   放大到 ~1e4, 有效步长 = step×1e4 爆炸 → Wc 失控增长 → 反馈极限环.
+                   上限 1000 使有效步长 ≤ step×1000, 弱信号更新受界.
+                   sum 模式下 ΣXd²>1 时 inv_pwr<1, 无需 cap (R-58-5). */
                 float inv_pwr = 1.0f / power[s];
-                if (inv_pwr > 1000.0f) inv_pwr = 1000.0f;
+                if (!fx->sum_norm && inv_pwr > 1000.0f) inv_pwr = 1000.0f;
                 for (int e = 0; e < E; e++) {
                     float *base = fx->xd + (e * S + s) * L;
                     float *wc_s = fx->wc + s * L;

@@ -16,10 +16,14 @@ typedef struct {
     volatile int freeze_lms;  /* 发散检测: 1=冻结 (R-28: int 跨平台32-bit, long在LP64为64) */
     float        err_env;     /* 误差功率包络快 EMA (~4ms, VS-LMS 尖峰检测) */
     float        err_base;    /* 误差功率包络慢 EMA (~31ms, VS-LMS 基线) */
+    int          sum_norm;    /* R-58-9: 功率归一化模式. 1=sum (ΣXd², 离线与训练世界一致),
+                                  0=mean (ΣXd²/(E*L)+floor, 实时硬件标定语义, 默认). */
 } fxnlms_mimo_t;
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak);  /* 返回0=成功, -1=OOM */
+/* R-58-9: 归一化模式开关 — 离线仿真调 1 (sum), 实时默认 0 (mean+cap, 保持硬件标定行为) */
+void fxnlms_set_norm(fxnlms_mimo_t *fx, int sum_norm);
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc);
 
 /* ── 离线仿真 (保留, 互不影响) ── */
