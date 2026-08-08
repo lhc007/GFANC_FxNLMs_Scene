@@ -18,6 +18,7 @@
 #include "cnn_m5_forward.h"
 #include "scene_controller.h"
 #include "scene_manager.h"
+#include "ocg.h"
 #include "fxnlms_mimo.h"
 #include "howling_detect.h"
 #include "sec_online.h"
@@ -104,6 +105,7 @@ static gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
 typedef struct {
     /* ANC 模块 */
     scene_ctrl_t  sc;
+    ocg_t         ocg;          /* OCG 多质心聚类闸门 (reset 模式决策) */
     fxnlms_mimo_t fx;
     fir_filter_t  bp_fir;        /* ref 带通 CNN (1024tap, 分类用) */
     fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (256tap, 群延迟8ms) */
@@ -605,8 +607,9 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
-    printf("[CNN] s=%d max=%.2f cos=%.2f %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
+    printf("[CNN] s=%d max=%.2f cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
            new_scene, gains[new_scene], cos_sim,
+           ctx->ocg.active, ctx->ocg.n_clusters,
            nr_str, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
            ctx->peak_mute ? " [PMUTE]" : "",
@@ -753,7 +756,8 @@ static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains) {
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
     ctx->converged_frames = 0;
-    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset cos=%.3f\n", cos_sim);
+    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset cos=%.3f clu=%d/%d\n",
+                               cos_sim, ctx->ocg.active, ctx->ocg.n_clusters);
     printf("  -> RESET (cos=%.2f < %.2f)\n", cos_sim, cfg.switch_threshold);
 }
 
@@ -1045,6 +1049,11 @@ int main(void) {
     if (scene_ctrl_init(&ctx->sc, sub_filters, L) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); ret = 1; goto cleanup;
     }
+    /* OCG 聚类闸门初始化: τ 复用 switch_threshold (GFANC_RESET_THRESH) */
+    if (ocg_init(&ctx->ocg, ctx->sc.K, cfg.switch_threshold,
+                 cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
+        fprintf(stderr, "ERROR: ocg_init failed\n"); ret = 1; goto cleanup;
+    }
     /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
        anti ≈ Wc_RMS × ref_filt × √L. 默认 0.01: ref=0.025→anti≈0.008 (−42dBFS).
        几乎无声, 确保噪声突增时不会饱和; LMS 在 10-30s 内自行收敛到工作点.
@@ -1104,7 +1113,7 @@ int main(void) {
     ctx->log_file = fopen("gfanc_log.csv", "a");
     if (ctx->log_file) {
         gf_log_timestamp(ctx->log_file, "start");  /* R-28: 可移植时间戳 */
-        fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event\n");
+        fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event,k_cluster,n_clusters\n");
         fflush(ctx->log_file);
     }
 
@@ -1145,6 +1154,7 @@ int main(void) {
             InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_gains, gains, K * sizeof(float));
+            ocg_reset(&ctx->ocg, gains);  /* OCG: 首个增益建立簇 0 */
             /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
                RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
             int init_ramp_ms = cfg.ramp_ms * 2;
@@ -1180,7 +1190,8 @@ int main(void) {
                         log_sec++, new_scene, gains[new_scene], cos_sim,
                         ctx->nr_level, ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
                         ctx->safety_mute ? "MUTE" : "",
-                        ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "");
+                        ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "",
+                        ctx->ocg.active, ctx->ocg.n_clusters);
                 fflush(ctx->log_file);
             }
 
@@ -1196,10 +1207,15 @@ int main(void) {
 
             check_wc_divergence(ctx);
             check_convergence(ctx);
-            /* 去场景层模式派发: reset=cos(anchor,cur)<阈值 → CrossFader 过渡到新 Wc;
-               continuous=永不重置 (CNN 仅首秒 INIT 一次). */
+            /* 去场景层模式派发: reset=OCG 簇索引变化 → CrossFader 过渡到新 Wc;
+               continuous=永不重置 (CNN 仅首秒 INIT 一次).
+               OCG (默认): 多质心聚类, 仅簇索引变化才重置 — 抑制簇内抖动/
+               慢漂移导致的反复重置 (ICASSP 2026). 关闭 (GFANC_OCG=0) 回退
+               旧闸门 cos(anchor,cur)<τ. */
             if (cfg.gfanc_mode == 1) {          /* reset */
-                if (cos_sim < cfg.switch_threshold) apply_reset(ctx, cos_sim, gains);
+                int do_reset = cfg.ocg_enable ? ocg_step(&ctx->ocg, gains)
+                                              : (cos_sim < cfg.switch_threshold);
+                if (do_reset) apply_reset(ctx, cos_sim, gains);
             }                                   /* continuous: 不动作 */
         }
         memcpy(ctx->sc.prev_gains, gains, K * sizeof(float));

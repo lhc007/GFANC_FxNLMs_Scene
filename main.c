@@ -22,6 +22,7 @@
 #include "cnn_m5_forward.h"
 #include "scene_controller.h"
 #include "scene_manager.h"
+#include "ocg.h"
 #include "fxnlms_mimo.h"
 
 /* ══════════════════════════════════════════════════════════
@@ -298,6 +299,12 @@ int main(int argc, char **argv)
     if (scene_ctrl_init(&sc, sub_filters, L) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); return 1;
     }
+    /* OCG 聚类闸门 (与实时版一致): τ 复用 switch_threshold */
+    ocg_t ocg;
+    if (ocg_init(&ocg, sc.K, cfg.switch_threshold,
+                 cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
+        fprintf(stderr, "ERROR: ocg_init failed\n"); return 1;
+    }
     /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
 
     /* 2e. FxNLMS */
@@ -418,6 +425,7 @@ int main(int argc, char **argv)
         if (first_sec) {
             /* 首秒 INIT: CNN Wc → FxNLMS 初始化 (两模式一致) */
             memcpy(anchor_gains, gains, K * sizeof(float));
+            ocg_reset(&ocg, gains);  /* OCG: 首个增益建立簇 0 */
             fxnlms_set_wc(&fx, wc_cur);
             snprintf(action, sizeof(action), "INIT");
             /* 自动增益标定 (匹配实时版) */
@@ -432,9 +440,12 @@ int main(int argc, char **argv)
             /* S-1: cos(anchor_gains, cur_gains) — 30 维直接权重增益 */
             float cos_sim = sm_cos_sim(anchor_gains, gains, K);
 
-            /* reset 模式: 频谱显著变化 (cos < threshold) → CrossFader 重置到新 Wc.
-               continuous 模式: CNN 不参与后续 Wc 构造 (仅诊断), FxNLMS 永不重置. */
-            if (cfg.gfanc_mode == 1 && cos_sim < cfg.switch_threshold) {
+            /* reset 模式: OCG 簇索引变化 (默认) 或 cos(anchor,cur)<τ (GFANC_OCG=0)
+               → CrossFader 重置到新 Wc; continuous 模式: CNN 不参与后续 Wc 构造.
+               OCG: 多质心聚类抑制簇内抖动/慢漂移导致的反复重置 (ICASSP 2026). */
+            int do_reset = cfg.ocg_enable ? ocg_step(&ocg, gains)
+                                          : (cos_sim < cfg.switch_threshold);
+            if (cfg.gfanc_mode == 1 && do_reset) {
                 memcpy(wc_old, fx.wc, S * L * sizeof(float));  /* 过渡起点 (当前收敛 Wc) */
                 /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
                 fade_cnt = cfg.fade_len;
@@ -560,6 +571,7 @@ int main(int argc, char **argv)
         printf("%4d | %5d | %6s | %6s | %5.3f | %6.4f | %5.4f | %s",
                sec + 1, new_scene, nr_est_str, nr_true_str,
                err_rms, ref_rms, anti_rms, action);
+        if (cfg.ocg_enable) printf(" [C%d/%d]", ocg.active, ocg.n_clusters);
         if (sec == 0) printf(" [FxRMS=%.4f]", sqrtf(acc_ref / len));
         printf("\n");
 

@@ -243,7 +243,7 @@ CNN 神经网络每秒分析一次 1 秒窗口的噪声，回归 **30 维子带�
 
 | 模式 | CNN 行为 | Wc 行为 |
 |---|---|---|
-| **reset**（默认） | 每秒跑，输出新 30 维增益 + 候选 wc_cur | `cos_sim(anchor_gains, cur_gains) < 0.8`（`GFANC_RESET_THRESH` 可调）→ CrossFader 100ms 平滑过渡到新 Wc，刷新 anchor |
+| **reset**（默认） | 每秒跑，输出新 30 维增益 + 候选 wc_cur | **OCG 多质心聚类闸门**（v1.7，ICASSP 2026）：对增益向量做在线聚类，仅**簇索引变化**才 → CrossFader 100ms 平滑过渡到新 Wc（`GFANC_OCG=0` 回退 `cos(anchor,cur)<0.8`） |
 | **continuous** | 每秒跑（仅诊断日志） | 仅首秒 INIT 设一次，FxNLMS 永不重置 |
 
 噪声类型变化是秒级到分钟级的，1 秒窗口保证足够的频率分辨率。reset 模式触发时 CrossFader 在 100ms 内平滑过渡，防止可闻瞬态。
@@ -416,9 +416,11 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 变步长 (VS-LMS) | 双 EMA 尖峰检测, 突发降步至 5% | 误差相对自身基线跳变→降步防反馈过冲; 平滑收敛全速 (2026-08-05) |
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
-| 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos<阈值 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
-| Reset 触发 | cos(anchor_gains, cur_gains) < 0.8 (env: GFANC_RESET_THRESH) | 仅 reset 模式; MIMO_GFANC Reset 同款, 无滞回 |
-| ~~场景切换 (OCG)~~ | 已移除 (v1.5 去场景层, v1.6 删除代码) | `src/ocg.c`/`include/ocg.h` 已删除, 含 `GFANC_OCG_*` 参数 |
+| 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: OCG 簇索引变化 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
+| Reset 触发 (OCG) | OCG 多质心聚类闸门 (env: GFANC_OCG=0 关, 回退旧闸门) | v1.7 新增: 增益向量在线聚类, 簇索引变化才重置 (ICASSP 2026); 簇半径复用 switch_threshold (cos 相似度) |
+| 聚类半径 τ | 0.8 (env: GFANC_RESET_THRESH) | cos(g', centroid) < τ → 新建簇; 簇内抖动/慢漂移被质心吸收不触发 |
+| 质心漂移 α | 0.1 (env: GFANC_OCG_ALPHA) | 质心 EMA 跟随增益方向 (吸收慢漂移) |
+| 簇上限 | 8 (env: GFANC_OCG_CLUSTERS) | LRU 淘汰最久未命中簇 |
 | Reset 过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 嵌入式处理延迟 | 3ms 默认 (env: GFANC_EMBED_DELAY_MS) | 离线 pad Ŝ 模拟 ADC+DSP+DAC 因果缺口 (v1.5) |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
@@ -472,7 +474,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick_rt` + 64tap ANC 带通 (与实时同信号链) |
 | `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, **Reset/Continuous 双模式派发** (去场景层), Ŝ 环路延迟自动补偿 |
 | `src/scene_controller.c` | CNN 直接权重 Wc 生产者 (v1.6): minmax → CNN 30 维回归 → `tanh` 增益 → `Wc=Σ gain×sub` → RMS 标定 + 取反 |
-| ~~`src/ocg.c` + `include/ocg.h`~~ | ~~在线聚类闸门 (ICASSP 2026)~~ — **已删除** (v1.6 死代码清理, 去场景层后零调用) |
+| `src/ocg.c` + `include/ocg.h` | OCG 多质心聚类闸门 (v1.7, ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置 — 抑制簇内抖动/慢漂移导致的反复重置 |
 | `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) |
 | `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏) |
 | `src/fir_filter.c` | FIR 滤波器 (gfanc_delay_t 双精度累加) |

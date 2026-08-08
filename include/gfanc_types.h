@@ -92,8 +92,16 @@ typedef struct {
 
     /* 去场景层 (gfanc-direct-weight): 无场景切换, CNN 只产 Wc.
        模式: 0=continuous (CNN 仅首秒初始化, FxNLMS 永不重置),
-             1=reset (每秒 cos_sim(anchor,probs)<switch_threshold → CrossFader 重置). */
+             1=reset (多质心 OCG 簇索引闸门 → CrossFader 重置). */
     int   gfanc_mode;          /* env: GFANC_MODE=reset|continuous */
+
+    /* OCG 在线聚类闸门 (ICASSP 2026, 详见 ocg.h):
+       在增益域对 CNN 输出做多质心聚类, 仅簇索引变化才更换滤波器 —
+       抑制簇内抖动/慢漂移导致的反复重置, 保护 FxNLMS 收敛.
+       τ 复用 switch_threshold (GFANC_RESET_THRESH). */
+    int   ocg_enable;          /* 1=OCG 闸门 (默认), 0=旧 cos(anchor,cur)<τ (env: GFANC_OCG) */
+    float ocg_alpha;           /* 质心 EMA 漂移系数 (env: GFANC_OCG_ALPHA, 默认 0.1) */
+    int   ocg_max_clusters;    /* 簇上限 (env: GFANC_OCG_CLUSTERS, 默认 8) */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -118,6 +126,7 @@ typedef struct {
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
+    1, 0.1f, 8,         /* ocg_enable, ocg_alpha, ocg_max_clusters (OCG 聚类闸门) */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -142,6 +151,12 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
         else if (!strcmp(s, "reset")) cfg->gfanc_mode = 1;
     }
     if ((s = getenv("GFANC_RESET_THRESH"))) cfg->switch_threshold = (float)atof(s);
+    if ((s = getenv("GFANC_OCG"))) {
+        if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "false")) cfg->ocg_enable = 0;
+        else if (!strcmp(s, "1") || !strcmp(s, "on") || !strcmp(s, "true")) cfg->ocg_enable = 1;
+    }
+    if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha = (float)atof(s);
+    if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

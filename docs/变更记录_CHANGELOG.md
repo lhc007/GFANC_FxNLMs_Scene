@@ -31,6 +31,40 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-08] 重新引入 OCG 多质心聚类闸门 — 替代 cos 单锚点 reset 判定 (v1.7)
+
+- **状态**: 工作区未提交
+- **基线**: cbd08cd（chore: 删除冗余 MIMO 合成数据训练 notebook）
+- **变更代码**:
+  - 新增: `include/ocg.h`、`src/ocg.c` — OCG 多质心在线聚类闸门（ICASSP 2026 论文 §2.3, 适配增益域）
+  - 修改: `main_realtime.c` — reset 模式派发改 `ocg_step()` 簇索引闸门（`GFANC_OCG=0` 可回退旧 cos 闸门）；rt_ctx 加 ocg 字段；INIT 时 `ocg_reset`；诊断行/CSV 加 `k_cluster,n_clusters` 列；apply_reset EVENT 行加簇信息
+  - 修改: `main.c`（离线）— 同构接入 OCG + 每秒表加 `[Ck/n]` 簇诊断
+  - 修改: `include/gfanc_types.h` — +`ocg_enable/ocg_alpha/ocg_max_clusters` 3 字段、默认值（1, 0.1, 8）、env 解析（`GFANC_OCG/GFANC_OCG_ALPHA/GFANC_OCG_CLUSTERS`）；τ 复用 `switch_threshold`（`GFANC_RESET_THRESH`）
+  - 修改: `Makefile` — MODULES +`src/ocg.c`
+- **变更原因**: 论文依据（Luo et al., ICASSP 2026）——双速率混合（1Hz CNN 产滤波器 + 采样率 FxNLMS 自适应）中，CNN 输出微小抖动反复触发滤波器更换会打断 FxNLMS 收敛。单锚点 cos 闸门（v1.6）只与"上次重置时增益"比较：慢漂移累计超阈值 → 反复重置；簇内抖动 → 锚点被抖动点反复覆盖 → 每帧重置。多质心闸门：质心跟随漂移/抖动（EMA α=0.1），仅簇索引变化才更换（论文式(4)）。
+- **造成影响**:
+  - 行为: reset 模式默认走 OCG 闸门；对稳定噪声（现测 mixed_7types_56s）行为与旧闸门一致（均无 reset，平均 NR 均 1.8dB）；对抖动/慢漂移噪声严格更少重置。continuous 模式不变
+  - 配置: 新增 `GFANC_OCG`（默认开）、`GFANC_OCG_ALPHA`（0.1）、`GFANC_OCG_CLUSTERS`（8）；`GFANC_RESET_THRESH` 语义变为聚类半径 τ（cos 相似度）
+  - 测试/回归: 三目标（main/gfanc_realtime/calibrate）编译零警告；`main.exe mixed_7types_56s.wav` 56s 跑通；OCG 机制 6 项单测全过（簇内抖动保持/突变新建簇/回已知簇复用/LRU 淘汰/慢漂移吸收/零增益保持）；A/B（OCG vs 旧闸门）同一文件结果一致（无回归）
+  - 性能/内存: 每帧 O(簇数×K) 余弦比较，1Hz 主线程开销可忽略；ocg_t 栈内存 ~1.1KB
+  - 未验证项: ① 真实重训 CNN（当前为合成冒烟检查点）下的抖动行为——OCG 的价值场景，待真实模型重训后复测；② τ=0.8/α=0.1 在增益域的标定依赖旧场景概率域的 0.8 经验值，如有抖动频发可调
+- **验证方式**: ① `make` 三目标零警告；② 机制单测 `build/ocg_selftest.c`（6 项全过）；③ 离线 A/B：`GFANC_OCG=0` 与默认对 mixed_7types_56s.wav 输出一致（NR 均 1.8dB）；④ 收紧 τ=0.92 压力测试两闸门均不误触发
+- **回退方式**: `GFANC_OCG=0` 环境变量即时回退旧 cos 单锚点闸门；`git checkout` 删除 ocg 文件
+
+### [2026-08-08] 设计决策留档 — tanh 增益域 vs 论文 [0,1] 非负权重 / CNN 路径解耦（均暂不改）
+
+- **状态**: 记录留档，未实施（用户指示"先记录下来，以后在改"）
+- **留档 1 — tanh [-1,1] 带符号增益 vs 论文 [0,1] 非负权重**:
+  - 现状: `scene_ctrl_process` 对 CNN logits 做 `tanh` → 每扬声器每子带增益 ∈ [-1,1]（带符号，允许相位翻转），`Wc=Σ gain×sub` 后 RMS 标定 + 取反
+  - 论文（GFANC 家族）: 权重向量 g' ∈ [0,1]^M 非负，CNN 回归 MSE=0.0031
+  - 权衡: 带符号增益表达力强（可反相、逐扬声器独立），但标签求解域更宽 → CNN 回归更难、训练数据需求更大；[0,1] 非负更易学、有界更稳，但表达受限（只能幅度组合）
+  - 后续行动（当 CNN 回归误差偏高/收敛不稳时）: ① 标签端加非负/稀疏约束；② CNN 输出层换 sigmoid；③ 保持 tanh 但在损失里加带内增益稀疏正则
+- **留档 2 — CNN 与路径解耦（论文 §2.2: 新声学环境只重训子滤波器, CNN 直接迁移）**:
+  - 分析结论: 当前标签由真实 MIMO 路径批量 LMS 求解（路径相关）。解耦 = 合成路径（带通）上求标签 → CNN 只学"噪声频谱 → 子带组合"，与路径无关
+  - **为什么暂不改**: ① 当前单窗口固定声学环境，真实路径标签严格更优（初始 Wc 更准），解耦在本机不会提高降噪量、反而会略降初始质量；② 收益仅在**多窗型产品**（每台窗型=新路径，免重训 CNN）；③ 需重训 + 硬件 A/B
+  - 触发条件（满足再实施）: 出现第二套窗型/开窗姿态需部署；或 CNN 迁移性测试失败
+- **回退方式**: 无代码变更，仅文档
+
 ### [2026-08-08] 死代码清理 — 删除 OCG 聚类闸门 / scene_manager 死函数 / test 脚手架
 
 - **状态**: 已提交（与 v1.6 直接权重改动同一提交）
