@@ -21,7 +21,6 @@
 #include "fxnlms_mimo.h"
 #include "howling_detect.h"
 #include "sec_online.h"
-#include "ocg.h"
 
 /* ── ADV-F3: 回调 WCET 监控 (诊断). GFANC_WCET=1 开启 (默认关, 零开销).
    rdtsc 仅 x86/x64; 其他平台编译为恒 0, WCET 显示 0. ── */
@@ -141,13 +140,11 @@ typedef struct {
     volatile LONG cnn_buf_ready; /* -1=无就绪, 0/1=该块已满待主线程处理 */
     int    first_sec;
 
-    /* 每场景记忆: 保存已收敛的 Wc, 下次切回时直接恢复 */
-    float  scene_wc[SC_K_MAX][S*L];
-    int    scene_wc_valid[SC_K_MAX];  /* 1=该场景已有收敛好的 Wc */
-    int    cur_scene_id;
+    /* 去场景层 (gfanc-direct-weight): 无场景记忆/切换/OCG.
+       单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
+    float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
-    float  anchor_probs[SC_K_MAX];    /* 进入当前场景时的probs锚点 (S-1修复) */
-    ocg_t  ocg;                   /* 在线聚类闸门 (GFANC_OCG=1 时替代滞回决策) */
+    float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
@@ -602,14 +599,14 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 /* ── 主循环辅助函数 (CR-4: 从 ~110 行 while 块拆分) ── */
 
 static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
-                              const float *probs) {
+                              const float *gains) {
     char nr_str[20];
     if (ctx->diverged)
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
     printf("[CNN] s=%d max=%.2f cos=%.2f %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
-           new_scene, probs[new_scene], cos_sim,
+           new_scene, gains[new_scene], cos_sim,
            nr_str, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
            ctx->peak_mute ? " [PMUTE]" : "",
@@ -680,10 +677,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     float div_thresh = cfg.diverge_anti_rms / (cfg.mic_pre_gain > 0.1f ? cfg.mic_pre_gain : 1.0f);
     if (ctx->anti_rms > div_thresh) {
         if (++ctx->diverge_sec >= 2) {
-            if (ctx->scene_wc_valid[ctx->cur_scene_id])
-                memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
-            else
-                scene_ctrl_construct_wc(&ctx->sc, ctx->cur_scene_id, ctx->wc_shadow);
+            memcpy(ctx->wc_shadow, ctx->last_good_wc, S*L*sizeof(float));
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
             InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * cfg.ramp_ms / 1000));
             ctx->diverge_sec = 0;
@@ -712,14 +706,8 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
                "> %.0f×init_max(%.3f), LMS frozen (%ds retry)\n",
                wc_max, cfg.freeze_ratio, ctx->wc_init_max, cfg.freeze_retry_sec);
     } else if (freeze_action == 3) {
-        /* R-7: 解冻重试 — 回滚到已知良好 Wc */
-        if (ctx->scene_wc_valid[ctx->cur_scene_id]) {
-            memcpy(ctx->wc_shadow, ctx->scene_wc[ctx->cur_scene_id], S*L*sizeof(float));
-            printf("[INFO] Wc freeze retry — rollback to scene_wc[%d]\n", ctx->cur_scene_id);
-        } else {
-            scene_ctrl_construct_wc(&ctx->sc, ctx->cur_scene_id, ctx->wc_shadow);
-            printf("[INFO] Wc freeze retry — rollback to CNN preset scene=%d\n", ctx->cur_scene_id);
-        }
+        /* R-7: 解冻重试 — 回滚到 known-good Wc (去场景层: 单一 last_good_wc) */
+        memcpy(ctx->wc_shadow, ctx->last_good_wc, S*L*sizeof(float));
         InterlockedExchangeAdd(&ctx->wc_seq, 2);
         InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry (rolled back)\n");
@@ -729,7 +717,7 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 1);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc freeze PERMANENT\n");
         printf("[WARN] Wc diverged again during watch period! "
-               "LMS permanently frozen until scene switch\n");
+               "LMS permanently frozen until next reset\n");
     } else if (freeze_action == 0 && !ctx->fx.freeze_lms && !ctx->freeze_permanent) {
         /* 观察期安全度过 (freeze_timer 从 -1 回到 0) 才打印 — 正常态 freeze_timer==0
            满足旧条件导致每秒刷屏 "[INFO] Wc stable", 改为仅在观察期结束时刻打印 */
@@ -739,53 +727,34 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
 }
 
 static void check_convergence(rt_ctx_t *ctx) {
-    /* C1: 使用共享收敛检测 */
+    /* C1: 使用共享收敛检测. 去场景层: 收敛样本写回单一 known-good Wc
+       (last_good_wc), 供发散救援/freeze 回滚; 无场景记忆, offset 恒 0. */
     int saved = sm_check_convergence(
         ctx->nr_level, cfg.nr_converge_db,
         ctx->safety_mute, ctx->diverged,
         &ctx->converged_frames,
-        (float *)ctx->scene_wc, ctx->cur_scene_id,
+        ctx->last_good_wc, 0,
         ctx->wc_snapshot, S * L,
         &ctx->wc_init_max);
     if (saved) {
-        /* scene_wc 已保存, wc_init_max 已更新为收敛期 max|Wc| */
+        /* last_good_wc 已更新为收敛期 Wc, wc_init_max 已更新为收敛期 max|Wc| */
     }
 }
 
-static void check_scene_switch(rt_ctx_t *ctx, int new_scene,
-                               float cos_sim, float *probs) {
-    /* cos>=0.8 守卫已移除 (历史冗余): 旧滞回路径返回 1 必满足 cos<0.8, 行为中性;
-       但 OCG 的 rejoin 可在 cos_active∈[0.75,0.9) 触发, 旧守卫会误拦合法切换. */
-    if (new_scene == ctx->cur_scene_id) return;
-
-    /* BUG-7: 发散/静音/peak_mute 削半/冻结期的 Wc 快照不保存进场景记忆 (防污染).
-       nr_level>=0 补充 freshness: diverged 标志有 1s 滞后, 本秒刚开始发散时
-       diverged 尚未置位, 但 nr_level 已转负. */
-    int wc_trusted = !ctx->diverged && !ctx->safety_mute
-                     && !ctx->peak_mute && !ctx->fx.freeze_lms
-                     && ctx->nr_level >= 0.0f;
-    int restored = sm_scene_switch_execute(
-        (float *)ctx->scene_wc, ctx->scene_wc_valid,
-        &ctx->cur_scene_id, new_scene,
-        ctx->wc_snapshot, ctx->wc_cur, ctx->wc_old, S * L,
-        cfg.wc_cold_start, wc_trusted);
-
-    if (ctx->log_file)
-        fprintf(ctx->log_file, "# EVENT: scene switch %d→%d cos=%.3f restored=%d\n",
-                ctx->cur_scene_id, new_scene, cos_sim, restored);
-
-    printf("  -> RESET s%d→s%d (%s)\n",
-           ctx->cur_scene_id, new_scene,
-           restored ? "restored adapted Wc" : "new scene, CNN preset");
-    if (!restored) InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);
-
-    /* CrossFader + 保护重置 (实时版特有: Interlocked 跨线程) */
+/* 去场景层 (gfanc-direct-weight): Reset 模式触发 — 无场景记忆, 直接过渡到
+   scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用. */
+static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains) {
+    memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float)); /* 过渡起点 */
+    /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
+    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
+    InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);
+    InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
     InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
-    memcpy(ctx->anchor_probs, probs, ctx->sc.K * sizeof(float));
-    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
-    InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
+    memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
     ctx->converged_frames = 0;
+    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset cos=%.3f\n", cos_sim);
+    printf("  -> RESET (cos=%.2f < %.2f)\n", cos_sim, cfg.switch_threshold);
 }
 
 int main(void) {
@@ -840,11 +809,10 @@ int main(void) {
     const char *sec_file = getenv("GFANC_SEC_FILE");
     if (!sec_file || !sec_file[0])
         sec_file = "data/secondary_path.bin";
-    float *sec_path, *sub_filters, *centroids, *bp_coeff;
+    float *sec_path, *sub_filters, *bp_coeff;
     int sec_len = bin_load_float(sec_file, &sec_path);
     printf("  Ŝ file: %s\n", sec_file);
     int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
-    int n_scene = bin_load_float("data/scene_defs.bin", &centroids);
     int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     /* R-13: 尝试加载 ANC 专用短带通 (256tap). 无文件时截取 1024tap 前 256 点作为近似. */
     float *bp_anc_coeff = NULL;
@@ -857,10 +825,6 @@ int main(void) {
     }
     if (sub_len < SC_C*SC_S || sub_len % (SC_C*SC_S) != 0) {
         fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, SC_C*SC_S);
-        ret = 1; goto cleanup;
-    }
-    if (n_scene < SC_S*SC_C) {
-        fprintf(stderr, "FATAL: scene_defs.bin too short (%d<%d)\n", n_scene, SC_S*SC_C);
         ret = 1; goto cleanup;
     }
     if (bp_len < BP_LEN) {
@@ -1078,23 +1042,13 @@ int main(void) {
     }
 #endif
 
-    if (scene_ctrl_init(&ctx->sc, centroids, sub_filters, L, n_scene) != 0) {
-        fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); ret = 1; goto cleanup;
-    }
-    /* R-4: CNN K vs scene_defs K 交叉校验 — 防止不同批次 data/ 混配 */
-    if (cnn_m5_get_K() != ctx->sc.K) {
-        fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
-                cnn_m5_get_K(), ctx->sc.K);
-        ret = 1; goto cleanup;
-    }
-    /* OCG: 在线聚类闸门 (GFANC_OCG=1 时替代场景切换滞回, ICASSP 2026) */
-    if (ocg_init(&ctx->ocg, &cfg, ctx->sc.K) != 0) {
-        fprintf(stderr, "WARN: ocg_init failed (K=%d), OCG disabled\n", ctx->sc.K);
+    if (scene_ctrl_init(&ctx->sc, sub_filters, L) != 0) {
+        fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); ret = 1; goto cleanup;
     }
     /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
        anti ≈ Wc_RMS × ref_filt × √L. 默认 0.01: ref=0.025→anti≈0.008 (−42dBFS).
        几乎无声, 确保噪声突增时不会饱和; LMS 在 10-30s 内自行收敛到工作点.
-       收敛后 scene_wc 保存正确幅值, 切回直接恢复 (不经过此保守值).
+       收敛后 last_good_wc 保存正确幅值, 切回直接恢复 (不经过此保守值).
        通过 GFANC_WC_TARGET 环境变量覆盖. ── */
     {
         float wc_target = cfg.wc_rms_target;
@@ -1154,40 +1108,43 @@ int main(void) {
         fflush(ctx->log_file);
     }
 
-    /* 主循环: CNN 场景分类 1Hz, 驱动 Wc 更新和场景切换 */
+    /* 主循环: CNN 1Hz 产 Wc, 驱动 Reset/Continuous 双模式 (去场景层) */
     int log_sec = 0;
-    int scene_cand = -1, scene_cand_cnt = 0;  /* P4: 场景切换滞回候选状态 */
     while (ctx->running) {
         gf_sleep_ms(100);  /* R-28: 可移植睡眠 */
         LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
         if (ready < 0) continue;
 
-        float probs[SC_K_MAX] = {0};
+        float gains[SC_DW_MAX] = {0};
         int new_scene;
         const int K = ctx->sc.K;
 
         /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
         if (ctx->fade_cnt > 0) {
-            memcpy(probs, ctx->sc.prev_probs, K * sizeof(float));
-            new_scene = ctx->cur_scene_id;
+            memcpy(gains, ctx->sc.prev_gains, K * sizeof(float));
+            new_scene = 0;
+            for (int i = 1; i < K; i++)
+                if (fabsf(gains[i]) > fabsf(gains[new_scene])) new_scene = i;
         } else {
-            new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, probs);
+            new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, gains);
         }
 
         if (ctx->first_sec) {
-            /* 首次 INIT: CNN 通用 Wc → 标记场景 → 冷启动 ramp */
-            /* C1: 使用共享函数初始化场景记忆 + wc_init_max */
-            sm_first_sec_init((float *)ctx->scene_wc, ctx->scene_wc_valid,
-                              &ctx->cur_scene_id, new_scene,
-                              ctx->wc_cur, S * L, &ctx->wc_init_max,
-                              cfg.wc_cold_start);
+            /* 首次 INIT (两模式一致): CNN Wc → 影子缓冲 → 冷启动 ramp.
+               去场景层: 无场景记忆; wc_init_max 由 wc_cur 推导,
+               last_good_wc = INIT 值 (后续由 check_convergence 刷新). */
+            if (cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
+                for (int i = 0; i < S*L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
+            }
+            float mx = sm_wc_max_abs(ctx->wc_cur, S*L);
+            ctx->wc_init_max = (mx > 0.001f) ? mx : 0.01f;
             /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
             memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
+            memcpy(ctx->last_good_wc, ctx->wc_cur, S*L*sizeof(float)); /* known-good 基线 */
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
             InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
-            memcpy(ctx->anchor_probs, probs, K * sizeof(float));
-            ocg_reset(&ctx->ocg, probs, new_scene);   /* OCG: 以首帧播种活动簇 */
+            memcpy(ctx->anchor_gains, gains, K * sizeof(float));
             /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
                RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
             int init_ramp_ms = cfg.ramp_ms * 2;
@@ -1195,7 +1152,7 @@ int main(void) {
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);  /* 冷启动 anti 限幅 */
             printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
-                   new_scene, probs[new_scene], init_ramp_ms, cfg.mute_hold_ms);
+                   new_scene, gains[new_scene], init_ramp_ms, cfg.mute_hold_ms);
             /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */
             if (!getenv("GFANC_MIC_GAIN")) {
                 /* 自动增益标定: 目标 ref≈0.03 (-30dBFS), 上限 5×.
@@ -1212,18 +1169,15 @@ int main(void) {
             ctx->first_sec = 0;
         } else {
             /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur).
-               OCG 启用时显示对活动簇中心的相似度 (更有意义); anchor_probs 仍
-               在切换时刷新, 供日志与旧路径使用. */
-            float cos_sim = cfg.ocg_enable
-                ? ocg_active_cos(&ctx->ocg, probs)
-                : sm_cos_sim(ctx->anchor_probs, probs, K);
+               Reset 模式以该值作触发判据; Continuous 模式仅供诊断. */
+            float cos_sim = sm_cos_sim(ctx->anchor_gains, gains, K);
 
-            print_diagnostics(ctx, new_scene, cos_sim, probs);
+            print_diagnostics(ctx, new_scene, cos_sim, gains);
 
             /* 运行时统计日志 (C1) */
             if (ctx->log_file) {
                 fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s\n",
-                        log_sec++, new_scene, probs[new_scene], cos_sim,
+                        log_sec++, new_scene, gains[new_scene], cos_sim,
                         ctx->nr_level, ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
                         ctx->safety_mute ? "MUTE" : "",
                         ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "");
@@ -1242,32 +1196,13 @@ int main(void) {
 
             check_wc_divergence(ctx);
             check_convergence(ctx);
-            if (cfg.ocg_enable) {
-                /* OCG: 在线聚类闸门 — 判定"新预测权重向量是否真的该替换当前"
-                   (Luo et al., ICASSP 2026). 自适应簇中心跟踪漂移, 只在噪声真
-                   的进入新聚类时才确认切换; 只返回目标场景, 机制仍走 check_scene_switch. */
-                ocg_reason_t reason = OCG_REASON_NONE;
-                int target = ocg_step(&ctx->ocg, probs, new_scene,
-                                      ctx->cur_scene_id, &reason);
-                if (target >= 0 && target != ctx->cur_scene_id) {
-                    check_scene_switch(ctx, target, cos_sim, probs);
-                    if (ctx->log_file)
-                        fprintf(ctx->log_file, "# EVENT: ocg switch %d→%d reason=%s\n",
-                                ctx->cur_scene_id, target,
-                                reason == OCG_REASON_REJOIN ? "rejoin" : "new");
-                }
-            } else {
-                /* P4: 场景切换滞回 — 候选场景需连续 3 帧一致才 RESET.
-                   CNN 在真实噪声边界上 probs 翻转 (实测 max=0.48~0.63 低置信跳变),
-                   旧逻辑单帧即切 → fade+mute_hold+Wc重载 循环泵浦 */
-                if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
-                                           new_scene, ctx->cur_scene_id,
-                                           &scene_cand, &scene_cand_cnt, 3)) {
-                    check_scene_switch(ctx, new_scene, cos_sim, probs);
-                }
-            }
+            /* 去场景层模式派发: reset=cos(anchor,cur)<阈值 → CrossFader 过渡到新 Wc;
+               continuous=永不重置 (CNN 仅首秒 INIT 一次). */
+            if (cfg.gfanc_mode == 1) {          /* reset */
+                if (cos_sim < cfg.switch_threshold) apply_reset(ctx, cos_sim, gains);
+            }                                   /* continuous: 不动作 */
         }
-        memcpy(ctx->sc.prev_probs, probs, K * sizeof(float));
+        memcpy(ctx->sc.prev_gains, gains, K * sizeof(float));
     }
 
     printf("\nStopping...\n");

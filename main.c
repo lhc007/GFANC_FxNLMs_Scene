@@ -23,7 +23,6 @@
 #include "scene_controller.h"
 #include "scene_manager.h"
 #include "fxnlms_mimo.h"
-#include "ocg.h"
 
 /* ══════════════════════════════════════════════════════════
    类型
@@ -149,6 +148,19 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define DSP_DELAY 0  /* 与实时版一致: Ŝ 已含声学延迟, 无硬件 I/O 延迟需补偿 */
 /* R-9: 增益/渐变参数统一由 cfg 管理, GFANC_MIC_GAIN / GFANC_FADE_LEN 等 env 变量可覆盖 */
 
+/* 因果性报告: 路径峰值延迟 (argmax tap → ms). Pri=参考→误差麦声学,
+   Ŝ=扬声器→误差麦声学. 净预览 = τ_pri − τ_spk − τ_proc (处理延迟).
+   >0 宽带可因果对消; <0 因果缺口 → 随机宽带受限 (windows-ANC 因果限制). */
+static float path_peak_delay_ms(const float *coeff, int n, float fs)
+{
+    int peak = 0; float mx = -1.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(coeff[i]);
+        if (a > mx) { mx = a; peak = i; }
+    }
+    return (float)peak / fs * 1000.0f;
+}
+
 /* ══════════════════════════════════════════════════════════
    主函数
    ══════════════════════════════════════════════════════════ */
@@ -166,12 +178,11 @@ int main(int argc, char **argv)
 
     /* ── 1. 加载权重 (R-3: 逐文件校验长度) ── */
     printf("Loading weights...\n");
-    float *sec_path, *pri_path, *sub_filters, *centroids, *bp_coeff;
+    float *sec_path, *pri_path, *sub_filters, *bp_coeff;
     int sec_len  = bin_load_float("data/secondary_path.bin", &sec_path);
     int pri_len  = bin_load_float("data/primary_path.bin", &pri_path);
     int sub_len  = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len   = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
-    int n_scene  = bin_load_float("data/scene_defs.bin", &centroids);
     /* BUG-6: ANC 专用短带通 (64tap, 与实时版一致). 无文件时截取 1024tap 前 64 点. */
     float *bp_anc_coeff = NULL;
     int bp_anc_loaded = bin_load_float("data/bandpass_anc.bin", &bp_anc_coeff);
@@ -207,10 +218,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "FATAL: bandpass_fir.bin too short/load failed (%d<%d)\n", bp_len, BP_LEN);
         return 1;
     }
-    if (n_scene < S*C) {
-        fprintf(stderr, "FATAL: scene_defs.bin too short (%d<%d)\n", n_scene, S*C);
-        return 1;
-    }
     int L = sub_len / (C * S); /* 1024 */
     if (L < 64 || L > 4096) {
         fprintf(stderr, "FATAL: filter length L=%d out of range [64,4096]\n", L);
@@ -239,12 +246,15 @@ int main(int argc, char **argv)
             for (int i = 0; i < E*S*SEC_LEN; i++) sec_path[i] *= inv;
         }
     }
-    /* 虚拟延迟 (GFANC_VIRT_DELAY_MS): 模拟 DSP/处理延迟, 验证算法在不同延迟下的表现.
-       加到 Ŝ 模型 (Fx 对齐 + 误差合成共用), 模拟环路延迟对因果性的消耗. */
-    int virt_delay = 0;
+    /* 嵌入式处理延迟 (GFANC_EMBED_DELAY_MS, 默认3ms): 模拟 ADC+DSP+DAC 信号链延迟,
+       pad 到 Ŝ 模型 (Fx 对齐 + 误差合成共用), 消耗因果裕量 — 离线预测嵌入式目标 NR.
+       GFANC_VIRT_DELAY_MS 可覆盖 (实验/扫参用). */
+    int virt_delay = cfg.embed_delay_ms * FS / 1000;
     {   const char *vd = getenv("GFANC_VIRT_DELAY_MS");
-        if (vd) { virt_delay = (int)(atof(vd) * FS / 1000.0f); /* ms→16k 样本 */
-            printf("  VIRT delay: %s ms → %d samples added to Ŝ\n", vd, virt_delay); } }
+        if (vd) virt_delay = (int)(atof(vd) * FS / 1000.0f);
+        printf("  PROC delay: %d ms (%d samples) added to Ŝ — 嵌入式信号链处理延迟"
+               " (GFANC_EMBED_DELAY_MS=3ms 默认, 可覆盖)\n",
+               virt_delay * 1000 / FS, virt_delay); }
     int sec_padded = SEC_LEN + DSP_DELAY + virt_delay;
     fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
     float *sec_coeffs = (float *)calloc(E * S * sec_padded, sizeof(float));
@@ -258,6 +268,21 @@ int main(int argc, char **argv)
             sec_firs[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
+    /* 因果性报告: 净预览时间 = τ_pri − τ_spk − τ_proc.
+       τ_proc = ANC带通群延迟 + 处理延迟 (GFANC_VIRT_DELAY_MS, 嵌入式 DSP/编解码预算). */
+    {
+        float tau_pri = path_peak_delay_ms(pri_path_used + 0*2*PRI_LEN, PRI_LEN, FS);
+        float tau_spk = path_peak_delay_ms(sec_path, SEC_LEN, FS);
+        float tau_bp  = (BP_ANC_LEN-1)/(2.0f*FS)*1000.0f;  /* 64tap 线性相位群延迟 */
+        float tau_proc = tau_bp + (DSP_DELAY + virt_delay)/(float)FS*1000.0f;
+        float preview = tau_pri - tau_spk - tau_proc;
+        printf("  Causality: τ_pri=%.2fms τ_spk=%.2fms τ_proc(bp+emb)=%.2fms "
+               "→ 净预览=%.2fms %s\n",
+               tau_pri, tau_spk, tau_proc, preview,
+               preview > 0 ? "(>0 宽带可因果对消)"
+                           : "(<0 因果缺口 — 随机宽带对消受限, 只能消窄带/低频)");
+    }
+
     /* 2c. 初级路径 FIR (R=0, 持久延迟线 — 跨 chunk 连续) */
     fir_filter_t pri_firs[E], pri_raw_firs[E];
     for (int e = 0; e < E; e++) {
@@ -268,22 +293,12 @@ int main(int argc, char **argv)
         pri_firs[e].ptr = pri_raw_firs[e].ptr = 0;
     }
 
-    /* 2d. Scene Controller */
+    /* 2d. Scene Controller (直接权重 Wc 生产者) */
     scene_ctrl_t sc;
-    if (scene_ctrl_init(&sc, centroids, sub_filters, L, n_scene) != 0) {
-        fprintf(stderr, "ERROR: scene_ctrl_init OOM\n"); return 1;
+    if (scene_ctrl_init(&sc, sub_filters, L) != 0) {
+        fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); return 1;
     }
-    /* R-4: CNN K vs scene_defs K 交叉校验 */
-    if (cnn_m5_get_K() != sc.K) {
-        fprintf(stderr, "FATAL: CNN K=%d != scene_defs K=%d (data/ batch mix-up?)\n",
-                cnn_m5_get_K(), sc.K);
-        return 1;
-    }
-    /* OCG: 在线聚类闸门 (GFANC_OCG=1 时替代场景切换滞回, ICASSP 2026) */
-    ocg_t ocg;
-    if (ocg_init(&ocg, &cfg, sc.K) != 0) {
-        fprintf(stderr, "WARN: ocg_init failed (K=%d), OCG disabled\n", sc.K);
-    }
+    /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
 
     /* 2e. FxNLMS */
     fxnlms_mimo_t fx;
@@ -356,14 +371,12 @@ int main(int argc, char **argv)
     int   fade_cnt = 0;
     float wc_old[S*L], wc_cur[S*L];
 
-    /* ── 场景管理 (匹配实时版) ── */
-    float scene_wc[SC_K_MAX][S*L];
-    int   scene_wc_valid[SC_K_MAX] = {0};
-    int   cur_scene_id = -1;
-    float anchor_probs[SC_K_MAX];
-    int   converged_frames = 0;
-    int   scene_cand = -1, scene_cand_cnt = 0;
-    float wc_init_max = 0.01f;
+    /* ── Reset 模式锚点 (去场景层, 匹配实时版) ──
+       CNN 仍是每秒 Wc 生产者 (scene_ctrl_process, 直接权重); 场景切换/记忆/滞回/OCG 已移除.
+       reset 模式: cos_sim(anchor_gains, cur_gains) < switch_threshold → CrossFader 重置到新 Wc.
+       continuous 模式: 仅首秒初始化, 之后 FxNLMS 永不重置. */
+    float anchor_gains[SC_DW_MAX];  /* 上次重置时的 30 维增益锚点 */
+    int   first_sec = 1;            /* 首秒 INIT: CNN Wc → FxNLMS 初始化 */
 
     /* ── NR 累积 (诚实NR, 匹配实时版) ── */
     float acc_err = 0, acc_anti_est = 0, acc_d_est = 0, acc_err_cross = 0;
@@ -372,7 +385,6 @@ int main(int argc, char **argv)
     int   acc_cnt = 0;
     int   anti_est_offset = 0;  /* BUG-1: 分散采样相位 (0..63, 每帧随机化) */
     int   diverged = 0;
-    float prev_nr_est = 0.0f;   /* BUG-7: 上一秒 NR (场景切换时判断 Wc 是否可信) */
 
     float sum_nr_db = 0;
     clock_t t0 = clock();
@@ -382,7 +394,7 @@ int main(int argc, char **argv)
     float anti_est_prev[E] = {0};
 
     printf("\n%4s | %5s | %6s | %6s | %6s | %7s | %6s | %s\n",
-           "Sec", "Scene", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
+           "Sec", "Band", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
     for (int i = 0; i < 85; i++) printf("-");
     printf("\n");
 
@@ -390,27 +402,22 @@ int main(int argc, char **argv)
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
 
-        /* 4a. CNN 场景分类 */
-        float probs[SC_K_MAX];
+        /* 4a. CNN 直接权重 Wc 构造 (每秒) */
+        float gains[SC_DW_MAX];
         int K = sc.K;
         int new_scene;
         if (len == chunk)
-            new_scene = scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, probs);
+            new_scene = scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
         else {
-            memcpy(probs, sc.prev_probs, K * sizeof(float));
-            new_scene = sc.cur_scene;
+            memcpy(gains, sc.prev_gains, K * sizeof(float));
+            new_scene = 0;
         }
 
-        /* 4b. 场景管理 (首次 INIT / 切换 RESET, 匹配实时版) */
+        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) */
         char action[20] = "-";
-        int first_sec = (cur_scene_id < 0);
         if (first_sec) {
-            /* C1: 使用共享函数初始化场景记忆 + wc_init_max */
-            sm_first_sec_init((float *)scene_wc, scene_wc_valid,
-                              &cur_scene_id, new_scene,
-                              wc_cur, S * L, &wc_init_max, 1.0f);
-            memcpy(anchor_probs, probs, K * sizeof(float));
-            ocg_reset(&ocg, probs, new_scene);   /* OCG: 以首帧播种活动簇 */
+            /* 首秒 INIT: CNN Wc → FxNLMS 初始化 (两模式一致) */
+            memcpy(anchor_gains, gains, K * sizeof(float));
             fxnlms_set_wc(&fx, wc_cur);
             snprintf(action, sizeof(action), "INIT");
             /* 自动增益标定 (匹配实时版) */
@@ -420,47 +427,22 @@ int main(int argc, char **argv)
                 if (auto_gain > 20.0f) auto_gain = 20.0f;
                 cfg.mic_pre_gain = auto_gain;
             }
+            first_sec = 0;
         } else {
-            /* S-1: cos(anchor, cur) 替代 cos(prev, cur) */
-            float cos_sim = sm_cos_sim(anchor_probs, probs, K);
+            /* S-1: cos(anchor_gains, cur_gains) — 30 维直接权重增益 */
+            float cos_sim = sm_cos_sim(anchor_gains, gains, K);
 
-            int switch_target = -1;
-            ocg_reason_t switch_reason = OCG_REASON_NONE;
-            if (cfg.ocg_enable) {
-                /* OCG: 在线聚类闸门 — 只在噪声真的进入新聚类时才切换
-                   (Luo et al., ICASSP 2026). 机制与旧路径完全一致. */
-                switch_target = ocg_step(&ocg, probs, new_scene,
-                                         cur_scene_id, &switch_reason);
-            } else if (sm_check_scene_switch(cos_sim, cfg.switch_threshold,
-                                              new_scene, cur_scene_id,
-                                              &scene_cand, &scene_cand_cnt, 3)) {
-                /* P4: 场景切换滞回 — 候选需连续3帧一致 */
-                switch_target = new_scene;
-                switch_reason = OCG_REASON_NEW;  /* 仅作 action 标签 */
-            }
-
-            if (switch_target >= 0 && switch_target != cur_scene_id) {
-                /* C1: 使用共享场景切换
-                   BUG-7: 发散期的 Wc 快照不保存进场景记忆 (防污染) */
-                int restored = sm_scene_switch_execute(
-                    (float *)scene_wc, scene_wc_valid,
-                    &cur_scene_id, switch_target,
-                    fx.wc, wc_cur, wc_old, S * L, 1.0f,
-                    !diverged && prev_nr_est >= 0.0f);
+            /* reset 模式: 频谱显著变化 (cos < threshold) → CrossFader 重置到新 Wc.
+               continuous 模式: CNN 不参与后续 Wc 构造 (仅诊断), FxNLMS 永不重置. */
+            if (cfg.gfanc_mode == 1 && cos_sim < cfg.switch_threshold) {
+                memcpy(wc_old, fx.wc, S * L * sizeof(float));  /* 过渡起点 (当前收敛 Wc) */
+                /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
                 fade_cnt = cfg.fade_len;
-                memcpy(anchor_probs, probs, K * sizeof(float));
-                converged_frames = 0;
-                /* action 后缀标注切换原因 (避免 snprintf 同对象重叠/截断) */
-                const char *ocg_tag = "";
-                if (cfg.ocg_enable) {
-                    if (switch_reason == OCG_REASON_REJOIN) ocg_tag = "/rj";
-                    else if (switch_reason == OCG_REASON_NEW) ocg_tag = "/nw";
-                }
-                snprintf(action, sizeof(action), "%s%s",
-                         restored ? "RESET(mem)" : "RESET", ocg_tag);
+                memcpy(anchor_gains, gains, K * sizeof(float));
+                snprintf(action, sizeof(action), "RESET");
             }
         }
-        memcpy(sc.prev_probs, probs, K * sizeof(float));
+        memcpy(sc.prev_gains, gains, K * sizeof(float));
 
         /* 4c. 逐样本 FxNLMS (匹配实时版 audio_cb) */
         float err_pwr = 0, dis_pwr = 0;
@@ -559,7 +541,6 @@ int main(int argc, char **argv)
             if (nr_est > 30.0f) nr_est = 30.0f;
             if (nr_est < -30.0f) nr_est = -30.0f;
         }
-        prev_nr_est = nr_est;                          /* BUG-7: 供下个场景切换判断 */
         float err_rms = sqrtf(err_pwr / (len * E));   /* 显示用全帧误差 RMS */
         float ref_rms = sqrtf(acc_ref / len);
         float anti_rms = sqrtf(acc_anti / (len * S));
@@ -570,14 +551,6 @@ int main(int argc, char **argv)
 
         /* 发散检测 (基于诚实NR, 匹配实时版) */
         diverged = (pa > 9.0f * pe && anti_rms > 0.05f && nr_est < 0.0f);
-
-        /* 收敛检测: 基于已知真值NR (离线更可靠) */
-        /* C1: 使用共享收敛检测 (离线版用 nr_true, 实时版用 nr_level) */
-        sm_check_convergence(nr_true, cfg.nr_converge_db,
-                             0/*safety_mute*/, diverged,
-                             &converged_frames,
-                             (float *)scene_wc, cur_scene_id,
-                             fx.wc, S * L, &wc_init_max);
 
         /* 输出: 诚实NR(匹配实时) + 已知真值NR(Pri模型) */
         char nr_est_str[20], nr_true_str[20];
@@ -621,7 +594,7 @@ int main(int argc, char **argv)
     free(bp_fir.delay_line);
     free(wav.data); if (ref_resampled) free(ref_resampled);
     bin_free(sec_path); if (pri_path_used != pri_path) free(pri_path_used); bin_free(pri_path); bin_free(sub_filters);
-    bin_free(centroids); bin_free(bp_coeff);
+    bin_free(bp_coeff);
     if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
     printf("Done.\n");
     return 0;

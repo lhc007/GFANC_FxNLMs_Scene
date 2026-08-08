@@ -6,6 +6,9 @@
 #ifndef CNN_M5_FORWARD_H
 #define CNN_M5_FORWARD_H
 
+/* 线性层输出维上限 — 直接权重模式为 S*C = 30 (2 扬声器 × 15 子带). */
+#define CNN_M5_OUT_MAX 30
+
 #ifdef __cplusplus
 extern "C" {
 #endif

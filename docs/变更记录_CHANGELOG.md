@@ -31,6 +31,72 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-08] 死代码清理 — 删除 OCG 聚类闸门 / scene_manager 死函数 / test 脚手架
+
+- **状态**: 已提交（与 v1.6 直接权重改动同一提交）
+- **基线**: e09e946（chore: 重测次级路径 (14:07 窗位) + golden 基线更新）
+- **变更代码**:
+  - 删除: `src/ocg.c`、`include/ocg.h`、`include/os_atomic.h`、`test/gen_test_wav.c`、`test/test_ocg.c`、`test/test_fir.c`、`test/golden.sha256`、`test/run_tests.sh`（test/ 目录 v1.6 起失效，不再恢复脚手架）
+  - 修改: `include/gfanc_types.h` — 删 `GFANC_K_MAX 16`、`ocg_enable/ocg_alpha/ocg_stay_thresh/ocg_rejoin_thresh/ocg_confirm_frames/ocg_max_clusters` 6 字段、`GFANC_CONFIG_DEFAULT` 中 OCG 默认值、`gfanc_config_load_env` 中 6 行 `GFANC_OCG_*` 解析
+  - 修改: `include/scene_manager.h` — 全量重写为在用纯函数：`sm_cos_sim`/`sm_wc_max_abs`/`sm_check_divergence`/`sm_check_convergence`（保留原签名）；删 `sm_wc_rms`/`sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`
+  - 修改: `Makefile` — MODULES 移除 `src/ocg.c`；删 `test`/`test-accept` 目标
+  - 修改: `include/os_port.h` — 注释移除对已删 `os_atomic.h` 的引用
+  - 修改: `README.md` — 参数表/代码结构的 OCG 引用改"已删除"，补判定粒度设计分析
+- **变更原因**: OCG 在线聚类闸门（ICASSP 2026）在 v1.5 去场景层后运行时零调用，属留档死代码；直接权重（v1.6）彻底不再需要场景切换逻辑，连同 `test/`（`make test` 已失效）、`os_atomic.h`（仅 ocg.c 使用）一并清理，降低维护面
+- **造成影响**:
+  - 行为: 无运行时行为变化（删除对象均零调用；`GFANC_OCG` 相关 env 变量不再解析，但 v1.5 起已无 OCG 路径）
+  - 配置: `GFANC_OCG`/`GFANC_OCG_ALPHA`/`GFANC_OCG_STAY`/`GFANC_OCG_REJOIN`/`GFANC_OCG_CONFIRM`/`GFANC_OCG_CLUSTERS` 移除（本就不生效）
+  - 测试/回归: `make`/`make realtime` 零警告；main.exe 冒烟跑通 56s 无 FATAL、无越界；`make test`/`make test-accept` 目标移除
+  - 性能/内存: 无（删除对象运行时不占用）
+  - 未验证项: 无
+- **验证方式**: ① `make clean && make all` 三目标零警告；② `./main.exe mixed_7types_56s.wav` 56s 跑通；③ 全仓 grep 确认无 `ocg`/`os_atomic`/`scene_defs`/死函数引用（仅文档历史记录）
+- **回退方式**: `git checkout` 恢复 ocg/os_atomic/test（git 历史留存，ocg.h/scene_manager 死函数均有记录）
+
+### [2026-08-08] C 运行时改直接权重模式 — CNN 回归 30 维子带增益（v1.6, 分支 gfanc-direct-weight）
+
+- **状态**: 已提交
+- **基线**: e09e946（chore: 重测次级路径 (14:07 窗位) + golden 基线更新）
+- **变更代码**:
+  - 新增: `export/make_synthetic_dw_ckpt.py` — 合成 30 维直接权重检查点（冒烟用，真实训练覆盖）
+  - 修改: `include/scene_controller.h` — 去 `centroids/cur_scene/prev_probs`，加 `SC_DW_MAX 30`/`prev_gains[30]`；`scene_ctrl_init(sc, sub_filters, L)` 新签名
+  - 修改: `src/scene_controller.c` — 全量重写：CNN 30 维 logits → `tanh` 增益 → `Wc[s,l]=Σ_c gain[s,c]·sub[(c,s),l]` → RMS 标定 + 取反；弱信号/CNN 失败保持上一秒增益
+  - 修改: `src/cnn_m5_forward.c` + `include/cnn_m5_forward.h` — K 上限 16 → `CNN_M5_OUT_MAX 30`（`K=n_w/64` 推导不变）
+  - 修改: `main.c` / `main_realtime.c` — 移除 `scene_defs.bin` 加载 + FATAL 检查 + centroids 交叉校验；数组 `prev_probs/anchor_probs/probs[16]` → `prev_gains/anchor_gains/gains[30]`；诊断列 Scene → Band（argmax |gain|）
+  - 修改: `include/gfanc_types.h` — 注释更新（`GFANC_K_MAX 16` 仅为 ocg.c 死代码保留）
+  - 修改: `README.md` — 架构/参数表/示例同步为直接权重（v1.6）
+- **变更原因**: 完成直接权重端到端闭环（Python 训练/导出已就绪，C 运行时仍为旧 scene-classifier + centroid blend 并硬依赖 `scene_defs.bin`；30 维检查点被 K≤16 拒绝）
+- **造成影响**:
+  - 行为: CNN 每秒回归 30 维增益（2 扬声器×15 子带），`tanh` → [-1,1] 带符号直接构造 Wc；不再需要场景 centroid；reset 判定改为 `cos(anchor_gains, cur_gains)<阈值`；`data/scene_defs.bin` 残留不影响运行（已不加载）
+  - 配置: 无新环境变量；`GFANC_MODE`/`GFANC_RESET_THRESH`/`GFANC_WC_TARGET` 语义不变
+  - 测试/回归: 合成检查点冒烟通过（export → main.exe 56s 跑通，reset 路径 K=30 无越界）；真实模型待用户重训后覆盖验证 NR
+  - 性能/内存: 前向不变（同一 m5_scene 架构），仅输出维 16→30，logits/gains 数组各 +56B
+  - 未验证项: 真实训练直接权重模型的端到端 NR 未验证（当前为随机权重冒烟）
+- **验证方式**: `make`/`make realtime` 零警告；`python export/make_synthetic_dw_ckpt.py` → `python export/export_bin.py`（`cnn_info.json` mode=direct_weight/activation=tanh/fc_out=30，跳过 scene_defs.bin）→ `./main.exe` 56s 无 FATAL、无越界，reset 模式多秒触发
+- **回退方式**: `git checkout` 恢复旧 scene-classifier（需同时回退 Python 导出为场景分类检查点）
+
+### [2026-08-08] 去场景层改 Reset/Continuous 双模式 + 嵌入式处理延迟建模（v1.5, 分支 gfanc-direct-weight）
+
+- **状态**: 工作区未提交
+- **基线**: e09e946（chore: 重测次级路径 (14:07 窗位) + golden 基线更新）
+- **变更代码**:
+  - 新增: `include/gfanc_types.h` — `embed_delay_ms` 字段（默认 3ms）+ `GFANC_EMBED_DELAY_MS` env
+  - 修改:
+    - `include/gfanc_types.h` — 去场景层配置：+`gfanc_mode`（0=continuous, 1=reset）+ `GFANC_MODE`/`GFANC_RESET_THRESH` env
+    - `main.c` — Ŝ 模型 pad 嵌入式处理延迟（`embed_delay_ms` 前补零，同时作用于 filtered-x 与误差合成）；启动打印因果报告 `净预览 = τ_pri − τ_spk − τ_proc`；删 OCG 分支/场景切换/收敛写回，改双模式派发
+    - `main_realtime.c` — 场景状态机 → Reset/Continuous 双模式派发；`scene_wc`/`cur_scene_id`/`ocg` 字段 → 单一 `last_good_wc`（发散救援/freeze 回滚共用）；`check_scene_switch` → `apply_reset`（无场景记忆）
+    - `README.md` — v1.5 文档同步（双模式语义/参数表/代码结构/离线验证/FAQ）
+    - `test/golden.sha256` — 重接受（3ms 延迟改变默认输出）
+  - 删除（运行时路径）: 场景记忆 `scene_wc`/`scene_wc_valid`、场景 ID `cur_scene_id`、滞回候选 `scene_cand/scene_cand_cnt`、OCG 调用；`sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`/`src/ocg.c` 留档为死代码
+- **变更原因**: 场景层（K=3 分类 + centroid）是启动滤波器质量的瓶颈——Wc 被限制在 3 个 centroid 凸包内，离线启动仅 ~1.2dB；MIMO_GFANC 直接权重固定滤波器启动 ~6.14dB（目标启动 1.2→~6dB）。同时按用户决定，离线测试引入**嵌入式处理延迟 3ms**（ADC+DSP+DAC，典型 DSP 预算）建模因果缺口，供嵌入式移植前评估因果性上限。
+- **造成影响**:
+  - 行为: 双模式共用同一信号链，仅派发分支不同。**Reset**（默认 `gfanc_mode=1`）: 每秒 `cos_sim(anchor_probs, probs) < switch_threshold(0.8)` → CrossFader 平滑过渡到新 Wc 并刷新 anchor；**Continuous**（`GFANC_MODE=continuous`）: CNN 仅首秒初始化 Wc，FxNLMS 永不重置。离线默认按 3ms pad Ŝ，启动日志新增因果报告行。
+  - 配置: 新增 `GFANC_MODE`（默认 reset）、`GFANC_RESET_THRESH`（默认 0.8）、`GFANC_EMBED_DELAY_MS`（默认 3）；`GFANC_OCG`/场景切换参数字段保留但运行时不再使用。
+  - 测试/回归: 黄金回归重接受（anti_out/error_out 含 3ms 延迟，输出合理无 NaN）。**关键 A/B 发现**: 现有 3 类 CNN 的 softmax 对全噪声类型输出近恒定 probs（p≈[0.5,0.4,0.05]，cos 最低 0.833）→ Reset 永不触发，两模式输出逐位相同；强制触发（阈值 0.84）时 NR 反降 2.9→2.5（假重置浪费收敛）。结论: Reset 模式的价值只能在**直接权重 CNN 重训**（15 维权重回归替代 3 类 softmax）后显现；双模式外壳已就绪，重训后只替换 `scene_ctrl_process` 内部实现。
+  - 性能/内存: 双模式共用一个派发分支；`last_good_wc` 单一数组替换 `scene_wc[K]`，内存略减；去 OCG/滞回路径，1Hz 主线程开销更小。
+  - 未验证项: 直接权重 CNN 重训未开始；嵌入式延迟对 NR 的实际影响已在离线验证（基线净预览 −1.9ms、road_noise 相干墙 0.3-0.8dB、正预览下 mixed 恢复 3.3dB/稳态6dB）；实时实机 A/B 未做。
+- **验证方式**: ① `make test` 全绿（golden 重接受后）+ 单元测试全过；② 离线 A/B reset vs continuous 输出逐位一致（CNN 恒定 probs 下两种模式无差异）；③ 因果报告行数值核对（τ_pri=0.69ms τ_spk + τ_proc → 净预览 −1.9ms）。
+- **回退方式**: 恢复 `sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch` 调用路径与场景记忆字段（git 历史留存），`GFANC_MODE=continuous` 等价于旧 Continuous 语义。
+
 ### [2026-08-07] 新增 OCG 在线聚类闸门（替代场景切换滞回）
 
 - **状态**: 已提交 (feat: OCG 在线聚类闸门 — 替代场景切换滞回)

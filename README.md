@@ -1,6 +1,8 @@
 # GFANC FxNLMS — MIMO 主动降噪系统
 
-> **版本**: v1.4 (2026-08-07) | **分支**: realtime-io
+> **版本**: v1.6 (2026-08-08) | **分支**: gfanc-direct-weight
+
+> **v1.6 变更**: C 运行时改为**直接权重 Wc 生产者**（CNN 回归 30 维子带增益 → `tanh` → `Wc=Σ gain·sub`，彻底去掉 centroid/softmax 场景路径与 `scene_defs.bin` 依赖）；**死代码清理**（删除 OCG 聚类闸门 `ocg.c/ocg.h`、`scene_manager.h` 死函数、`test/` 脚手架、`GFANC_OCG_*` 参数）。v1.5 起已去掉场景层（无场景记忆/滞回/OCG）→ **Reset / Continuous 双模式**（CNN 只产 Wc，`gfanc_mode` 切换）；离线默认按**嵌入式处理延迟 3ms** 建模因果性（`GFANC_EMBED_DELAY_MS`）。
 
 一个**主动降噪引擎**的纯 C 语言实现，从 Python 项目 [GFANC_Scene](GFANC_Scene) 移植。
 
@@ -59,7 +61,7 @@ set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
 python export/export_bin.py
 ```
 
-导出内容：CNN 权重（58 个 `.bin`）、子滤波器、场景 centroids、主/次路径、带通 FIR、配置 JSON。
+导出内容：CNN 权重（58 个 `.bin`）、子滤波器、主/次路径、带通 FIR、配置 JSON。**直接权重模式（v1.6）跳过场景 centroids**（`scene_defs.bin` 不再生成/加载）。
 
 ### 3. 编译
 
@@ -148,13 +150,13 @@ Loading weights...
 Input: 44100 Hz, 1 ch, 661500 samples (15.0s)
 Resampled: 44100 Hz -> 16000 Hz (240000 samples)
 
- Sec | Scene | NR_est | NR_true |    err | refFilt |   anti | Note
+ Sec | Band | NR_est | NR_true |    err | refFilt |   anti | Note
 -------------------------------------------------------------------------------------
-   1 |     0 |    0.3 |    0.3 | 0.255 | 0.0098 | 0.0086 | INIT [FxRMS=0.0098]
-   2 |     0 |    0.5 |    0.5 | 0.272 | 0.0099 | 0.0084 | -
-   3 |     1 |    0.8 |    0.8 | 0.296 | 0.0142 | 0.0139 | -
+   1 |   10 |    0.3 |    0.3 | 0.255 | 0.0098 | 0.0086 | INIT [FxRMS=0.0098]
+   2 |   10 |    0.5 |    0.5 | 0.272 | 0.0099 | 0.0084 | -
+   3 |   10 |    0.8 |    0.8 | 0.296 | 0.0142 | 0.0139 | -
   ...
-  15 |     0 |    3.0 |    2.9 | 0.315 | 0.0144 | 0.0417 | -
+  15 |   10 |    3.0 |    2.9 | 0.315 | 0.0144 | 0.0417 | -
 -------------------------------------------------------------------------------------
   Avg |                           |        |    1.8 |
 
@@ -172,14 +174,14 @@ Done.
 | 列 | 含义 | 举例 |
 |----|------|------|
 | `Sec` | 第几秒 | `1` |
-| `Scene` | CNN 识别的场景 ID | `0` |
+| `Band` | CNN 直接权重增益的 argmax \|gain\| 带索引（0..29 = 扬声器×子带，仅诊断，不参与 Wc 切换） | `10` |
 | `NR_est` | **估计降噪量**（与实时版同公式，数字越大越好） | `4.6 dB` = 估计压低了 4.6 分贝 |
 | `NR_true` | **已知真值降噪量**（仅离线可用，Pri 模型精确计算扰动，最可信） | `4.4 dB` |
 | `err` / `refFilt` / `anti` | 残差 / 带通参考 / 反噪声 RMS | |
-| `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(切换场景) |
+| `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(reset 模式 cos<阈值 → 重置 Wc) |
 
 - **NR_true 是最可信的指标**（离线用 Pri 模型精确算出扰动，NR_est 与它逐秒偏差 <0.5dB）；10 dB 意味着噪声能量降到 1/10，20 dB 意味着降到 1/100
-- 注意：**离线 NR_true 是无因果缺口的模型上限**，不代表实时能达到——实时受控制路径延迟限制（64tap 带通后净预览 ≈ −9ms，见下文"离线验证"）
+- 注意：**离线 NR_true 当前按嵌入式处理延迟 3ms 建模因果性**（默认 `GFANC_EMBED_DELAY_MS=3`，启动日志打印净预览时间），不再是"无因果缺口"的理想上限；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
 
 ## 项目结构
 
@@ -195,7 +197,7 @@ GFANC_FxNLMs_Scene/
 ├── include/               头文件（API 定义）
 │   ├── gfanc_types.h      基础类型（FIR 滤波器）
 │   ├── fir_filter.h       FIR 滤波器
-│   ├── scene_controller.h CNN 场景识别 + 滤波器构造
+│   ├── scene_controller.h CNN 直接权重 Wc 生产者
 │   ├── fxnlms_mimo.h      自适应降噪算法（离线+实时双路径）
 │   ├── howling_detect.h   啸叫检测 + IIR 陷波
 │   ├── binary_loader.h    模型加载器
@@ -203,7 +205,7 @@ GFANC_FxNLMs_Scene/
 │
 ├── src/                   源代码（实现）
 │   ├── fir_filter.c       FIR 滤波器（双段循环, 零取模）
-│   ├── scene_controller.c AI 场景识别 + 控制滤波器构造
+│   ├── scene_controller.c CNN 直接权重 Wc 构造 (tanh 增益)
 │   ├── fxnlms_mimo.c      自适应降噪核心（离线仿真+实时双路径）
 │   ├── cnn_m5_forward.c   神经网络推理（静态缓冲）
 │   ├── howling_detect.c   啸叫 DFT 检测 + IIR 陷波（逐扬声器独立状态）
@@ -230,14 +232,40 @@ GFANC_FxNLMs_Scene/
 
 ### 慢速环路（每秒执行一次）— "大脑"
 
-CNN 神经网络每秒分析一次 1 秒窗口的噪声，识别场景类型（K 种，运行时从数据推导，当前 K=3），混合 15 个预训练子滤波器构造控制滤波器 Wc。双缓冲机制确保零样本丢失。
+CNN 神经网络每秒分析一次 1 秒窗口的噪声，回归 **30 维子带增益**（2 扬声器 × 15 子带，`tanh` → [-1,1] 带符号），并直接构造控制滤波器 Wc = Σ 增益 × 子滤波器（v1.6 直接权重，替换旧 K=3 场景 CNN + centroid blend）。双缓冲机制确保零样本丢失。
 
 ```
-噪声 → 带通(20-1500Hz) → CNN(M5, K类) → Blend(15子滤波器) → Wc(1024tap)
-                                    ↑ 1Hz, 双缓冲+原子交接
+噪声 → 带通(20-1500Hz) → CNN(M5, 30维回归) → tanh 增益 → Wc=Σ gain×sub → Wc(1024tap)
+                                                    ↑ 1Hz, 双缓冲+原子交接
 ```
 
-场景识别为 1Hz 是正确设计——噪声类型变化是秒级到分钟级的，1 秒窗口保证足够的频率分辨率。场景切换时 CrossFader 在 100ms 内平滑过渡。
+**去场景层双模式**（`gfanc_mode`，v1.5）——CNN 不再做"场景切换"（无场景记忆/滞回/OCG），只产 Wc：
+
+| 模式 | CNN 行为 | Wc 行为 |
+|---|---|---|
+| **reset**（默认） | 每秒跑，输出新 30 维增益 + 候选 wc_cur | `cos_sim(anchor_gains, cur_gains) < 0.8`（`GFANC_RESET_THRESH` 可调）→ CrossFader 100ms 平滑过渡到新 Wc，刷新 anchor |
+| **continuous** | 每秒跑（仅诊断日志） | 仅首秒 INIT 设一次，FxNLMS 永不重置 |
+
+噪声类型变化是秒级到分钟级的，1 秒窗口保证足够的频率分辨率。reset 模式触发时 CrossFader 在 100ms 内平滑过渡，防止可闻瞬态。
+
+**Reset 判定粒度：整向量 vs 逐扬声器（设计决策记录）**
+
+本方案 reset 判定采用**整向量 30 维 cos**（`cos(anchor_gains, cur_gains) < 阈值`），与 MIMO_GFANC 的**逐扬声器独立判定**（K=3 softmax，每扬声器各自阈值 0.7）不同。区别与权衡：
+
+| 维度 | 整向量 30 维 cos（本方案） | 逐扬声器独立判定（MIMO_GFANC） |
+|---|---|---|
+| 判定单元 | 2×15 增益向量整体算一个 cos | 每扬声器按各自子带增益单独判定 |
+| 对噪声切换敏感度 | 全场切换（大部分维度同变）→ 敏感 | 单扬声器相关变化 → 敏感 |
+| 抗抖动 | 高——30 维方向稳定，随机抖动对 cos 影响小 | 低——2~3 维判定易被噪声抖动误触 |
+| 同步性 | 两扬声器联合切换，CrossFader 过渡时空间响应一致 | 两扬声器可能先后切换，瞬时空间失衡 |
+| 实现 | 与 CNN 整向量输出天然对齐，无需拆分子判定 | 需按扬声器分组子向量分别判定 |
+
+选整向量的理由：
+1. **稀释效应（dilution）**：单个子带/扬声器的局部变化被其余维度"稀释"进整向量 cos，变化被平滑——抑制**误重置**（微小扰动不触发）；代价是**漏检**局部显著变化。但真实噪声切换（如马路→直升机）是宽带全场变化，各维度同时漂移、cos 掉幅明显，稀释效应影响有限。MIMO_GFANC 的 2 维逐扬声器判定相反：对局部变化敏感，但噪声敏感度也高（其 softmax 又近恒定 → 实际几乎不触发）。
+2. **物理耦合**：两扬声器共享同一参考噪声与误差声场（3 误差麦各收两路叠加），是**联合控制系统**。整向量判定保证两路 Wc 同步过渡，避免一改一不改造成瞬时声场失衡。
+3. **实现与语义最简**：CNN 一次前向即整向量 `gain[s*C+c]`，整向量判定无需拆分再聚合。
+
+**已知代价**：无法单独重置某一扬声器——若某一路空间位置噪声独立剧变，会因稀释效应延迟重置（可接受：两扬声器共享噪声源，独立剧变场景罕见）。
 
 ### 前馈环路（每秒 16000 次）— "肌肉"
 
@@ -258,7 +286,7 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写W
               Pri(ref) → Dis → err = Dis + anti → 梯度
 ```
 
-关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积 64tap 带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。CNN 分类保留独立的 1024tap 带通（频率分辨率）。
+关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积 64tap 带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。CNN 直接权重保留独立的 1024tap 带通（频率分辨率）。
 
 ### 三层架构
 
@@ -267,16 +295,16 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写W
 │                                                               │
 │  ref → bp_fir(1024tap) → cnn_buf[2][16000] 双缓冲            │
 │    │                         │                                │
-│    │                    CNN M5 (K类, 运行时推导)               │
-│    │                      ↓ softmax                          │
-│    │                    Blend: centroid[K][30] softmax加权     │
+│    │          CNN M5 直接权重 (30维回归, 运行时推导)           │
+│    │                      ↓ tanh                             │
+│    │       gain[30] (S×C, 带符号 [-1,1])                      │
 │    │                      ↓                                  │
-│    │                    Wc = Σ blend[c]×sub_filter[c]         │
-│    │                    RMS自动标定 (wc_rms_target), 取反     │
+│    │       Wc = Σ gain[s,c]×sub_filter[(c,s),:]               │
+│    │       RMS自动标定 (wc_rms_target), 取反                  │
 │    │                      ↓                                  │
-│    │                    滞回检测 (cos<0.8)                    │
-│    │                      ↓ 切换                             │
-│    │                    CrossFader 100ms → Wc[2048]           │
+│    │        去场景层双模式 (gfanc_mode, v1.5)                 │
+│    │         reset: cos(anchor_gains,cur)<0.8 → CrossFader    │
+│    │         continuous: 仅首秒INIT, 永不重置                  │
 │    │                                                         │
 ├─ 前馈环路 (16kHz, 音频回调) ─────────────────────────────────┤
 │                                                               │
@@ -378,19 +406,21 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 硬件采样率 | 48000 Hz | ASIO 声卡采样率（3:1 抽取/内插） |
 | 误差麦克风 (E) | 3 | 放在降噪目标位置 |
 | 扬声器 (S) | 2 | 播放反噪声 |
-| 子滤波器 (C) | 15 | 预训练滤波器, 按场景混合 |
-| 场景类型 (K) | 3 (运行时从数据推导) | CNN 可识别的噪声环境数 |
+| 子滤波器 (C) | 15 | 预训练滤波器, 直接权重混合 (Wc 基) |
+| CNN 输出维 (K) | 30 (=S×C, 运行时从 linear_weight 推导) | 直接权重回归: 2 扬声器 × 15 子带增益 (v1.6; 旧场景分类 K=3 已移除) |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
-| CNN 带通 / ANC 带通 | 1024 / 64 tap | 分类用 1024(分辨率), FxLMS 用 64(群延迟 2ms) |
+| CNN 带通 / ANC 带通 | 1024 / 64 tap | 直接权重用 1024(分辨率), FxLMS 用 64(群延迟 2ms) |
 | 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
 | 输入预增益 | 自适应 (env: GFANC_MIC_GAIN) | 自动标定到 TARGET_REF_RMS=0.03 |
 | 步长 (μ) | 1e-7 (基准, Ŝ RMS 自动缩放; env: GFANC_STEP) | LMS 自适应步长 |
 | 变步长 (VS-LMS) | 双 EMA 尖峰检测, 突发降步至 5% | 误差相对自身基线跳变→降步防反馈过冲; 平滑收敛全速 (2026-08-05) |
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
-| 场景切换阈值 | 余弦相似度 < 0.8 | 触发场景切换 |
-| 场景切换 (OCG) | 在线聚类闸门, 默认关 (env: GFANC_OCG, 默认 0) | 替代静态滞回: 自适应簇中心跟踪漂移防误切, 回归场景复用 (Luo et al. ICASSP 2026). 参数: GFANC_OCG_ALPHA(0.10) / _STAY(0.90) / _REJOIN(0.75) / _CONFIRM(3) / _CLUSTERS(4) |
-| 切换过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
+| 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos<阈值 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
+| Reset 触发 | cos(anchor_gains, cur_gains) < 0.8 (env: GFANC_RESET_THRESH) | 仅 reset 模式; MIMO_GFANC Reset 同款, 无滞回 |
+| ~~场景切换 (OCG)~~ | 已移除 (v1.5 去场景层, v1.6 删除代码) | `src/ocg.c`/`include/ocg.h` 已删除, 含 `GFANC_OCG_*` 参数 |
+| Reset 过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
+| 嵌入式处理延迟 | 3ms 默认 (env: GFANC_EMBED_DELAY_MS) | 离线 pad Ŝ 模拟 ADC+DSP+DAC 因果缺口 (v1.5) |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
 | 冷启动 Wc 衰减 | 0.3 (env: GFANC_WC_COLD) | CNN 预设衰减系数 |
 | 冷启动软释放 | 前 1s cap0.12(梯度冻结), 后 1s cap→1.0 | 消除启动啸叫 (v1.2) |
@@ -429,9 +459,9 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 **`GFANC_WC_TARGET` — 不影响收敛后 NR**（0.003/0.01/0.03 实测均 ~13.9dB）。只影响冷启动 Wc 幅度（过大 → 开机"嗡"瞬态），收敛后自适应覆盖。
 
-**文件时长**：步长不变时收敛需要时间——15s 文件默认参数 ~2dB、34s ~5-6dB、56s ~4.7dB。
+**文件时长**：步长不变时收敛需要时间——15s 文件默认参数 ~2dB、34s ~5-6dB、56s ~4.7dB（**均为理想正预览下**；默认 3ms 嵌入式延迟下受因果墙限制，见 [离线验证](#离线验证)）。
 
-> ⚠️ 上表为**离线**（无因果缺口）测量。实时 NR 上限还受**因果性**约束（`GFANC_BUFFER` 越小环路越低、ANC 带通已砍 64tap），且 NR_est 依赖 Ŝ 模型+误差麦灵敏度、误差麦降太狠会虚高——**唯一真值 = 离线 NR_true，实时以人耳为准**。
+> ⚠️ 上表为**理想正预览**测量（无嵌入式处理延迟）。离线默认 `GFANC_EMBED_DELAY_MS=3` 后，NR 上限由三堵墙主导：**延迟**（因果缺口，见[窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）/ **相干** / **空间**（见[离线验证](#离线验证)）。实时 NR_est 还依赖 Ŝ 模型+误差麦灵敏度、误差麦降太狠会虚高——**唯一真值 = 离线 NR_true，实时以人耳为准**。
 
 ## 代码结构
 
@@ -440,8 +470,9 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | 文件 | 功能 |
 |------|------|
 | `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick_rt` + 64tap ANC 带通 (与实时同信号链) |
-| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, 场景状态机, Ŝ 环路延迟自动补偿 |
-| `src/scene_controller.c` | CNN M5 推理 → softmax → max 归一化 Blend → Wc 构造 (RMS 对齐) |
+| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, **Reset/Continuous 双模式派发** (去场景层), Ŝ 环路延迟自动补偿 |
+| `src/scene_controller.c` | CNN 直接权重 Wc 生产者 (v1.6): minmax → CNN 30 维回归 → `tanh` 增益 → `Wc=Σ gain×sub` → RMS 标定 + 取反 |
+| ~~`src/ocg.c` + `include/ocg.h`~~ | ~~在线聚类闸门 (ICASSP 2026)~~ — **已删除** (v1.6 死代码清理, 去场景层后零调用) |
 | `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) |
 | `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏) |
 | `src/fir_filter.c` | FIR 滤波器 (gfanc_delay_t 双精度累加) |
@@ -452,7 +483,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `src/calibrate_secondary.c` | 次级路径 C 版白噪声校准 + 延迟/滑移诊断 |
 | `src/binary_loader.c` | .bin 二进制权重文件加载 (v2 格式, GFNC 头+CRC32) |
 | `include/gfanc_types.h` | 集中参数 + 分级日志 + 维度宏 |
-| `include/scene_manager.h` | 共享场景管理纯函数 (main.c + main_realtime.c 共用) |
+| `include/scene_manager.h` | 共享纯函数 (main.c + main_realtime.c 共用); `sm_cos_sim`(reset 判定)/`sm_wc_max_abs`/`sm_check_divergence`/`sm_check_convergence`; v1.6 已删 `sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`/`sm_wc_rms` 死代码 |
 | `include/sec_online.h` | 在线 Ŝ 辨识 API |
 | `include/cnn_m5_forward.h` | CNN 实例化 API |
 | `export/export_bin.py` | PyTorch → C .bin 导出 |
@@ -461,39 +492,89 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `export/measurement/` | 测量核心模块 (扫频生成/反卷积/质量检验) |
 | `GFANC_Scene/` | Python 项目 (训练代码 + 模型权重 + 声学路径测量数据) |
 
+## 训练管线（直接权重 CNN）
+
+直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
+
+### 数据与标签
+
+- 数据源：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）
+- 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
+- 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]），由 `label_real_noise.py` 用**实测声学路径 + 子滤波器基**生成 —— 正是直接权重 CNN 的回归目标
+- **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
+
+### 命令顺序
+
+```bash
+# 0) 一次性依赖
+pip install numpy scipy pandas torch torchaudio
+
+# 1) 生成子滤波器（宽带 FxNLMS 训练主滤波器 → sqrt-Hann DFT 分解为 15 个子带）
+cd GFANC_Scene
+python training/control_filters/Pre_training_broadband_and_decompose.py
+#    → models/MIMO_Pretrained_Control_filters_broadband.mat
+#      仅当子滤波器基变更时才需重跑（声学路径/分解参数更换后）
+
+# 2) 重标标签（只重标已有 WAV，不重切）
+python training/labeling/label_real_noise.py
+#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
+#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
+
+# 3) 训练直接权重 CNN（m5_scene → 30 维回归头，tanh + MSE）
+python training/network/Train_validate.py
+#    → GFANC_Scene/models/MIMO_M5_DirectWeight_Real.pth
+
+# 4) 评估（可选：测试集整向量 cos / 逐扬声器 cos / MSE）
+python training/network/evaluate.py
+
+# 5) 导出 C 二进制（自动检测直接权重模型）
+cd ..
+python export/export_bin.py
+#    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
+```
+
+### 说明
+
+- **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
+- **何时必须重标（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——`label_real_noise.py` 的 `USE_LOG_SPACING` 须为 `False`。
+- **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
+- **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
+- **合成数据仅作可选增强**：MIMO 的 `band_*` 标签（0/1 频带激活）语义与直接权重不同，不能直接用来训练；若要加频谱覆盖，合成样本必须走自己的标注管线重新标成 `gain_*` 再混入。
+
 ## 离线验证
 
 离线模式 (`main.exe`)：
 
 | 指标 | 结果 |
 |------|------|
-| **算法能力**（窗口场景 预览3ms+延迟≤2ms, `GFANC_STEP=1e-5`） | **~13-15 dB**（详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)） |
-| 平均 NR_true（默认参数, road_noise-15, 15s） | ~2 dB |
-| 平均 NR_true（默认参数, road_noise_0-34, 34s） | ~5 dB |
-| 平均 NR_true（默认参数, mixed_7types_56s, 56s） | ~4.7 dB |
-| 场景数 (K) | 3 (运行时从数据推导) |
+| **算法能力**（正预览 + `GFANC_STEP=1e-5`） | **~13-15 dB**（详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)） |
+| 平均 NR_true（嵌入式默认 3ms 延迟, road_noise-15, 15s） | ~0.3 dB（宽带→相干/空间墙, 见下方警告） |
+| 平均 NR_true（嵌入式默认 3ms 延迟, mixed_7types_56s, 56s） | ~1.8 dB |
+| 平均 NR_true（嵌入式 2ms + 预览 10ms → 净预览 +6ms, mixed_7types） | ~3.3 dB（稳态尾部 4-6dB） |
+| CNN 输出维 (K) | 30 (=S×C, 从 linear_weight 推导, 直接权重回归) |
 | 指标可信度 | NR_est 与 NR_true 逐秒偏差 <0.5dB |
 
-> **默认 step=1e-7 是为实时稳定性调校的**（记忆/实测：VS-LMS 下 step 3e-7 实时已过冲，1e-7 才稳）。离线文件短（15-56s）时默认步长收敛偏慢、NR 偏低。要复现算法能力上限（13-15dB），用 `GFANC_STEP=1e-5` 跑离线。步长与离线 NR（34s 马路噪声, 窗口场景）实测关系：1e-7→6dB、5e-7→9dB、1e-5→14dB。
+> **默认 step=1e-7 是为实时稳定性调校的**（记忆/实测：VS-LMS 下 step 3e-7 实时已过冲，1e-7 才稳）。离线文件短（15-56s）时默认步长收敛偏慢、NR 偏低。要复现算法能力上限（13-15dB），用 `GFANC_STEP=1e-5` 跑离线。步长与离线 NR（34s 马路噪声, 正预览）实测关系：1e-7→6dB、5e-7→9dB、1e-5→14dB。
 
-> ⚠️ **离线 NR_true 是无因果缺口的模型上限**（Dis 与 anti 由同一信号驱动），不代表实时可达到。实时受控制路径延迟限制（ANC 带通 64tap 群延迟 2ms + ASIO ~8.4ms + 声学 0.4ms ≈ 10.8ms；参考→误差 64cm 仅 1.9ms 预览 → 净预览 ≈ −9ms，原 256tap 时 −18.5ms；详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ（64tap 改后环路值需重测）后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
+> ⚠️ **离线 NR_true 现在按嵌入式处理延迟 3ms 建模因果性**（默认 `GFANC_EMBED_DELAY_MS=3`，启动日志打印净预览时间），不再是"无因果缺口"的理想上限。关键实测（2026-08-08）：① 即使不加嵌入式延迟，64tap ANC 带通群延迟 1.97ms 已超过初级路径提前量 0.69ms → 基线净预览即 −1.9ms；② 纯宽带 road_noise 加多大预览都封顶 ~0.8dB（相干/空间墙，2 扬声器/3 误差麦几何）；③ 要净预览为正需 `τ_pri > τ_spk + τ_proc`（proc=2ms 时需参考麦声学提前量 >4.6ms ≈ 1.6m，参考麦移向噪声源/移离误差麦）。实时受 PC 控制路径延迟限制更重（净预览 ≈ −9ms；详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ 后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
 
 ## 常见问题
 
-**Q: 为什么离线运行 NR 只有 1-2dB？算法是不是有问题？**
-A: **不是 bug**——是默认步长 1e-7 为实时稳定性调校的（VS-LMS 下 3e-7 实时已过冲），离线 15s 文件在 1e-7 下收敛太慢（逐秒 NR 从 0.3 爬到 2.9，还在收敛途中）。算法本身能到 10-14dB：
+**Q: 为什么离线运行 NR 只有 0.3-2dB？算法是不是有问题？**
+A: **不是 bug**——三个因素叠加：① 默认步长 1e-7 为实时稳定性调校（VS-LMS 下 3e-7 实时已过冲），离线 15s 文件在 1e-7 下收敛慢；② 离线现在默认按嵌入式处理延迟 3ms 建模因果性（`GFANC_EMBED_DELAY_MS=3`），基线净预览已是 **−1.9ms**（64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；③ 纯宽带噪声（road_noise）受**相干/空间墙**限制，与因果无关，加多大预览都封顶 ~0.8dB（2 扬声器/3 误差麦几何）。
 
-| 配置（road_noise-15, 同一文件） | NR_true |
+| 配置 | NR_true |
 |---|---|
-| 默认参数 | ~1.8 dB |
-| `GFANC_STEP=1e-5` | ~10.4 dB |
-| `GFANC_STEP=1e-5` + 窗口场景（`GFANC_VIRT_PREVIEW_MS=3 GFANC_VIRT_DELAY_MS=2`） | ~12.3 dB |
+| 默认参数, road_noise-15 | ~0.3 dB |
+| 默认参数, mixed_7types_56s | ~1.8 dB |
+| `GFANC_EMBED_DELAY_MS=2 GFANC_VIRT_PREVIEW_MS=10`（净预览 +6ms）, mixed_7types | ~3.3 dB（稳态 4-6dB） |
+| 同上, Helicopter | 稳态 ~3.5 dB |
 
-要复现算法能力上限（对应可行性文档 13-15dB），跑：
+要复现算法能力上限（正预览 + 大步长），跑：
 ```bash
-GFANC_STEP=1e-5 ./main.exe "Noise Examples/road_noise-15.wav"
+GFANC_EMBED_DELAY_MS=2 GFANC_VIRT_PREVIEW_MS=10 GFANC_STEP=1e-5 ./main.exe "Noise Examples/mixed_7types_56s.wav"
 ```
-1-2dB 反而是"诚实"读数——反映实时安全步长在实际时长内的收敛结果，更接近实时实际能拿到的量级（实时还受 12.4ms 环路因果性限制）。
+0.3-2dB 反而是"诚实"读数——反映真实因果约束 + 实时安全步长下的收敛结果，更接近嵌入式实际能拿到的量级（嵌入式还受参考麦声学提前量限制：要正预览需 `τ_pri > 4.6ms`，参考麦需移向噪声源/移离误差麦）。
 
 **Q: 为什么 error_out.wav 听起来比原噪声还大？**
 A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看表格里的 NR_true（离线真值）或实时 NR 数字，不要用耳朵直接听 error_out.wav。

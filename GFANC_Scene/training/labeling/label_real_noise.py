@@ -79,7 +79,10 @@ DEVICE      = 'cuda' if torch.cuda.is_available() else 'cpu'
 # ══════════════════════════════════════════════════
 # 子滤波器配置
 # ══════════════════════════════════════════════════
-USE_LOG_SPACING = True  # True=对数间距 23~1299Hz (推荐), False=均匀间距 20~1500Hz
+# 必须与部署基一致: 部署 (export_bin.py → data/sub_filters.bin → C 运行时) 和
+# MIMO_GFANC 参考均用 broadband。logspacing 与 broadband 内容不同 (最大差 0.33),
+# 用 logspacing 标出的增益在部署 broadband 基下不是最优权重 → 必须用 broadband 重标。
+USE_LOG_SPACING = False  # False=均匀间距 20~1500Hz (部署基, 与 export_bin.py/MIMO 参考一致)
 # ══════════════════════════════════════════════════
 
 chunk_len = int(CHUNK_SEC * FS)

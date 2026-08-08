@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>  /* gf_log (ADV-D4: LOG 宏去 GCC ##__VA_ARGS__ 扩展) */
+#include <string.h>  /* gfanc_config_load_env: GFANC_MODE strcmp */
 
 typedef float gfanc_float_t;
 
@@ -12,7 +13,6 @@ typedef float gfanc_float_t;
 #define GFANC_E_MAX  5    /* 误差麦最大数量 (当前 3, 目标 1×5×4=5) */
 #define GFANC_S_MAX  4    /* 扬声器最大数量 (当前 2, 目标 1×5×4=4) */
 #define GFANC_L_MAX  2048 /* 滤波器最大长度 (当前 1024) */
-#define GFANC_K_MAX  16   /* 场景最大数量 (SC_K_MAX, 已存在于 scene_controller.h) */
 #define GFANC_C_MAX  15   /* 子滤波器最大数量 (SC_C, 已存在于 scene_controller.h) */
 
 /* FIR 滤波器.
@@ -85,18 +85,15 @@ typedef struct {
     int   hw_min_hold;           /* 陷波最小保持帧数 */
 
     int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
+    int   embed_delay_ms;        /* 嵌入式信号链处理延迟 ADC+DSP+DAC (env: GFANC_EMBED_DELAY_MS, 默认3ms).
+                                    离线 main.c pad Ŝ 模拟因果缺口; 0=实时PC等效(无处理延迟). */
     float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
     float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */
 
-    /* 在线聚类闸门 (OCG) — 替代场景切换滞回 (GFANC_OCG 系列 env)
-       方案: Luo et al., ICASSP 2026 "Stabilized Hybrid GFANC+FxNLMS with Online Clustering".
-       0=旧滞回路径(默认), 1=在线聚类闸门. */
-    int   ocg_enable;          /* 1=启用在线聚类闸门 (0=旧滞回, golden 回归不变) */
-    float ocg_alpha;           /* 活动簇漂移学习率 (0.05~0.2, 默认0.10) */
-    float ocg_stay_thresh;     /* 留在活动簇 cos 下限 (默认0.90) */
-    float ocg_rejoin_thresh;   /* 识别已知簇 cos 下限 (默认0.75) */
-    int   ocg_confirm_frames;  /* 确认切换所需连续帧数 (默认3) */
-    int   ocg_max_clusters;    /* 簇数量上限 (默认4, ≤OCG_MAX_CLUSTERS) */
+    /* 去场景层 (gfanc-direct-weight): 无场景切换, CNN 只产 Wc.
+       模式: 0=continuous (CNN 仅首秒初始化, FxNLMS 永不重置),
+             1=reset (每秒 cos_sim(anchor,probs)<switch_threshold → CrossFader 重置). */
+    int   gfanc_mode;          /* env: GFANC_MODE=reset|continuous */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -117,10 +114,10 @@ typedef struct {
     12.0f, 4, 8, 0.96f, /* hw_thresh_db(12), hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
     0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
+    3,                  /* embed_delay_ms (嵌入式处理延迟默认3ms, GFANC_EMBED_DELAY_MS 覆盖) */ \
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
-    0, 0.10f, 0.90f, 0.75f, 3, 4  /* OCG: enable, alpha, stay, rejoin, confirm, max_clusters \
-                                     (默认关=旧滞回路径, GFANC_OCG=1 开启验证) */ \
+    1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -134,17 +131,17 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_LEAK")))         cfg->leak         = (float)atof(s);
     if ((s = getenv("GFANC_FREEZE_RATIO"))) cfg->freeze_ratio = (float)atof(s);
     if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
+    if ((s = getenv("GFANC_EMBED_DELAY_MS"))) cfg->embed_delay_ms = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
     if ((s = getenv("GFANC_WC_TARGET")))  cfg->wc_rms_target = (float)atof(s);
     if ((s = getenv("GFANC_SEC_MU")))     cfg->sec_online_mu  = (float)atof(s);
     if ((s = getenv("GFANC_WC_COLD")))   cfg->wc_cold_start  = (float)atof(s);
     if ((s = getenv("GFANC_HW_THRESH"))) cfg->hw_thresh_db   = (float)atof(s);
-    if ((s = getenv("GFANC_OCG")))          cfg->ocg_enable        = atoi(s);
-    if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha         = (float)atof(s);
-    if ((s = getenv("GFANC_OCG_STAY")))     cfg->ocg_stay_thresh   = (float)atof(s);
-    if ((s = getenv("GFANC_OCG_REJOIN")))   cfg->ocg_rejoin_thresh = (float)atof(s);
-    if ((s = getenv("GFANC_OCG_CONFIRM")))  cfg->ocg_confirm_frames = atoi(s);
-    if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters  = atoi(s);
+    if ((s = getenv("GFANC_MODE"))) {
+        if (!strcmp(s, "continuous")) cfg->gfanc_mode = 0;
+        else if (!strcmp(s, "reset")) cfg->gfanc_mode = 1;
+    }
+    if ((s = getenv("GFANC_RESET_THRESH"))) cfg->switch_threshold = (float)atof(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

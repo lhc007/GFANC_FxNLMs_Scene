@@ -3,6 +3,10 @@
  *  提取两者中完全一致的状态机计算, 消除维护漂移风险 (ADVERSARIAL_REVIEW C1).
  *  注意: 此模块仅包含纯函数 (无 I/O, 无线程同步, 无全局状态).
  *        线程同步 (Interlocked + wc_shadow) 和 I/O 仍由各自主程序处理.
+ *
+ *  gfanc-direct-weight (v1.6): 已删除场景记忆/切换/滞回死代码
+ *    (sm_scene_switch_execute / sm_first_sec_init / sm_check_scene_switch / sm_wc_rms),
+ *    保留直接权重模式仍在用的纯函数.
  */
 #ifndef SCENE_MANAGER_H
 #define SCENE_MANAGER_H
@@ -18,21 +22,22 @@ extern "C" {
    共享计算函数 (纯函数, main.c + main_realtime.c 共用)
    ══════════════════════════════════════════════════════════ */
 
-/** 计算两个概率分布之间的余弦相似度 (S-1: anchor vs current).
- *  用于场景切换滞回检测 — cos < threshold 且场景不同 → 候选切换.
+/** 计算两个向量之间的余弦相似度 (reset 判定: anchor vs current).
  *
- *  @param anchor  进入当前场景时的概率锚点 (K 维)
- *  @param probs   当前帧 softmax 概率 (K 维)
- *  @param K       场景数
+ *  direct-weight 模式: 输入为 30 维子带增益向量 (S×C), 不再输入 softmax 概率.
+ *
+ *  @param anchor  锚点向量 (上次重置时的增益, K 维)
+ *  @param cur     当前增益向量 (K 维)
+ *  @param K       向量维数 (=S*C=30)
  *  @return        余弦相似度 ∈ [-1, 1], 1=完全相同, -1=完全相反
  */
-static inline float sm_cos_sim(const float *anchor, const float *probs, int K)
+static inline float sm_cos_sim(const float *anchor, const float *cur, int K)
 {
     float dot = 0.0f, np = 0.0f, nc = 0.0f;
     for (int k = 0; k < K; k++) {
-        dot += anchor[k] * probs[k];
+        dot += anchor[k] * cur[k];
         np  += anchor[k] * anchor[k];
-        nc  += probs[k]  * probs[k];
+        nc  += cur[k]  * cur[k];
     }
     return dot / (sqrtf(np) * sqrtf(nc) + 1e-10f);
 }
@@ -51,109 +56,6 @@ static inline float sm_wc_max_abs(const float *wc, int n)
         if (a > mx) mx = a;
     }
     return mx;
-}
-
-/** 计算 Wc 的 RMS 值.
- *
- *  @param wc   滤波器系数数组
- *  @param n    数组长度 (S*L)
- *  @return     sqrt(Σ wc² / n)
- */
-static inline float sm_wc_rms(const float *wc, int n)
-{
-    float ss = 0.0f;
-    for (int i = 0; i < n; i++) ss += wc[i] * wc[i];
-    return sqrtf(ss / (float)n);
-}
-
-/** 执行场景切换: 保存旧 Wc → 恢复新 Wc → 可选 CNN 预设回退 → 初始化 CrossFader.
- *
- *  此函数封装主线程中的场景切换逻辑 (实时版和离线版完全一致).
- *  实时版调用方负责通过 wc_shadow+wc_seq 提交 Wc (本函数不处理).
- *
- *  @param scene_wc        场景记忆数组 [K][S*L]
- *  @param scene_wc_valid  场景记忆有效标志 [K]
- *  @param cur_scene_id    当前场景 ID (输入/输出)
- *  @param new_scene       目标场景 ID
- *  @param wc_snapshot     当前 Wc 快照 (保存到旧场景记忆)
- *  @param wc_cur          新场景 Wc (输出: 被恢复的记忆或 CNN 预设覆盖)
- *  @param wc_old          CrossFader 旧端 Wc (输出: 被当前快照覆盖)
- *  @param wc_n            每个扬声器的系数数 (=S*L)
- *  @param wc_cold_start   首次场景衰减 (0.3=30%起步, 1.0=关闭)
- *  @param wc_trusted      当前 Wc 是否可信 (非发散/非静音/非冻结). 0 时旧场景
- *                         记忆不覆盖 (保留旧记忆或待初始化), 防发散快照污染.
- *  @return 1=使用了已收敛记忆, 0=使用了 CNN 预设 (首次)
- */
-static inline int sm_scene_switch_execute(
-    float *scene_wc, int *scene_wc_valid,
-    int *cur_scene_id, int new_scene,
-    const float *wc_snapshot,
-    float *wc_cur, float *wc_old,
-    int wc_n, float wc_cold_start, int wc_trusted)
-{
-    int restored = 0;
-
-    /* 保存旧场景的当前 Wc (快照是回调最新值, 比 wc_cur 更实时).
-       BUG-7: 仅当当前 Wc 可信 (非发散/非静音/非冻结) 时保存.
-       发散/peak_mute 削半/冻结期的 Wc 快照保存进记忆会污染场景记忆,
-       切回该场景时恢复发散滤波器 → 再次发散, 形成永久坏记忆. */
-    if (wc_trusted) {
-        memcpy(scene_wc + (*cur_scene_id) * wc_n, wc_snapshot, wc_n * sizeof(float));
-        scene_wc_valid[*cur_scene_id] = 1;
-    }
-    /* 不可信时保留旧记忆 (若有) — scene_wc_valid 不置位, 下次恢复走 CNN 预设
-       而非发散快照. wc_old 仍取自 wc_snapshot (CrossFader 需从当前位置平滑过渡). */
-
-    /* 新场景: 有收敛记忆就用记忆, 否则用 CNN 预设 (已在 wc_cur 中) */
-    if (scene_wc_valid[new_scene]) {
-        memcpy(wc_cur, scene_wc + new_scene * wc_n, wc_n * sizeof(float));
-        restored = 1;
-    } else {
-        /* 冷启动衰减: 首次未收敛场景, CNN 预设可能偏离真实噪声,
-           LMS 从低向上收敛 (安全) 避免从过高值 overshoot 发散. */
-        if (wc_cold_start < 1.0f && wc_cold_start > 0.0f) {
-            for (int i = 0; i < wc_n; i++) wc_cur[i] *= wc_cold_start;
-        }
-        /* CNN 预设同步存入场景记忆 — 防止下次恢复时拿到未初始化的空滤波器 */
-        memcpy(scene_wc + new_scene * wc_n, wc_cur, wc_n * sizeof(float));
-        scene_wc_valid[new_scene] = 1;
-    }
-
-    /* CrossFader: wc_old = 切换瞬间的当前 Wc (过渡起点) */
-    memcpy(wc_old, wc_snapshot, wc_n * sizeof(float));
-
-    *cur_scene_id = new_scene;
-    return restored;
-}
-
-/** 首次初始化: 存入 CNN 预设 Wc 作为场景记忆, 计算 wc_init_max 作为 freeze 基准.
- *
- *  @param scene_wc        场景记忆数组
- *  @param scene_wc_valid  场景记忆有效标志
- *  @param cur_scene_id    当前场景 ID (输出)
- *  @param new_scene       CNN 分类的场景 ID
- *  @param wc_cur          CNN 构造的初始 Wc (in/out: 会被 wc_cold_start 衰减)
- *  @param wc_n            系数数 (=S*L)
- *  @param wc_init_max     输出: max|Wc| 作为 freeze 基准 (最小 0.01)
- *  @param wc_cold_start   首次衰减系数 (0.3=30%起步, 1.0=关闭)
- */
-static inline void sm_first_sec_init(
-    float *scene_wc, int *scene_wc_valid,
-    int *cur_scene_id, int new_scene,
-    float *wc_cur, int wc_n,
-    float *wc_init_max, float wc_cold_start)
-{
-    /* 冷启动衰减: CNN 预设可能大幅偏离当前噪声 → LMS 从低向上收敛, 防 overshoot */
-    if (wc_cold_start < 1.0f && wc_cold_start > 0.0f) {
-        for (int i = 0; i < wc_n; i++) wc_cur[i] *= wc_cold_start;
-    }
-
-    memcpy(scene_wc + new_scene * wc_n, wc_cur, wc_n * sizeof(float));
-    scene_wc_valid[new_scene] = 1;
-    *cur_scene_id = new_scene;
-
-    float mx = sm_wc_max_abs(wc_cur, wc_n);
-    *wc_init_max = (mx > 0.001f) ? mx : 0.01f;
 }
 
 /** 检查 Wc 发散并更新 freeze 状态机.
@@ -208,19 +110,19 @@ static inline int sm_check_divergence(
     return 0;  /* 无变化 */
 }
 
-/** 检查收敛并保存 Wc 到场景记忆.
+/** 检查收敛并保存 Wc (去场景层后保存至单一 known-good Wc 供救援/回滚).
  *
  *  @param nr_level        当前 NR (dB)
  *  @param nr_threshold    收敛阈值 (dB)
  *  @param safety_mute     安全静音标志 (非零 → 跳过)
  *  @param diverged        发散标志 (非零 → 跳过)
  *  @param converged_frames 连续达标帧数 (输入/输出)
- *  @param scene_wc        场景记忆
- *  @param cur_scene_id    当前场景
- *  @param wc_snapshot     当前 Wc (收敛时保存至此)
- *  @param wc_n            系数数
+ *  @param scene_wc        收敛 Wc 保存目标 (旧场景记忆场景数组; 去场景层后传 last_good_wc)
+ *  @param cur_scene_id    场景偏移 (旧 K 场景槽位 × wc_n; 去场景层后恒 0)
+ *  @param wc_snapshot     收敛期 Wc 快照源 (调用方拷贝自 wc_shadow)
+ *  @param wc_n            系数数 (S*L)
  *  @param wc_init_max     输出: 更新为收敛时 max|Wc| (自适应 freeze 基准)
- *  @return  1=本次帧触发了 scene_wc 保存, 0=未触发
+ *  @return  1=本次帧触发了保存, 0=未触发
  */
 static inline int sm_check_convergence(
     float nr_level, float nr_threshold,
@@ -243,44 +145,6 @@ static inline int sm_check_convergence(
         }
     } else {
         *converged_frames = 0;
-    }
-    return 0;
-}
-
-/** 场景切换滞回检测: 候选场景需连续 confirm_frames 帧一致才确认.
- *
- *  返回值语义: 0=无切换, 1=确认切换 (调用方随后执行 sm_scene_switch_execute)
- *
- *  @param cos_sim         当前帧 cos(anchor, probs)
- *  @param switch_threshold 切换阈值 (cos < threshold → 候选)
- *  @param new_scene       当前帧 CNN 分类 scene_id
- *  @param cur_scene_id    当前场景
- *  @param scene_cand      候选场景 (输入/输出)
- *  @param scene_cand_cnt  候选连续帧数 (输入/输出)
- *  @param confirm_frames  确认所需帧数 (通常=3)
- *  @return  1=确认切换, 0=未确认
- */
-static inline int sm_check_scene_switch(
-    float cos_sim, float switch_threshold,
-    int new_scene, int cur_scene_id,
-    int *scene_cand, int *scene_cand_cnt,
-    int confirm_frames)
-{
-    if (cos_sim < switch_threshold && new_scene != cur_scene_id) {
-        if (new_scene == *scene_cand)
-            (*scene_cand_cnt)++;
-        else {
-            *scene_cand = new_scene;
-            *scene_cand_cnt = 1;
-        }
-        if (*scene_cand_cnt >= confirm_frames) {
-            *scene_cand = -1;
-            *scene_cand_cnt = 0;
-            return 1;
-        }
-    } else {
-        *scene_cand = -1;
-        *scene_cand_cnt = 0;
     }
     return 0;
 }

@@ -5,7 +5,7 @@
  *    gf_sleep_ms(100);                // Phase-2 Linux → usleep(100000)
  *    gf_log_timestamp(logfile, tag);  // Phase-3 裸机 → 定义 GFANC_NO_TIME 去除
  *
- *  与 os_atomic.h 互补: 原子操作用 os_atomic, 系统调用用 os_port.
+ *  线程同步/原子操作由各主程序直接使用平台原语 (Interlocked 等).
  */
 #ifndef OS_PORT_H
 #define OS_PORT_H

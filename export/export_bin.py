@@ -28,8 +28,11 @@ else:
     # 默认: 项目根目录下的 GFANC_Scene
     PY_PROJ = Path(os.path.dirname(os.path.abspath(__file__))).parent / 'GFANC_Scene'
 
-# CNN 模型
-CNN_MODEL  = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
+# CNN 模型 — 直接权重回归版优先, 否则回退到场景分类器 (backward compat)
+CNN_CKPT_DW  = PY_PROJ / 'models' / 'MIMO_M5_DirectWeight_Real.pth'
+CNN_CKPT_SCE = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
+CNN_MODEL = CNN_CKPT_DW if CNN_CKPT_DW.exists() else CNN_CKPT_SCE
+IS_DW = CNN_MODEL == CNN_CKPT_DW    # True=直接权重回归 (S*C=30 维), False=场景分类 (K 维)
 
 # 子滤波器 (.mat)
 SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat'
@@ -52,22 +55,32 @@ OUT_DIR.mkdir(exist_ok=True)
 # 系统参数 (S/C/E 固定, K 从场景定义自动读取)
 S, C, E = 2, 15, 3   # S=扬声器, C=子滤波器数, E=误差麦克风数
 
-# ── 自动读取场景数 K ──
-with open(SCENE_DEF) as f:
-    scene_doc = json.load(f)
-K = len([k for k in scene_doc['scenes']])
-print(f'K = {K} scenes (auto-detected from {SCENE_DEF.name})')
-
-# 校验 CNN checkpoint 与 K 匹配
+# ── CNN 输出维度: DW 模式 = S*C (直接权重), Scene 模式 = K (场景数) ──
 ckpt = torch.load(str(CNN_MODEL), map_location='cpu', weights_only=True)
-ckpt_k = ckpt['linear.weight'].shape[0]
-if ckpt_k != K:
-    raise SystemExit(
-        f'ERROR: K mismatch — {SCENE_DEF.name} has {K} scenes, '
-        f'but {CNN_MODEL.name} linear layer expects {ckpt_k}. '
-        f'Check your SCENE_DEF / CNN_MODEL paths.'
-    )
-print(f'CNN checkpoint K={ckpt_k} OK')
+n_out = ckpt['linear.weight'].shape[0]
+if IS_DW:
+    # 直接权重回归: 输出必须 = S*C = 30 (S 扬声器 × C 子带增益)
+    if n_out != S * C:
+        raise SystemExit(
+            f'ERROR: direct-weight CNN expects {S*C} (=S{S}×C{C}) outputs, '
+            f'but {CNN_MODEL.name} linear layer has {n_out}. '
+            f'Retrain with K=SC (see training/network/Train_validate.py).'
+        )
+    K = n_out
+    print(f'CNN mode: direct_weight (回归头 {K}=S*C 维, tanh 激活)')
+else:
+    # 场景分类: K 从 scene_definitions_real.json 读取
+    with open(SCENE_DEF) as f:
+        scene_doc = json.load(f)
+    K = len([k for k in scene_doc['scenes']])
+    if n_out != K:
+        raise SystemExit(
+            f'ERROR: K mismatch — {SCENE_DEF.name} has {K} scenes, '
+            f'but {CNN_MODEL.name} linear layer expects {n_out}. '
+            f'Check your SCENE_DEF / CNN_MODEL paths.'
+        )
+    print(f'CNN mode: scene_classifier (K={K} 维, softmax 激活)')
+print(f'CNN checkpoint 输出 {n_out} 维 OK')
 
 def write_bin(name, arr):
     """R-16-②: v2 格式 — 16B 头 + float32 payload."""
@@ -155,6 +168,9 @@ cnn_info = {
     'pool_kernel': 4, 'pool_stride': 4,
     'fc_in': 64, 'fc_out': K,
     'bn_eps': 1e-5,
+    # C 端推理激活: direct_weight=tanh (回归头输出归一化增益), scene=softmax
+    'mode': 'direct_weight' if IS_DW else 'scene',
+    'activation': 'tanh' if IS_DW else 'softmax',
 }
 write_json('cnn_info.json', cnn_info)
 print(f'  cnn_info.json saved')
@@ -176,11 +192,14 @@ write_bin('secondary_path', Sec)
 print(f'  primary_path.bin: {list(Pri.shape)}')
 print(f'  secondary_path.bin: {list(Sec.shape)}')
 
-# ── 4. 场景定义 ──
-print('Exporting scene definitions...')
-centroids = np.array([scene_doc['scenes'][str(k)]['centroid'] for k in range(K)], dtype=np.float32)
-write_bin('scene_defs', centroids)
-print(f'  scene_defs.bin: {list(centroids.shape)}')
+# ── 4. 场景定义 (仅场景分类模式; 直接权重模式无 centroid, 运行时改为权重混合) ──
+if IS_DW:
+    print('Skipping scene_defs.bin (direct_weight 模式无 centroid)')
+else:
+    print('Exporting scene definitions...')
+    centroids = np.array([scene_doc['scenes'][str(k)]['centroid'] for k in range(K)], dtype=np.float32)
+    write_bin('scene_defs', centroids)
+    print(f'  scene_defs.bin: {list(centroids.shape)}')
 
 # ── 5. 带通 FIR ──
 print('Exporting bandpass FIR...')
@@ -206,6 +225,10 @@ config = {
     'input_len': 16000, 'bp_len': int(len(bp_coeff)),
     'bp_anc_len': 256,
     'dsp_delay': 16, 'fade_len': 1600, 'sc_dim': S * C,
+    # CNN 模式: direct_weight (回归 S*C 维, tanh) / scene (分类 K 维, softmax)
+    'cnn_mode': 'direct_weight' if IS_DW else 'scene',
+    'cnn_activation': 'tanh' if IS_DW else 'softmax',
+    'n_cnn_out': K,
 }
 write_json('gfanc_config.json', config)
 

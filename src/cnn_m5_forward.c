@@ -108,8 +108,9 @@ int cnn_init(cnn_instance_t *cnn)
     int n_b = bin_load_float("data/cnn_linear_bias.bin", &m->fc_bias);
     if (n_w < 0 || n_b < 0) return -1;
     cnn->K = n_w / CH;
-    if (cnn->K < 1 || cnn->K > 16) {
-        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats)\n", cnn->K, n_w);
+    if (cnn->K < 1 || cnn->K > CNN_M5_OUT_MAX) {
+        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats) — expected 1..%d\n",
+                cnn->K, n_w, CNN_M5_OUT_MAX);
         return -1;
     }
     (void)n_b;
