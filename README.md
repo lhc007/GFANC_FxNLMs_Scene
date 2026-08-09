@@ -279,18 +279,18 @@ F-A 修复后，实时和离线使用独立路径，互不影响：
 ```
 ref → bp_anc(64tap) → x_ref ─┬─→ [Wc ⊗ x_ref] → anti (物理扬声器输出)
                               │
-                              └─→ Ŝ ⊗ ref → Fx → 梯度更新
-                                                 ↑
-                                   err_meas = bp(err_mic) (实测误差直驱)
+                              └─→ Ŝ ⊗ ref → bp_anc(64tap) → Fx → 梯度更新 (R-58-11)
+                                                                      ↑
+                                                        err_meas = bp(err_mic) (实测误差直驱)
 ```
 
 **离线路径**（`fxnlms_tick_rt`，与实时同信号链）：
 ```
-ref → bp_anc(64tap) → Ŝ ⊗ ref → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV)
+ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ Fx (Ŝ域, 仅写WAV) (R-58-10)
               Pri(ref) → Dis → err = Dis + anti → 梯度
 ```
 
-关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积 64tap 带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。CNN 直接权重保留独立的 1024tap 带通（频率分辨率）。
+关键区别：实时 anti 输出是 `Wc ⊗ ref`（直接卷积 64tap 带通参考），梯度用实测误差麦信号直接驱动；离线 anti 是 `Wc ⊗ (Ŝ ⊗ ref)`（经模型滤波），用于 WAV 仿真评估。CNN 直接权重保留独立的 1024tap 带通（频率分辨率）。**R-58-10/11 后实时与离线的 Fx 均再过一次 64tap bp_anc（与 `err_meas` 的 bp 路径逐样本对齐）**，消除"误差带通而 Fx 不带通"的梯度相位失配（FxLMS 临界稳定 → Wc 慢漂移，实时被 cold_hold/adaptive-leak/safety_mute 掩盖）。
 
 ### 三层架构
 

@@ -110,6 +110,7 @@ typedef struct {
     fir_filter_t  bp_fir;        /* ref 带通 CNN (1024tap, 分类用) */
     fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (256tap, 群延迟8ms) */
     fir_filter_t  bp_err[E];     /* err 带通 ANC (256tap) */
+    fir_filter_t  bp_fx[E*S];    /* R-58-10: 梯度 Fx 带通, 每 (e,s) 独立 FIR (与 err_meas 同路径对齐) */
     fir_filter_t *sec_firs;      /* [E*S] 次级路径 */
     float        *sec_coeffs;
     float        *bp_anc_coeffs; /* R-13: ANC 带通系数 (256tap, 与 CNN 1024tap 独立) */
@@ -306,6 +307,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         for (int e = 0; e < E; e++)
             for (int s = 0; s < S; s++)
                 Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_anc);
+        /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复实时梯度相位失配, 同离线根因).
+           每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
+        for (int e = 0; e < E; e++)
+            for (int s = 0; s < S; s++)
+                Fx_arr[e*S+s] = fir_tick(&ctx->bp_fx[e*S+s], Fx_arr[e*S+s]);
 
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
         float err_meas[E];
@@ -385,7 +391,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 fir_reset(&ctx->bp_fir);
                 fir_reset(&ctx->bp_fir_anc);  /* R-13 */
                 for (int e = 0; e < E; e++) fir_reset(&ctx->bp_err[e]);
-                for (int i = 0; i < E*S; i++) fir_reset(&ctx->sec_firs[i]);
+                for (int i = 0; i < E*S; i++) { fir_reset(&ctx->bp_fx[i]); fir_reset(&ctx->sec_firs[i]); }
                 for (int s = 0; s < S; s++)
                     if (ctx->fb_fir[s].coeffs) fir_reset(&ctx->fb_fir[s]);
                 ctx->nan_out_hold = 0;
@@ -889,6 +895,21 @@ int main(void) {
         if (!ctx->bp_err[e].delay_line) { fprintf(stderr, "OOM: bp_err[%d]\n", e); ret = 1; goto cleanup; }
     }
 
+    /* ── R-58-10: 梯度 Fx 也过 bp_anc (与 err_meas 同路径) — 修复梯度相位失配.
+       err_meas = bp_err(es) 带 31.5 样本群延迟 (64tap), 若 Fx = Ŝ⊗ref_anc 不过 bp →
+       梯度与误差错位 31.5 样本 → FxLMS 临界稳定 → Wc 相位慢漂移 → 降噪被压 (与离线同构根因,
+       实时被 cold_hold/adaptive-leak/safety_mute 掩盖). 修复: Fx 过同一 bp_anc 系数.
+       注意: 必须 E×S 每条路径一个独立 FIR — 若共享, s=1 的 tick 会用 s=0 污染的延迟线
+       → 第二扬声器滤波参考被交叉污染 → Wc[1] 梯度错位 (离线 bug ② 教训). */
+    for (int e = 0; e < E; e++)
+        for (int s = 0; s < S; s++) {
+            int idx = e*S+s;
+            float *ec = bp_anc_ok ? bp_anc_coeff : bp_coeff;
+            ctx->bp_fx[idx].coeffs = ec; ctx->bp_fx[idx].n_taps = BP_ANC_LEN;
+            ctx->bp_fx[idx].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
+            if (!ctx->bp_fx[idx].delay_line) { fprintf(stderr, "OOM: bp_fx[%d]\n", idx); ret = 1; goto cleanup; }
+        }
+
     /* ── BUG-2: Ŝ 健康检查 + 环路延迟自动补偿 ──
        FxLMS 对齐要求: 模型延迟(dsp_delay + Ŝ峰位) = 真实环路延迟.
        若 Ŝ 在测量时被对齐抹掉了环路延迟 (管道测量 / 校准对齐), 模型延迟偏小,
@@ -1232,6 +1253,7 @@ cleanup:
         free(ctx->bp_fir_anc.delay_line);  /* R-13 */
         free(ctx->bp_anc_coeffs);          /* R-13: bandpass_anc.bin 所有权 */
         for (int e = 0; e < E; e++) free(ctx->bp_err[e].delay_line);
+        for (int i = 0; i < E*S; i++) free(ctx->bp_fx[i].delay_line);  /* R-58-10 */
         if (ctx->sec_firs) {
             for (int i = 0; i < E*S; i++) free(ctx->sec_firs[i].delay_line);
             free(ctx->sec_firs);
