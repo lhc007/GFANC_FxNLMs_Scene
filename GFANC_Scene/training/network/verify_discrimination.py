@@ -124,9 +124,33 @@ def feature_cnn_output(win, model, bp_w, bp_pad, device):
     return pred
 
 
+def wc_only_nr(win, gains, Pri, Sec, sub_full, device, fs=16000, repet=3):
+    """仅 CNN Wc 的稳态降噪 (无 FxLMS 自适应).
+
+    生成真实声学路径下的 Dis/Fx (Repet=3), 用增益重建的 Wc 做固定卷积,
+    取末 1s 稳态窗计算 NR — 与 2026-08-09 实测基准同口径 (标签界 5.2~8.1 dB).
+    """
+    from training.control_filters.Disturbance_generation import disturbance_generation_batch_gpu
+    Dis, Fx, T = disturbance_generation_batch_gpu(
+        [torch.from_numpy(win)], Pri, Sec, fs=fs, Repet=repet)
+    Dis, Fx = Dis[0].cpu().numpy(), Fx[0].cpu().numpy()
+    Wc = np.einsum('sc,csl->sl', gains, sub_full)          # (S, L)
+    E = Dis.shape[0]
+    anti = np.zeros_like(Dis)
+    for e in range(E):
+        for s in range(N_SPEAKERS):
+            anti[e] += np.convolve(Wc[s], Fx[e, s])[:T]
+    n0 = T - fs
+    pd = np.mean(Dis[:, n0:] ** 2)
+    pe = np.mean((Dis - anti)[:, n0:] ** 2)
+    return 10 * np.log10(pd / (pe + 1e-20))
+
+
 def main():
-    ap = argparse.ArgumentParser(description='Checkpoint 3: CNN 输出判别力 (最近均值协议)')
+    ap = argparse.ArgumentParser(description='Checkpoint 3: CNN 输出判别力 + 仅 CNN Wc 的真实基准降噪')
     ap.add_argument('--model', required=True)
+    ap.add_argument('--no-nr', action='store_true',
+                    help='跳过 Wc-only NR 实测 (只测判别力, 不生成 Dis/Fx)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -197,6 +221,30 @@ def main():
     print('  ' + '-' * 46)
     print('  基线 (2026-08-09 C 运行时): 输入谱 75.0% | 真实标签 76.7% | CNN 输出 35.8%')
     print('  目标: 两阶段训练后 CNN 输出判别力 ≥ 70%')
+
+    # ── 仅 CNN Wc 的真实基准稳态降噪 (目标: 5-8 dB, 无 FxLMS) ──
+    if not args.no_nr:
+        print('\n  ── 仅 CNN Wc 的真实基准稳态降噪 ──')
+        print('  (首 1s 窗口, Repet=3, Wc 固定卷积无自适应; 与 2026-08-09 实测同口径)')
+        print('  ' + '-' * 46)
+        from training.control_filters.path_loader import load_multichannel_paths_with_variable_names
+        Pri, Sec = load_multichannel_paths_with_variable_names(
+            folder=str(_PROJECT_ROOT / 'Primary and Secondary Path'), subfolder='',
+            Pri_path_file_name='primary_path.npy', Sec_path_file_name='secondary_path.npy')
+        sub_full = sio.loadmat(str(_SUB_FILTER))['Wc_v'].astype(np.float32)   # (C, S, L)
+        nrs = []
+        for t, files in TYPE_FILES.items():
+            for fn in files:
+                w, sr = torchaudio.load(str(_NOISE_DIR / fn))
+                w = torchaudio.functional.resample(w, sr, 16000).squeeze().numpy()
+                win = w[:SAMPLE_LEN]
+                g = feature_cnn_output(win, model, bp_w, bp_pad, device).reshape(N_SPEAKERS, N_BANDS)
+                n = wc_only_nr(win, g, Pri, Sec, sub_full, device)
+                nrs.append(n)
+                print(f'  {fn:28s}  {n:+.1f} dB')
+        print('  ' + '-' * 46)
+        print(f'  参考 (2026-08-09): 基线 CNN {min(nrs):+.1f}~{max(nrs):+.1f} | '
+              f'标签(LMS)界 5.2~8.1 | 全1宽带 4.1~7.5 | 目标 5-8 dB')
 
 
 if __name__ == '__main__':
