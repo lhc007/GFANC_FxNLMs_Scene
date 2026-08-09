@@ -317,16 +317,17 @@ int main(int argc, char **argv)
     }
     /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
 
-    /* 2e. FxNLMS — R-58-8: 离线版步长与训练世界解耦 (实测标定).
-       训练 (Pre_training) 用 mu=0.05 + sum 归一化在纯线性 float64 世界收敛;
-       C 端链路含 mic_pre_gain G×tanh 饱和×64tap bp_err, 同样 0.05 会把 Wc
-       从 0.01 推到 0.8 → anti 过量 → 正反馈发散 (G 越大越狠: road-15 G=2.72
-       → -45dB, mixed G=0.21 → -12dB, 发散程度 ∝ G 已验证).
-       实测 step 扫描 (EMBED=0): 0.05→发散, 0.005→-8.4, 0.0005→+16.3,
-       0.00005→+11.1, µ=0→+10.4 — 默认取 0.0005 (收敛最快且稳定).
+    /* 2e. FxNLMS — R-58-10: 步长默认值与修复后链路重新标定.
+       R-58-8 曾在旧链路 (含 es∝G² 双增益 + 梯度相位失配) 下扫描, 0.005 发散、
+       0.0005 最优 — 那是在 bug 链路上的伪标定 (es 被 G² 推到 tanh 饱和, 梯度还错位).
+       R-58-10 修复 (Fx 过 bp_err + es 去双 G) 后重新扫描 (三文件, sum 归一化):
+         step:  0.00005  0.0001  0.0005  0.001  0.002  0.005  0.01
+         mixed: 7.9     8.4     9.2     9.5    9.6    9.8    9.5
+         road-15/0-34: 0.005 稳定且最优 (9.2/9.6)
+       平台区 0.001-0.005, 0.01 回落 — 默认取 0.005 (收敛快且稳定, 裕量 2×).
        GFANC_STEP / GFANC_LEAK 环境变量可覆盖. */
     if (!getenv("GFANC_STEP")) {
-        cfg.step_size = 0.0005f; /* R-58-8: C 端链路稳定步长 (训练 0.05 在此链路发散) */
+        cfg.step_size = 0.005f; /* R-58-10: 修复后链路稳定步长 (0.0005 旧标定已过时) */
     }
     if (!getenv("GFANC_LEAK")) {
         cfg.leak = 5e-7f;        /* 保持弱泄漏 */
@@ -422,6 +423,20 @@ int main(int argc, char **argv)
         bp_err_nr[e].n_taps = BP_ANC_LEN;
         bp_err_nr[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
         bp_err_nr[e].ptr = 0;
+    }
+    /* R-58-10: 梯度 Fx 也过 64tap 带通 (与 err_meas 同路径) — 修复梯度相位失配.
+       err_meas = bp_err(es) 带 31.5 样本群延迟, 若 Fx = Ŝ⊗ref_anc 不过 bp → 梯度与
+       误差错位 31.5 样本 → FxLMS 临界稳定 → Wc 相位慢漂移 → 降噪随时间衰减 (root cause).
+       修复: Fx 过同一 bp_anc → ∂err_meas/∂Wc = bp(Ŝ⊗x) 与 eg 逐样本对齐.
+       注意: 必须 E×S 每条路径一个独立 FIR — 若每 e 共享一个, s=1 的 tick 会用
+       s=0 污染的延迟线 → 第二扬声器的滤波参考被交叉污染 → Wc[1] 梯度错位 → 慢漂移. */
+    fir_filter_t bp_fx[E * S];
+    memset(bp_fx, 0, sizeof(bp_fx));
+    for (int i = 0; i < E * S; i++) {
+        bp_fx[i].coeffs = bp_anc_coeff;
+        bp_fx[i].n_taps = BP_ANC_LEN;
+        bp_fx[i].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
+        bp_fx[i].ptr = 0;
     }
 
     /* ── 4. 离线 ANC (与实时版 main_realtime.c 信号路径一致, 仅 I/O 不同) ── */
@@ -527,6 +542,11 @@ int main(int argc, char **argv)
             for (int e = 0; e < E; e++)
                 for (int s = 0; s < S; s++)
                     Fx_arr[e * S + s] = fir_tick(&sec_firs[e * S + s], ref_filt);
+            /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复时间衰减根因).
+               每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
+            for (int e = 0; e < E; e++)
+                for (int s = 0; s < S; s++)
+                    Fx_arr[e * S + s] = fir_tick(&bp_fx[e * S + s], Fx_arr[e * S + s]);
 
             /* anti_spk = Wc ⊗ x_hist, err_meas = dis + anti_est (合成误差驱动梯度) */
             float anti_spk[S];
@@ -562,7 +582,11 @@ int main(int argc, char **argv)
                 float anti_at_mic = 0;
                 for (int s = 0; s < S; s++)
                     anti_at_mic += fir_tick(&sec_firs_err[e * S + s], anti_spk[s]);
-                float es = (pri_raw + anti_at_mic) * cfg.mic_pre_gain;
+                /* R-58-10: es 不再二次乘 G — pri_raw/anti_at_mic 已含 G (经 ref_anc=bp(G·x)).
+                   原 es=(pri+anti)×G → es∝G² → 有效步长∝G + NR_true 口径 ±20log10(G) 伪影
+                   (G=2.72 road-15: tanh 饱和梯度死亡 → 负 NR; G=0.27 road_0-34: +11.4dB 虚高).
+                   修复后步长/指标与 G 无关, 弱/强文件行为一致. */
+                float es = pri_raw + anti_at_mic;
                 float es_nr = es;   /* R-58 口径修复: NR_true 统计用未截断信号.
                                        tanh 是 ADC 饱和模拟, 非声学失真 — 截断把全带能量折叠进带内,
                                        Wc≈0 (弱信号) 时也报假负 NR. 梯度仍用截断 err_meas (匹配实时版). */
@@ -655,6 +679,7 @@ int main(int argc, char **argv)
     /* ── 6. 清理 ── */
     free(anti_out); free(err_out); free(ref_filt_all); free(ref_anc_all);
     for (int e = 0; e < E; e++) { free(bp_err[e].delay_line); free(bp_err_nr[e].delay_line); }
+    for (int i = 0; i < E * S; i++) free(bp_fx[i].delay_line);
     fxnlms_free(&fx);
     scene_ctrl_free(&sc);
     for (int i = 0; i < E * S; i++) { free(sec_firs[i].delay_line); free(sec_firs_err[i].delay_line); }
