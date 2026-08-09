@@ -47,7 +47,7 @@ cd GFANC_FxNLMs_Scene
 
 ### 2. 导出权重（仅需做过训练后执行）
 
-如果你在 Python 项目 [GFANC_Scene](../GFANC_Scene) 中重新训练了 CNN 模型或子滤波器，需要重新导出为 C 可用的 `.bin` 文件：
+仓库自带训练好的权重，**未训练过的直接跳过本步**。若你重新训练了 CNN 模型或子滤波器，需要重新导出为 C 可用的 `.bin` 文件（训练流程见 [训练管线](#训练管线直接权重-cnn)）：
 
 ```bash
 pip install numpy scipy torch   # 一次性依赖
@@ -154,14 +154,14 @@ Loading weights...
 Input: 16000 Hz, 1 ch, 557256 samples (34.8s)
 Auto-gain: bandpass ref RMS 0.1100 -> mic_pre_gain 0.27 (目标 0.030, 实时版工作点)
 
- Sec |  Band | NR_est | NR_true |    err | refFilt |   anti | Note
--------------------------------------------------------------------------------------
-   1 |     2 |    9.7 |    9.6 | 0.398 | 0.0287 | 0.0161 | INIT [C0/1] [FxRMS=0.0287]
-   2 |     2 |    9.9 |    9.9 | 0.400 | 0.0282 | 0.0160 | - [C0/1]
-   3 |     2 |    9.6 |    9.6 | 0.432 | 0.0323 | 0.0179 | - [C0/1]
+ Sec |               TopBands | NR_est | NR_true |    err | refFilt |   anti | Note
+---------------------------------------------------------------------------------------------------------
+   1 |   2(10%) 17(9%) 14(8%) |    9.7 |    9.6 | 0.398 | 0.0287 | 0.0161 | INIT [C0/1] [FxRMS=0.0287]
+   2 |   2(11%) 17(8%) 14(8%) |    9.9 |    9.9 | 0.400 | 0.0282 | 0.0160 | - [C0/1]
+   3 |   2(10%) 14(9%) 17(8%) |    9.6 |    9.6 | 0.432 | 0.0323 | 0.0179 | - [C0/1]
   ...
-  35 |     0 |    0.0 |    0.0 | 0.000 | 0.0000 | 0.0000 | - [C0/1]
--------------------------------------------------------------------------------------
+  35 |    2(9%) 17(7%) 14(7%) |    0.0 |    0.0 | 0.000 | 0.0000 | 0.0000 | - [C0/1]
+---------------------------------------------------------------------------------------------------------
   Avg |                           |        |    9.6 |
 
 Processing: 14.3s for 34.8s audio (2.4x)
@@ -178,7 +178,7 @@ Done.
 | 列 | 含义 | 举例 |
 |----|------|------|
 | `Sec` | 第几秒 | `1` |
-| `Band` | CNN 直接权重增益的 argmax \|gain\| 带索引（0..29 = 扬声器×子带，仅诊断，不参与 Wc 切换） | `10` |
+| `TopBands` | CNN 30 维直接权重增益中 \|gain\| 占比最高的 3 个子带索引 + 占比（`带(百分比)`，0..29 = 扬声器×子带，仅诊断，不参与 Wc 切换）。占比 = \|gain[i]\|/Σ\|gain[j]\|；全 ~0 时显示 `-`。替代旧单值 argmax（CNN 输出层 bias 使 argmax 常钉死在低频带，单值信息量低） | `2(10%) 17(9%) 14(8%)` |
 | `NR_est` | **估计降噪量**（与实时版同公式，数字越大越好） | `4.6 dB` = 估计压低了 4.6 分贝 |
 | `NR_true` | **已知真值降噪量**（仅离线可用，Pri 模型精确计算扰动，最可信） | `4.4 dB` |
 | `err` / `refFilt` / `anti` | 残差 / 带通参考 / 反噪声 RMS | |
@@ -186,6 +186,71 @@ Done.
 
 - **NR_true 是最可信的指标**（离线用 Pri 模型精确算出扰动，NR_est 与它逐秒偏差 <0.5dB）；10 dB 意味着噪声能量降到 1/10，20 dB 意味着降到 1/100
 - 注意：**离线默认 `GFANC_EMBED_DELAY_MS=0`**（R-58-8：训练世界无此延迟，3ms 会造成 anti 相位错位 48 样本 → 自适应发散）。启动日志打印净预览时间（基线 ≈ −1.9ms：64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
+
+
+## 训练管线（直接权重 CNN）
+
+> 只想用现成权重跑系统，见 [快速开始](#快速开始)；本节是**训练/更换自己的模型**。训练完成后回到[快速开始 步骤 2](#2-导出权重仅需做过训练后执行) 导出。
+
+直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
+
+### 数据与标签
+
+- 数据源：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）
+- 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
+- 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]），由 `label_real_noise.py` 用**实测声学路径 + 子滤波器基**生成 —— 正是直接权重 CNN 的回归目标
+- 合成数据（可选增强）：`make_synthetic_dataset.py` 生成 4 族多样谱形（窄带/宽带/1-f^α/谐波，20-1500Hz 全子带覆盖）后走**同一套 LMS 管线**标成 `gain_*`。**治 CNN 输入失聪**——真实 4 类全低频主导、谱形接近，从零训练输出坍缩到同一低频处方（判别力 35.8% vs 输入谱 75%），合成数据逼 CNN 学输入再低 LR 微调
+- **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
+
+### 命令顺序
+
+```bash
+# 0) 一次性依赖
+pip install numpy scipy pandas torch torchaudio
+
+# 1) 生成子滤波器（宽带 FxNLMS 训练主滤波器 → sqrt-Hann DFT 分解为 15 个子带）
+cd GFANC_Scene
+python training/control_filters/Pre_training_broadband_and_decompose.py
+#    → models/MIMO_Pretrained_Control_filters_broadband.mat
+#      仅当子滤波器基变更时才需重跑（声学路径/分解参数更换后）
+
+# 2) 重标标签（只重标已有 WAV，不重切）
+python training/labeling/label_real_noise.py
+#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
+#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
+
+# 2b) 合成数据生成 + 打标签（可选增强，治 CNN 输入失聪；默认 60000/7500/7500，打标签 ~5.5h）
+python training/labeling/make_synthetic_dataset.py
+#    → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\*.wav
+#      + Index_synth_{split}_data.csv + Gains_synth_{split}_data.npy（LMS_MU=0.001, LMS_REPET=3）
+#      --gen-only 只生成；--label-only 只打标签（重跑不用再生成）
+
+# 3) 两阶段训练直接权重 CNN（合成预训练 → 真实微调，低 LR 防坍缩回）
+python training/network/Train_validate_synth.py
+#    → models/MIMO_M5_DirectWeight_Pretrain.pth（合成预训练，保留）
+#      + models/MIMO_M5_DirectWeight_Real.pth（真实微调后，export 自动加载）
+#      纯真实训练仍可用：python training/network/Train_validate.py
+
+# 4) 评估（可选：测试集整向量 cos / 逐扬声器 cos / MSE）
+python training/network/evaluate.py
+
+# 4b) 判别力验证（可选：Checkpoint 3 —— CNN 输出最近均值分类，治失聪目标 ≥70%）
+python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
+#      基线对照：--model models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth（应复现 ≈35.8%）
+
+# 5) 导出 C 二进制（自动检测直接权重模型）
+cd ..
+python export/export_bin.py
+#    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
+```
+
+### 说明
+
+- **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
+- **何时必须重标（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——`label_real_noise.py` 的 `USE_LOG_SPACING` 须为 `False`。
+- **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
+- **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
+- **合成数据管线**：`make_synthetic_dataset.py` 统一负责生成+打标签（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成样本全走该管线标成 `gain_*`）。两阶段训练 `Train_validate_synth.py`：合成预训练逼 CNN 学「输入谱→增益」多样映射，再低 LR 真实微调适配真实统计量、防坍缩回低频处方。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入，目标从 35.8% 提到 ≥70%
 
 ## 项目结构
 
@@ -503,55 +568,6 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `export/measure_primary.py` | Python 初级路径测量 |
 | `export/measurement/` | 测量核心模块 (扫频生成/反卷积/质量检验) |
 | `GFANC_Scene/` | Python 项目 (训练代码 + 模型权重 + 声学路径测量数据) |
-
-## 训练管线（直接权重 CNN）
-
-直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
-
-### 数据与标签
-
-- 数据源：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）
-- 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
-- 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]），由 `label_real_noise.py` 用**实测声学路径 + 子滤波器基**生成 —— 正是直接权重 CNN 的回归目标
-- **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
-
-### 命令顺序
-
-```bash
-# 0) 一次性依赖
-pip install numpy scipy pandas torch torchaudio
-
-# 1) 生成子滤波器（宽带 FxNLMS 训练主滤波器 → sqrt-Hann DFT 分解为 15 个子带）
-cd GFANC_Scene
-python training/control_filters/Pre_training_broadband_and_decompose.py
-#    → models/MIMO_Pretrained_Control_filters_broadband.mat
-#      仅当子滤波器基变更时才需重跑（声学路径/分解参数更换后）
-
-# 2) 重标标签（只重标已有 WAV，不重切）
-python training/labeling/label_real_noise.py
-#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
-#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
-
-# 3) 训练直接权重 CNN（m5_scene → 30 维回归头，tanh + MSE）
-python training/network/Train_validate.py
-#    → GFANC_Scene/models/MIMO_M5_DirectWeight_Real.pth
-
-# 4) 评估（可选：测试集整向量 cos / 逐扬声器 cos / MSE）
-python training/network/evaluate.py
-
-# 5) 导出 C 二进制（自动检测直接权重模型）
-cd ..
-python export/export_bin.py
-#    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
-```
-
-### 说明
-
-- **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
-- **何时必须重标（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——`label_real_noise.py` 的 `USE_LOG_SPACING` 须为 `False`。
-- **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
-- **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
-- **合成数据仅作可选增强**：MIMO 的 `band_*` 标签（0/1 频带激活）语义与直接权重不同，不能直接用来训练；若要加频谱覆盖，合成样本必须走自己的标注管线重新标成 `gain_*` 再混入。
 
 ## 离线验证
 

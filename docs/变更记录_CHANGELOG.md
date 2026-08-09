@@ -31,6 +31,45 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-09] 合成数据生成+打标签管线 & 两阶段训练（合成预训练→真实微调）— 治 CNN 输入失聪
+
+- **状态**: 工作区未提交
+- **基线**: 5266e9f（fix: 实时版同步梯度相位修复 R-58-11）
+- **变更代码**:
+  - 新增: `GFANC_Scene/training/labeling/make_synthetic_dataset.py` — 合成数据生成+打标签入口：4 族信号（窄带 0.40 / 宽带 0.30 / 1-f^α 倾斜 0.15 / 谐波 0.15）覆盖 20-1500Hz 全子带谱形，走 LMS 标成 `gain_*`；CLI `--gen-only`/`--label-only`/`--probe`，默认 60000/7500/7500
+  - 新增: `GFANC_Scene/training/network/Train_validate_synth.py` — 两阶段训练：合成预训练 40ep（LR 0.01）→ 真实微调 25ep（LR 0.003）；复用 m5_scene+带通+minmax+MSE+Adam+StepLR；输出仍写 `models/MIMO_M5_DirectWeight_Real.pth`（export 自动加载，部署路径不变）。**关键修复 `cos_max=-inf`**：回归训练首轮 valid_cos 可能为负，从 0 起则永不如 0 → 一个检查点都不存 → 重载崩溃（冒烟测试捕获）
+  - 重写: `GFANC_Scene/training/network/verify_discrimination.py` — Checkpoint 3 判别力验证，复现原始最近均值协议（7 基准录音 → 148 逐秒窗口 → 6 类；指标 = 最近均值分类准确率 + 类型内/间 cos 间隙），附排除 mixed 的 5 类变体
+  - 新增: `models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth` — 训练前基线模型备份（判别力对照用）
+  - 修改: `README.md` — 数据与标签/命令顺序/说明补合成数据管线（2b 生成+打标签、步骤 3 两阶段训练、4b 判别力验证）；`docs/变更记录_CHANGELOG.md` — 本条记录
+- **变更原因**: 2026-08-09 诊断确认 CNN「输入失聪」——输出增益判别力仅 35.8%，而输入谱可分 75.0%、真实标签 76.7%（带通后探针 gap=+0.036 证明输入含全部区分信息，瓶颈在模型）。根因：真实 4 类（道路/儿童/施工/铁路）全低频主导、谱形接近，从零在真实数据训练 → 输出坍缩到同一低频处方。合成数据用多样谱形逼 CNN 必须用输入，再低 LR 微调适配真实统计量、防坍缩回
+- **造成影响**:
+  - 行为: 训练产物路径不变，`export_bin.py` 自动加载 → 部署流程零改动。**当前 CNN 行为未变**（重训+重导出前仍是旧模型）
+  - 配置: 无新增（全部 CLI 默认；`LMS_MU=0.001`、`FX_NOISE_DB=-30`、`LMS_REPET=3`、`BATCH_SIZE=128`）
+  - 测试/回归: 训练脚本冒烟通过（1 epoch 预训练，cos_max bug 已修复）；判别力脚本基线复现（CNN 输出 37.2%≈35.8%、输入谱 gap +0.036 精确、真实标签 80%≈76.7%）
+  - 性能/内存: 打标签 ~5.5h（60000×Repet=3，GPU）、训练 ~3.5h（40+25ep）、合成数据集磁盘 ~6GB（`D:\Dataset\Synthetic_Dataset`）
+  - 未验证项: **Checkpoint 3 判别力（目标 ≥70%）待训练完成后验证**；重导出 .bin 后离线 NR 是否提升待实测；合成数据对实时降噪的实际增益待硬件验证
+- **验证方式**: 打标签 `make_synthetic_dataset.py --label-only`；训练 `Train_validate_synth.py`；验证 `verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth`（基线对照传 `--model ..._baseline_35pct.pth` 应复现 37.2%）
+- **回退方式**: 不重训/不重导出即无行为影响；删 `D:\Dataset\Synthetic_Dataset` 即移除数据；仍可走纯真实训练 `Train_validate.py`
+
+### [2026-08-09] Band 日志改 TopBands — 诊断输出 top-3 子带占比替代 argmax 单值
+
+- **状态**: 工作区未提交
+- **基线**: 5266e9f（fix: 离线降噪发散根因修复 R-58-7/8/9 — 路径统一 + EMBED/步长默认 + 归一化分离）
+- **变更代码**:
+  - 新增: `include/scene_manager.h` — 纯函数 `sm_fmt_top_gains()`：计算 30 维直接权重增益中 |gain| 占比最高的 3 个子带，格式 `2(10%) 17(9%) 14(8%)`（占比 = |gain[i]|/Σ|gain[j]|，全 ~0 时 `-`）
+  - 修改: `main.c` — 表格列 `Band`→`TopBands`（列宽 5→22），行打印用 `sm_fmt_top_gains(gains, K, ...)`；删除不再使用的 `new_scene` 局部变量
+  - 修改: `main_realtime.c` — `print_diagnostics` 的 `s=%d max=%.2f`→`top=%s`；INIT 单次打印 `scene=%d max=%.2f`→`top=%s`；`new_scene` 参数保留但标记 `(void)`（CSV 机器日志仍直接用，未动）
+  - 修改: `README.md` — 输出示例与列含义表同步 TopBands
+- **变更原因**: 诊断列 argmax 单值信息量低 — CNN 输出层 bias[2]=+0.970 恒占优使 argmax 常钉死在低频带 2（用户疑问"Band 为什么一直是 2"），但真实信息在整套增益向量分布。top-3 占比同时看到"哪个带最重"和"各带如何分配"（road_noise 稳定 top=2；mixed 场景 top-1 翻到 14、出现 band 6，证明 CNN 输入自适应）
+- **造成影响**:
+  - 行为: 仅控制台/离线表格诊断输出格式变化（Band 单值 → TopBands 三值+占比）；ANC 处理逻辑与 Wc 构造**零改动**。实时版 CSV 机器日志列序/语义不变
+  - 配置: 无
+  - 测试/回归: 离线 road_noise_0-34 +9.6dB / mixed_7types_56s +9.8dB 与基线一致；两二进制零警告编译通过
+  - 性能/内存: `sm_fmt_top_gains` 每行 O(K=30) 一次, 可忽略
+  - 未验证项: 实时版输出需硬件上电肉眼确认
+- **验证方式**: `gcc` 零警告编译 main.exe + gfanc_realtime.exe；离线跑 `Noise Examples/road_noise_0-34.wav` 与 `mixed_7types_56s.wav`，NR 与 R-58-10 基线一致
+- **回退方式**: 恢复 `git checkout 5266e9f -- main.c main_realtime.c include/scene_manager.h README.md`
+
 ### [2026-08-09] 实时版同步梯度相位修复 R-58-11 — Fx 过 bp_anc（落地 R-58-10 未验证项①）
 
 - **状态**: 已提交（2026-08-09, commit: fix: 实时版同步梯度相位修复 R-58-11 — Fx 过 bp_anc）
