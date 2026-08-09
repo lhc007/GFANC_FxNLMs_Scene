@@ -609,12 +609,15 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
                               const float *gains) {
     char nr_str[20];
+    char topbuf[64];
+    (void)new_scene;  /* 仍在 CSV 机器日志使用 (见调用点) */
     if (ctx->diverged)
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
-    printf("[CNN] s=%d max=%.2f cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
-           new_scene, gains[new_scene], cos_sim,
+    sm_fmt_top_gains(gains, ctx->sc.K, topbuf, sizeof(topbuf));
+    printf("[CNN] top=%s cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
+           topbuf, cos_sim,
            ctx->ocg.active, ctx->ocg.n_clusters,
            nr_str, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
@@ -1182,8 +1185,10 @@ int main(void) {
             InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * init_ramp_ms / 1000));
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);  /* 冷启动 anti 限幅 */
-            printf("[CNN] INIT scene=%d max=%.2f (ramp %dms, mute_hold %dms)\n",
-                   new_scene, gains[new_scene], init_ramp_ms, cfg.mute_hold_ms);
+            char topbuf[64];
+            sm_fmt_top_gains(gains, K, topbuf, sizeof(topbuf));
+            printf("[CNN] INIT top=%s (ramp %dms, mute_hold %dms)\n",
+                   topbuf, init_ramp_ms, cfg.mute_hold_ms);
             /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */
             if (!getenv("GFANC_MIC_GAIN")) {
                 /* 自动增益标定: 目标 ref≈0.03 (-30dBFS), 上限 5×.

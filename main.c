@@ -469,9 +469,9 @@ int main(int argc, char **argv)
     /* 跨秒持久状态 */
     float err_meas[E] = {0};
 
-    printf("\n%4s | %5s | %6s | %6s | %6s | %7s | %6s | %s\n",
-           "Sec", "Band", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
-    for (int i = 0; i < 85; i++) printf("-");
+    printf("\n%4s | %22s | %6s | %6s | %6s | %7s | %6s | %s\n",
+           "Sec", "TopBands", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
+    for (int i = 0; i < 105; i++) printf("-");
     printf("\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
@@ -481,12 +481,10 @@ int main(int argc, char **argv)
         /* 4a. CNN 直接权重 Wc 构造 (每秒) */
         float gains[SC_DW_MAX];
         int K = sc.K;
-        int new_scene;
         if (len == chunk)
-            new_scene = scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
+            scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
         else {
             memcpy(gains, sc.prev_gains, K * sizeof(float));
-            new_scene = 0;
         }
 
         /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) */
@@ -649,8 +647,10 @@ int main(int argc, char **argv)
         if (diverged) snprintf(nr_est_str, sizeof(nr_est_str), "DIV!");
         else          snprintf(nr_est_str, sizeof(nr_est_str), "%.1f", nr_est);
         snprintf(nr_true_str, sizeof(nr_true_str), "%.1f", nr_true);
-        printf("%4d | %5d | %6s | %6s | %5.3f | %6.4f | %5.4f | %s",
-               sec + 1, new_scene, nr_est_str, nr_true_str,
+        char topbuf[64];
+        sm_fmt_top_gains(gains, K, topbuf, sizeof(topbuf));
+        printf("%4d | %22s | %6s | %6s | %5.3f | %6.4f | %5.4f | %s",
+               sec + 1, topbuf, nr_est_str, nr_true_str,
                err_rms, ref_rms, anti_rms, action);
         if (cfg.ocg_enable) printf(" [C%d/%d]", ocg.active, ocg.n_clusters);
         if (sec == 0) printf(" [FxRMS=%.4f]", sqrtf(acc_ref / len));
