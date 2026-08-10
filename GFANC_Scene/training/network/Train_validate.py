@@ -15,7 +15,7 @@ CNN 直接权重回归训练入口 (MIMO_GFANC Train_validate.py 适配版).
 
 输出: models/MIMO_M5_DirectWeight_Real.pth (export_bin.py 自动优先加载)
 """
-import sys, os
+import sys, os, time
 from pathlib import Path
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +48,9 @@ LR_GAMMA = 0.5
 # ≠ 增益方向改变" → 治部署端每秒独立 minmax 的 denom 漂移导致的实机抖动.
 # None=不增强; 验证/评估不走增强 (选模公平). 若验证 cos 明显下降, 收窄范围.
 GAIN_RANGE = (0.5, 2.0)
+# 进度打印 (2026-08-10): 一轮有 254 batch, 脚本原本一轮才打印一次, 中途无输出
+# 会让用户误以为卡住. 每 LOG_EVERY 个 batch 打印一次 loss.
+LOG_EVERY = 50
 
 # 数据路径 — 与 label_real_noise.py / recluster_real.py 输出一致
 DATA_DIR      = r'D:\Dataset\Real_world_Dataset'
@@ -119,7 +122,8 @@ def train_single_epoch(model, data_loader, loss_fn, optimizer, device, scaler=No
     train_cos_spk = [0.0, 0.0]
     model.train()
 
-    for input, target in data_loader:
+    n_batch = len(data_loader)
+    for bi, (input, target) in enumerate(data_loader):
         input, target = input.to(device, non_blocking=True), target.to(device, non_blocking=True)
         input = prepare_batch(input, gain_range=GAIN_RANGE)
 
@@ -139,10 +143,15 @@ def train_single_epoch(model, data_loader, loss_fn, optimizer, device, scaler=No
             optimizer.step()
 
         # 记录损失与余弦相似度
-        train_loss += loss.item() * input.size(0)
+        batch_loss = loss.item()
+        train_loss += batch_loss * input.size(0)
         train_cos += batch_cosine_sim(prediction, target)
         for spk in range(N_SPEAKERS):
             train_cos_spk[spk] += batch_cosine_sim_spk(prediction, target, spk)
+
+        # 进度: 每 LOG_EVERY 个 batch 打印一次 (flush 即时刷新)
+        if (bi + 1) % LOG_EVERY == 0 or (bi + 1) == n_batch:
+            print(f'    [train {bi+1}/{n_batch}] loss={batch_loss:.4f}', flush=True)
 
     n = len(data_loader)
     avg_loss = train_loss / len(data_loader.dataset)
@@ -159,17 +168,23 @@ def validate_single_epoch(model, data_loader, loss_fn, device):
     eval_cos_spk = [0.0, 0.0]
     model.eval()
 
+    n_batch = len(data_loader)
     with torch.no_grad():
-        for input, target in data_loader:
+        for bi, (input, target) in enumerate(data_loader):
             input, target = input.to(device, non_blocking=True), target.to(device, non_blocking=True)
             input = prepare_batch(input)
             prediction = torch.tanh(model(input))
             loss = loss_fn(prediction, target)
 
-            eval_loss += loss.item() * input.size(0)
+            batch_loss = loss.item()
+            eval_loss += batch_loss * input.size(0)
             eval_cos += batch_cosine_sim(prediction, target)
             for spk in range(N_SPEAKERS):
                 eval_cos_spk[spk] += batch_cosine_sim_spk(prediction, target, spk)
+
+            # 进度: 每 LOG_EVERY 个 batch 打印一次 (flush 即时刷新)
+            if (bi + 1) % LOG_EVERY == 0 or (bi + 1) == n_batch:
+                print(f'    [valid {bi+1}/{n_batch}] loss={batch_loss:.4f}', flush=True)
 
     n = len(data_loader)
     avg_loss = eval_loss / len(data_loader.dataset)
@@ -196,6 +211,7 @@ def train(model, train_loader, valid_loader, epochs, device, model_path=None, us
     validate_loss_epochs = []
 
     for i in range(epochs):
+        t0 = time.time()
         print(f"\n第 {i+1}/{epochs} 轮")
         print(f"学习率: {optimizer.param_groups[0]['lr']:.6f}")
 
@@ -220,6 +236,7 @@ def train(model, train_loader, valid_loader, epochs, device, model_path=None, us
                       f"(valid cos={cos_max:.4f})" + bcolors.ENDC)
         else:
             print(f"  最佳 cos 仍为 {cos_max:.4f}{marker}")
+        print(f"  本轮用时 {time.time()-t0:.0f}s")
         print("-" * 40)
 
     print(f"\n训练完成, 最佳验证 cos={cos_max:.4f}")

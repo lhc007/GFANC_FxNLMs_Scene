@@ -105,10 +105,14 @@ class MyNoiseDataset(Dataset):
         augment:   True=训练集增强, False=验证集 (干净, 与部署条件一致)
     """
 
-    def __init__(self, csv_path, wav_dir, augment=False):
+    def __init__(self, csv_path, wav_dir, augment=False, use_cache=True):
         df = pd.read_csv(csv_path)
         self.wav_dir = wav_dir
         self.augment = augment
+        self.use_cache = use_cache
+        # wav 内存缓存 (2026-08-10): 每 epoch 重新读盘 6.3 万 wav 是训练瓶颈
+        # (num_workers=0 串行加载, GPU 空等). 懒加载后常驻内存, epoch 间零读盘.
+        self._cache = {} if use_cache else None
         self._file_path_col = df['File_path'].values
         self.categories = df['category'].values
         gain_cols = [c for c in df.columns if c.startswith('gain_')]
@@ -124,8 +128,21 @@ class MyNoiseDataset(Dataset):
     def __len__(self):
         return len(self._file_path_col)
 
+    def _get_signal(self, index):
+        """取波形; 缓存开启时懒加载并常驻内存 (epoch 间零读盘, 提速数据加载).
+        训练集 6.3 万样本 float32 ≈ 4GB (实测 32GB 内存, 安全)."""
+        if self._cache is None:
+            return _load_signal(self.wav_dir, self._file_path_col[index])
+        fp = self._file_path_col[index]
+        sig = self._cache.get(fp)
+        if sig is None:
+            sig = _load_signal(self.wav_dir, fp)
+            self._cache[fp] = sig
+        return sig
+
     def __getitem__(self, index):
-        signal = _load_signal(self.wav_dir, self._file_path_col[index])
+        signal = self._get_signal(index)
+        signal = signal.clone()          # 拷贝, 防止增强/外部 in-place 修改污染缓存
         if self.augment:
             signal = _augment(signal)
         label = self._labels[index]
