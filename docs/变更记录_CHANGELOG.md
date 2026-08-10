@@ -31,6 +31,27 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-10] 两阶段训练后验证 — Wc-only 5-8dB 达成（C 端 RMS 标定是关键），v2 与 baseline 增益/降噪几乎无差别
+
+- **状态**: 已提交 97b3eb8（feat: 两阶段训练后验证 — Wc-only NR 对齐 C 端 RMS 标定, v2 达成 5-8dB）
+- **基线**: e389483（feat: verify_discrimination.py 加 Wc-only NR 实测）
+- **变更代码**:
+  - 修改: `training/network/verify_discrimination.py` — Wc-only NR 对齐 C 运行时 RMS 标定（`scene_ctrl_construct_wc` 的 `Wc *= stub_rms/wc_rms`）。此前测的是未标定裸 Wc，低估约 3.3 dB，造成"CNN Wc 比全 1 滤波器差"的误判
+  - 新增: `models/MIMO_M5_DirectWeight_Real_v2.pth` — 两阶段训练产物（部署候选，未部署）；`models/MIMO_M5_DirectWeight_Pretrain.pth` — 合成预训练中间检查点
+- **变更原因**: Checkpoint 3 目标（Wc-only 5-8 dB + 判别力≥70%）训练后验证。两个关键事实：① "Wc-only 只有 2.5-4.1 dB"是度量伪影——C 端每秒做 RMS 标定，Python 侧此前未对齐；② 对齐后**两模型都达成目标，且输出几乎相同**
+- **造成影响**:
+  - 行为: 无运行时行为变化（verify 脚本度量口径修正；部署模型 `MIMO_M5_DirectWeight_Real.pth` 未更换，仍与 baseline 一致）
+  - 测试/回归（全文件逐窗 7 文件 148 窗）:
+    - v2 标定后 Wc-only NR 全体 +6.54±1.04 dB（首窗 5.0-7.9）→ **Checkpoint 3 目标 5-8 达成**
+    - base 标定后同样 +6.54±1.07 dB（首窗 4.9-8.0）；逐窗配对差 v2−base = **−0.007±0.160 dB → 训练对 Wc-only 降噪提升≈0**
+    - 增益 cos(base,v2)=0.997（148 窗），每带幅值差≤0.02 → 两模型输出几乎相同
+    - cos(base,label)=cos(v2,label)=0.86-0.99 → 两模型增益方向都近 LMS 最优；标签本身跨类型近共线 → 这批基准文件增益空间近似一维，CNN 学到的都是同一平均方向
+    - 判别力 37.2→42.6%（排除 mixed 52.2→64.1%），但两模型增益空间对类型都不可分（类型内≈类型间 cos 0.98）→ 判别力提升是近共线空间的小角度偏移，弱信号，非"输入失聪修复"
+  - 性能/内存: 无
+  - 未验证项: ① v2 部署（copy→export_bin→rebuild→离线全系统回归）未做，需用户确认；② 合成数据对未见过噪声类型的鲁棒性收益（判别力提升的实际价值场景）未硬件验证
+- **验证方式**: `diag_fulllen_nr.py` 全文件逐窗配对对比（148 窗，差≈0）；`verify_discrimination.py` 判别力（base 复现 37.2%）；`diag_both.py` cos 到标签（两模型均 0.86-0.99）
+- **回退方式**: verify 脚本 `git checkout`；v2/Pretrain 模型删除即无影响（部署模型未动）
+
 ### [2026-08-09] 合成数据生成+打标签管线 & 两阶段训练（合成预训练→真实微调）— 治 CNN 输入失聪
 
 - **状态**: 工作区未提交
