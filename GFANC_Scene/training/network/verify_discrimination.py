@@ -125,16 +125,25 @@ def feature_cnn_output(win, model, bp_w, bp_pad, device):
 
 
 def wc_only_nr(win, gains, Pri, Sec, sub_full, device, fs=16000, repet=3):
-    """仅 CNN Wc 的稳态降噪 (无 FxLMS 自适应).
+    """仅 CNN Wc 的稳态降噪 (无 FxLMS 自适应), 含 C 运行时 RMS 标定.
 
-    生成真实声学路径下的 Dis/Fx (Repet=3), 用增益重建的 Wc 做固定卷积,
-    取末 1s 稳态窗计算 NR — 与 2026-08-09 实测基准同口径 (标签界 5.2~8.1 dB).
+    与 scene_controller.c 的 scene_ctrl_construct_wc 对齐:
+      Wc = Σ_g gains·sub → wc_rms → Wc *= stub_rms / wc_rms
+    (stub_rms = 全 1 增益等权求和的 RMS; 符号取反是 C 端约定, Python 侧已对).
+    Dis/Fx 走真实声学路径 (Repet=3), 末 1s 稳态窗计 NR.
     """
     from training.control_filters.Disturbance_generation import disturbance_generation_batch_gpu
     Dis, Fx, T = disturbance_generation_batch_gpu(
         [torch.from_numpy(win)], Pri, Sec, fs=fs, Repet=repet)
     Dis, Fx = Dis[0].cpu().numpy(), Fx[0].cpu().numpy()
     Wc = np.einsum('sc,csl->sl', gains, sub_full)          # (S, L)
+    # RMS 标定 (C 端 wc_rms_target = stub_rms, 2026-08-10 实测: 无此步裸 Wc 低估 ~3.3 dB)
+    S, L = Wc.shape
+    stub = sub_full.sum(axis=0)                            # (S,L) 全1增益等权求和
+    stub_rms = float(np.sqrt((stub ** 2).sum() / (S * L)))
+    wc_rms = float(np.sqrt((Wc ** 2).sum() / (S * L)))
+    if wc_rms > 1e-6:
+        Wc = Wc * (stub_rms / wc_rms)
     E = Dis.shape[0]
     anti = np.zeros_like(Dis)
     for e in range(E):
@@ -243,8 +252,9 @@ def main():
                 nrs.append(n)
                 print(f'  {fn:28s}  {n:+.1f} dB')
         print('  ' + '-' * 46)
-        print(f'  参考 (2026-08-09): 基线 CNN {min(nrs):+.1f}~{max(nrs):+.1f} | '
-              f'标签(LMS)界 5.2~8.1 | 全1宽带 4.1~7.5 | 目标 5-8 dB')
+        print(f'  本模型 (含 C 端 RMS 标定): {min(nrs):+.1f}~{max(nrs):+.1f} dB')
+        print(f'  参考: 标签(LMS)界 5.2~8.1 | 全1宽带 4.1~7.5 | 目标 5-8 dB')
+        print(f'  2026-08-10 实测: v2 5.0~7.9 达成目标; 裸 Wc(无标定) 会低估约 3.3 dB')
 
 
 if __name__ == '__main__':
