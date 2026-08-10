@@ -31,7 +31,23 @@
 
 ## 记录列表（最新在上）
 
-### [2026-08-10] 两阶段训练后验证 — Wc-only 5-8dB 达成（C 端 RMS 标定是关键），v2 与 baseline 增益/降噪几乎无差别
+### [2026-08-10] 实机验证闭环: reset 闸门灵敏度 0.8→0.6 + OCG 默认关 + safety_mute 判据修正 + 重校准数据入库
+- **状态**: 已提交 <此提交>
+- **基线**: bf52a2e
+- **变更代码**:
+  - 修改: `include/gfanc_types.h` — `switch_threshold` 默认 0.8→**0.6**；`ocg_enable` 默认 1→**0**（OCG 需 `GFANC_OCG=1` 显式开启）
+  - 修改: `main_realtime.c` — `safety_mute` 判据 err_rms>2×ref 改 **8×ref + anti_rms>0.05 门**（防 rig 结构性误杀）
+  - 修改: `data/secondary_path_measured.bin`、`data/sec_bulk_delay.bin`、`data/feedback_path_s0/s1.bin` — v4 校准程序重测入库
+  - 修改: `docs/GFANC_综合审查报告_合并版.md` — 补离线 NR 天花板=次级路径低频滚降的分析与路线图项
+- **变更原因**: 实机纯音/路噪验证中, 默认 reset 闸门(0.80)在深对消时误杀健康 Wc(cos 自然跌破 0.8) → 每 ~1000cb 震荡循环; OCG 聚类在 cos 0.99-1.00 也抖动触发, 且 τ 复用 switch_threshold, 降 0.6 反而加剧 → 验证有效配置为 **OCG 关 + THRESH 0.6**。safety_mute 旧 2× 判据对 err/ref≈7-9 的 rig 结构性误杀(anti 仅 0.01 时无反馈可护, err 跳变全为路噪)。
+- **造成影响**:
+  - 行为: 默认配置下 reset 仅在 cos<0.6 触发(场景真正切换), 深对消不再被误打断; safety_mute 仅在 err>8×ref 且 anti>0.05 时冻结(anti 极小时物理不可能啸叫)
+  - 配置: `GFANC_RESET_THRESH` 默认语义 0.8→0.6；`GFANC_OCG` 默认关
+  - 测试/回归: 实机 250Hz/500Hz 纯音深对消 err 0.10→0.015-0.018 (~17dB) 并保持 40s+ 零 RESET; 路噪稳态 err/ref≈0.30 (~10dB) 持续 2 分钟零发散; 新默认=验证有效配置
+  - 性能/内存: 无
+  - 未验证项: 500Hz 收敛较慢(CNN 增益与 LMS 最优对齐差, 属架构特性非 bug); OCG 关闭后场景切换场景(scene change)回归未测
+- **验证方式**: 实机 GFANC_SEC_FILE=secondary_path_measured.bin + 新默认(无 RESET_THRESH/OCG 环境变量), 250Hz/500Hz 纯音 + 路噪 WAV 各跑 ~90s, 检查 err/anti/RESET/NOTCH
+- **回退方式**: `GFANC_RESET_THRESH=0.8` + `GFANC_OCG=1` 环境变量还原旧行为; 或 git revert 本提交
 
 - **状态**: 已提交 97b3eb8（feat: 两阶段训练后验证 — Wc-only NR 对齐 C 端 RMS 标定, v2 达成 5-8dB）
 - **基线**: e389483（feat: verify_discrimination.py 加 Wc-only NR 实测）

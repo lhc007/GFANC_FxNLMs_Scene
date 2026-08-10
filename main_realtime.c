@@ -502,7 +502,11 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             /* R-56: NR<0 确保只有真正恶化时才判定发散 (NR>0 说明仍在降噪,
                pa>>pe 只是小误差导致的高比值, 不是 Wc 膨胀) */
             ctx->diverged = (pa > 9.0f * pe && ctx->anti_rms > 0.05f && ctx->nr_level < 0.0f);
-            ctx->safety_mute = (ctx->err_rms > ctx->ref_rms * 2.0f
+            /* 2026-08-10 实机调试: 2× 阈值对 err/ref≈7-9 的 rig 结构性误杀 —
+               anti 仅 0.01 时无反馈可护, err 跳变全是路噪, 该消不该冻.
+               改 8× + anti_rms>0.05 门 (anti 极小时物理上不可能啸叫). */
+            ctx->safety_mute = (ctx->err_rms > ctx->ref_rms * 8.0f
+                                && ctx->anti_rms > 0.05f
                                 && ctx->ref_rms > 0.001f
                                 && ctx->mute_hold <= 0);
             ctx->acc_ref = ctx->acc_err = ctx->acc_fb = 0;

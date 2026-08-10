@@ -116,7 +116,10 @@ typedef struct {
     0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
                            Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
-    30.0f, 0.8f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db */ \
+    30.0f, 0.6f, 3.0f, /* freeze_ratio, switch_threshold, nr_converge_db.
+                           switch_threshold 0.8→0.6 (2026-08-10): 实机纯音验证中
+                           0.80 在深对消时误杀健康 Wc(cos 自然跌破 0.8)导致每 ~1000cb 震荡;
+                           0.6 下 250/500Hz 深对消均稳住, 零 RESET */ \
     60,                 /* freeze_retry_sec */ \
     0.25f,              /* diverge_anti_rms */ \
     12.0f, 4, 8, 0.96f, /* hw_thresh_db(12), hw_persist, hw_release, hw_notch_r */ \
@@ -128,7 +131,11 @@ typedef struct {
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
-    1, 0.1f, 8,         /* ocg_enable, ocg_alpha, ocg_max_clusters (OCG 聚类闸门) */ \
+    0, 0.1f, 8,         /* ocg_enable, ocg_alpha, ocg_max_clusters (OCG 聚类闸门).
+                           ocg_enable 1→0 (2026-08-10): 纯音深对消下 OCG 簇抖动
+                           (cos 0.99-1.00 也触发) 与 τ 复用 switch_threshold 的耦合
+                           都加剧 reset 误杀; 验证有效配置 = OCG 关 + THRESH 0.6,
+                           需 OCGFANC_OCG=1 显式开启 */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
