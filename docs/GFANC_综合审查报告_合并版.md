@@ -115,7 +115,7 @@
 - **修复状态**：🔵 需自动出厂标定。
 
 【ADV-E2 次级路径离线训练无法在线更新 · 严重 · [量产]】
-- **修复状态**：🔵 在线 Ŝ 辨识已加（sec_online）；全自动仍待。
+- **修复状态**：🔵 在线 Ŝ 辨识已加（sec_online）；**2026-08-10 链路验证：接线/实现正确，但存在无探针噪声的辨识偏差风险（FxLMS 收敛后残差与 anti 结构性相关 → 估计有偏，完全对消时 Ŝ 漂向 0 → Fx→0 → Wc 梯度冻结）→ 默认保持 `sec_online_mu=0`，启用需硬件协议**（详见第七节 2026-08-10 记录）。
 
 【ADV-E3 依赖特定 CNN 权重 · 严重 · [量产]】
 - **修复状态**：🔵 换硬件需重训。
@@ -214,6 +214,7 @@
 | P1 | 低频反馈 B-1 | ❌ 可行性否定（2026-08-06）：PC 稳定带 20-30Hz 无噪声能量，上界 +0.1dB；**移到嵌入式**（2ms→20-200Hz→+3-4dB） |
 | P2 | 4 扬声器扩展时 E 同步扩 + 重调 μ（R-30） | ⏳ 硬件+训练 |
 | P2 | 训练侧：K 扩展/置信度/bp256 子滤波器 | 🟠 Python 侧 |
+| P2 | 在线 Ŝ 辨识启用验证（ADV-E2）：探针噪声 或 扰动低时门控辨识 + Ŝ sanity 检查 | ⏳ 待硬件（2026-08-10 链路已验证，风险=辨识偏差） |
 
 ---
 
@@ -248,6 +249,13 @@
 - **ADV-F3 回调 WCET 监控**：新增 `GFANC_WCET` 门控的 rdtsc 计时（`main_realtime.c`），默认关零开销。
 
 **未变更（仍待 Phase-2/3）**：R-27（manifest/sha256）、R-30（梯度 E 归一化）、R-25/R-24（CNN 激活缓冲静态化/int8）、R-21（HAL）、ADV-E 系列（量产）。
+
+**2026-08-10 sec_online 链路验证**（ADV-E2 状态更新，`src/sec_online.c`）：
+- **接线正确**：`sec_online_mu>0` → `sec_online_init`（main_realtime.c:1028）+ 逐样本 `sec_online_update`（L359-360，仅正常运行时、`ramp_cnt==0`）写入 `ctx->sec_coeffs`，与 Fx FIR 共用**同一缓冲**（L1018 `sec_firs[idx].coeffs = sec_coeffs + idx*sp`）。同线程顺序执行（先 Fx 后更新，下样本生效），无数据竞争。
+- **实现正确**：环形缓冲读写对齐一致（`coef[0]` 对齐最新 anti，与 fxnlms `wc[0]` 对齐最新样本的约定一致）；每扬声器独立 power 归一化 NLMS（`μ·e_id·anti/power[s]`）；`dsp_delay` padding 区不受更新。
+- **风险（非代码 bug，设计局限）**：无探针噪声在线辨识以 (anti_spk → err_mic) 为对象，而 `err_mic` 含 ANC 自身对消残差。FxLMS 收敛后残差与 anti **结构性相关**（通过参考→扰动→anti 的链路），→ Ŝ 估计有偏；极端（完全对消）时残差≈0 且与 anti 相关 → Ŝ 向 0 漂移 → Fx→0 → Wc 梯度冻结。文件头注释"disturbance residual acts as dither that averages out"过于乐观。另：无 Ŝ 系数 sanity cap（安静期 `power→floor=1e-6` 时 `inv_pwr` 放大，理论上 coef 可无界）。
+- **算力**：~14K MAC/样本 ×16kHz ≈ 230 MFLOPs/s（PC 无压力，嵌入式需评估）。
+- **行动**：默认 `sec_online_mu=0` 保持不动；启用需硬件协议 —— ① 加探针噪声解相关，或 ② 仅在扰动低/安静时段辨识（门控）+ Ŝ 系数 sanity 检查。列入行动路线图 P2。
 
 ---
 
