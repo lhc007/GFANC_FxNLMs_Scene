@@ -85,7 +85,7 @@ typedef struct {
     int   hw_min_hold;           /* 陷波最小保持帧数 */
 
     int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
-    int   embed_delay_ms;        /* 嵌入式信号链处理延迟 ADC+DSP+DAC (env: GFANC_EMBED_DELAY_MS, 默认3ms).
+    int   embed_delay_ms;        /* 嵌入式信号链处理延迟 ADC+DSP+DAC (env: GFANC_EMBED_DELAY_MS, 默认0ms — R-58-8).
                                     离线 main.c pad Ŝ 模拟因果缺口; 0=实时PC等效(无处理延迟). */
     float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
     float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */

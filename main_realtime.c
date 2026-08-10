@@ -86,7 +86,9 @@ static float biquad_tick(biquad_t *f, float x)
 #define BP_LEN       1024   /* CNN 带通 (分类需频率分辨率) */
 #define BP_ANC_LEN   64     /* R-13: ANC 带通 (64tap 群延迟 2ms vs 8ms — 砍环路延迟, 宽带可消上限 ↑) */
 #define SEC_LEN      1024
-/* DSP_DELAY 由 cfg.dsp_delay 管理, 默认 16, 环境变量 GFANC_DSP_DELAY 可覆盖 */
+/* DSP_DELAY 由 cfg.dsp_delay 管理, 默认 0; 无 GFANC_DSP_DELAY 时运行时自动从
+   data/sec_bulk_delay.bin 加载实测环路延迟补偿 (dsp_delay = 环路延迟 − Ŝ峰位),
+   GFANC_DSP_DELAY 环境变量可手动覆盖 */
 /* R-9: 以下参数统一由 cfg (gfanc_config_t) 管理, env 变量可直接生效
    GFANC_RAMP_MS / GFANC_MUTE_MS / GFANC_FADE_LEN / GFANC_MIC_GAIN */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */

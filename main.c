@@ -257,14 +257,15 @@ int main(int argc, char **argv)
             printf("  Ŝ: 原始增益 (默认, 与训练世界一致)\n");
         }
     }
-    /* 嵌入式处理延迟 (GFANC_EMBED_DELAY_MS, 默认3ms): 模拟 ADC+DSP+DAC 信号链延迟,
+    /* 嵌入式处理延迟 (GFANC_EMBED_DELAY_MS, 默认0ms — R-58-8): 模拟 ADC+DSP+DAC 信号链延迟,
        pad 到 Ŝ 模型 (Fx 对齐 + 误差合成共用), 消耗因果裕量 — 离线预测嵌入式目标 NR.
-       GFANC_VIRT_DELAY_MS 可覆盖 (实验/扫参用). */
+       默认 0 与训练世界一致 (3ms=48样本 pad 会 anti 相位错位→自适应正反馈发散);
+       评估嵌入式目标时 GFANC_EMBED_DELAY_MS 显式开启, GFANC_VIRT_DELAY_MS 可覆盖 (实验/扫参用). */
     int virt_delay = cfg.embed_delay_ms * FS / 1000;
     {   const char *vd = getenv("GFANC_VIRT_DELAY_MS");
         if (vd) virt_delay = (int)(atof(vd) * FS / 1000.0f);
         printf("  PROC delay: %d ms (%d samples) added to Ŝ — 嵌入式信号链处理延迟"
-               " (GFANC_EMBED_DELAY_MS=3ms 默认, 可覆盖)\n",
+               " (默认0ms, GFANC_EMBED_DELAY_MS 显式开启; 可覆盖)\n",
                virt_delay * 1000 / FS, virt_delay); }
     int sec_padded = SEC_LEN + DSP_DELAY + virt_delay;
     fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
