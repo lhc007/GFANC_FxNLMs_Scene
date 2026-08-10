@@ -30,6 +30,8 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
     sc->L           = filter_len;
     sc->prev_gains_valid = 0;
     memset(sc->prev_gains, 0, sizeof(sc->prev_gains));
+    sc->gain_smooth_beta   = 0.5f;   /* P0-2 默认, 可被 scene_ctrl_set_gain_smoothing 覆盖 */
+    sc->gain_smooth_switch = 0.85f;
 
     /* stub RMS: 所有子滤波器等权求和 → RMS.
        R-24: 静态临时缓冲 (init 期一次性使用, ≤32KB) */
@@ -51,6 +53,13 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
 void scene_ctrl_free(scene_ctrl_t *sc)
 {
     (void)sc;   /* 无动态分配, 保留为 no-op */
+}
+
+/** P0-2 增益时间平滑参数 (beta∈[0,1], 1=关闭; switch_cos=场景切换旁路阈值). */
+void scene_ctrl_set_gain_smoothing(scene_ctrl_t *sc, float beta, float switch_cos)
+{
+    sc->gain_smooth_beta   = (beta >= 0.0f && beta <= 1.0f) ? beta : 0.5f;
+    sc->gain_smooth_switch = switch_cos;
 }
 
 /** 直接权重 Wc 构造: wc[s*L+l] = Σ_c gains[s*C+c] · sub[(c*S+s)*L+l].
@@ -146,10 +155,30 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
         if (fabsf(g) > gmax) { gmax = fabsf(g); argmax = i; }
     }
 
-    /* 直接权重构造 Wc + RMS 标定 + 取反 */
+    /* P0-2 自适应增益时间平滑: 纯音下 bands 跨秒翻转 (抖动) 会让 OCG/cos 闸门受害.
+       大变化 (帧间 cos < switch, 场景真切换) → β=1 立即跟随, 无切换延迟;
+       小抖动 (cos ≥ switch) → β 慢速 EMA 吸收, 增益方向稳定.
+       注: 平滑后的 gains_out 同时用于 Wc 构造、cos 闸门、OCG 簇判定. */
+    if (sc->prev_gains_valid && sc->gain_smooth_beta < 1.0f) {
+        float dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < SC; i++) {
+            dot += sc->prev_gains[i] * gains_out[i];
+            na  += sc->prev_gains[i] * sc->prev_gains[i];
+            nb  += gains_out[i] * gains_out[i];
+        }
+        float cos_prev = (na > 1e-9f && nb > 1e-9f)
+                       ? dot / (sqrtf(na) * sqrtf(nb)) : 1.0f;
+        float beta = (cos_prev < sc->gain_smooth_switch) ? 1.0f : sc->gain_smooth_beta;
+        if (beta < 1.0f) {
+            for (int i = 0; i < SC; i++)
+                gains_out[i] = (1.0f - beta) * sc->prev_gains[i] + beta * gains_out[i];
+        }
+    }
+
+    /* 直接权重构造 Wc + RMS 标定 + 取反 (用平滑后增益, 抑制 Wc 逐秒跳变) */
     scene_ctrl_construct_wc(sc, gains_out, wc_out);
 
-    /* 更新历史增益 */
+    /* 更新历史增益 (存平滑后值, 作为下帧抖动比较基准) */
     memcpy(sc->prev_gains, gains_out, SC * sizeof(float));
     sc->prev_gains_valid = 1;
     (void)K;

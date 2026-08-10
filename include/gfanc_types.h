@@ -75,6 +75,8 @@ typedef struct {
     float nr_converge_db;        /* 收敛判定 NR 阈值 dB */
     int   freeze_retry_sec;      /* freeze 后尝试解冻的秒数 */
     float diverge_anti_rms;      /* anti_rms 连续3s超此值 → Wc 发散救援 (env: GFANC_DIVERGE_ANTI) */
+    float diverge_err_ratio;     /* P0-4: 救援须 err_rms/ref_rms 同时 > 此值 (对消失败) 才触发,
+                                    防深对消时 anti 高但 err 已被压住 → 误回滚健康 Wc (env: GFANC_DIVERGE_ERR_RATIO) */
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
 
     /* 啸叫检测 */
@@ -98,10 +100,17 @@ typedef struct {
     /* OCG 在线聚类闸门 (ICASSP 2026, 详见 ocg.h):
        在增益域对 CNN 输出做多质心聚类, 仅簇索引变化才更换滤波器 —
        抑制簇内抖动/慢漂移导致的反复重置, 保护 FxNLMS 收敛.
-       τ 复用 switch_threshold (GFANC_RESET_THRESH). */
-    int   ocg_enable;          /* 1=OCG 闸门 (默认), 0=旧 cos(anchor,cur)<τ (env: GFANC_OCG) */
+       τ 独立 (P0-1: 解耦 switch_threshold, 不再复用 GFANC_RESET_THRESH) */
+    int   ocg_enable;          /* 1=OCG 闸门, 0=旧 cos(anchor,cur)<τ (env: GFANC_OCG) */
+    float ocg_tau;             /* 簇半径阈值: cos(g',c)>=τ 归入, 否则新建簇 (env: GFANC_OCG_TAU, 默认 0.8) */
     float ocg_alpha;           /* 质心 EMA 漂移系数 (env: GFANC_OCG_ALPHA, 默认 0.1) */
     int   ocg_max_clusters;    /* 簇上限 (env: GFANC_OCG_CLUSTERS, 默认 8) */
+
+    /* CNN 增益时间平滑 (P0-2, 治纯音带跨秒翻转抖动 — bands 2/6/14/17/19):
+       自适应 EMA — 帧间 cos < switch (场景真切换) → β=1 立即跟随 (无延迟);
+       否则 β 慢速平滑, 吸收带选择抖动 (OCG/cos 闸门不再被抖动触发). */
+    float gain_smooth_beta;    /* EMA 平滑系数 (env: GFANC_GAIN_SMOOTH, 默认 0.5; 1=关闭平滑) */
+    float gain_smooth_switch;  /* 旁路阈值: 帧间增益 cos 低于此视为场景切换, β 强制 1 (默认 0.85) */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -122,6 +131,7 @@ typedef struct {
                            0.6 下 250/500Hz 深对消均稳住, 零 RESET */ \
     60,                 /* freeze_retry_sec */ \
     0.25f,              /* diverge_anti_rms */ \
+    0.6f,               /* diverge_err_ratio (P0-4: anti 高且 err/ref>0.6 才救援; 深对消 err/ref≈0.4 不误杀) */ \
     12.0f, 4, 8, 0.96f, /* hw_thresh_db(12), hw_persist, hw_release, hw_notch_r */ \
     32,                 /* hw_min_hold */ \
     0,                  /* dsp_delay (Ŝ peak@tap10 已含声学延迟) */ \
@@ -131,11 +141,17 @@ typedef struct {
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
-    0, 0.1f, 8,         /* ocg_enable, ocg_alpha, ocg_max_clusters (OCG 聚类闸门).
+    0, 0.8f, 0.1f, 8,   /* ocg_enable, ocg_tau, ocg_alpha, ocg_max_clusters (OCG 聚类闸门).
                            ocg_enable 1→0 (2026-08-10): 纯音深对消下 OCG 簇抖动
                            (cos 0.99-1.00 也触发) 与 τ 复用 switch_threshold 的耦合
-                           都加剧 reset 误杀; 验证有效配置 = OCG 关 + THRESH 0.6,
-                           需 OCGFANC_OCG=1 显式开启 */ \
+                           都加剧 reset 误杀.
+                           2026-08-10 P0-3 复测 (τ 解耦 + 增益平滑后): 仍失败 —
+                           深对消被 diverge 救援打断后增益漂移落到簇外 (cos 0.52),
+                           OCG 建新簇 → 连续 RESET → 深对消丢失, 簇 0↔1 ping-pong.
+                           验证有效配置 = OCG 关 + THRESH 0.6 + 增益平滑 (P0-2).
+                           OCG 保留代码, 待簇判据更鲁棒后 (如持续性差异) 再评估. */ \
+    0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
+                           帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -151,6 +167,7 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_DSP_DELAY")))   cfg->dsp_delay    = atoi(s);
     if ((s = getenv("GFANC_EMBED_DELAY_MS"))) cfg->embed_delay_ms = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
+    if ((s = getenv("GFANC_DIVERGE_ERR_RATIO"))) cfg->diverge_err_ratio = (float)atof(s);
     if ((s = getenv("GFANC_WC_TARGET")))  cfg->wc_rms_target = (float)atof(s);
     if ((s = getenv("GFANC_SEC_MU")))     cfg->sec_online_mu  = (float)atof(s);
     if ((s = getenv("GFANC_WC_COLD")))   cfg->wc_cold_start  = (float)atof(s);
@@ -164,8 +181,10 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
         if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "false")) cfg->ocg_enable = 0;
         else if (!strcmp(s, "1") || !strcmp(s, "on") || !strcmp(s, "true")) cfg->ocg_enable = 1;
     }
+    if ((s = getenv("GFANC_OCG_TAU")))     cfg->ocg_tau     = (float)atof(s);
     if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha = (float)atof(s);
     if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
+    if ((s = getenv("GFANC_GAIN_SMOOTH"))) cfg->gain_smooth_beta = (float)atof(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

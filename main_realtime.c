@@ -160,6 +160,7 @@ typedef struct {
     float  ref_env;               /* ref 包络 (~16ms), AGC 防饱和 */
     volatile LONG cold_hold;     /* cold start anti 硬限幅保护, 2s 后释放 */
     int    diverge_sec;           /* anti_rms 连续超限秒数 (≥2s 触发 Wc 救援) */
+    float  prev_err_ref;          /* P0-4: 上一秒 err_rms/ref_rms (上升趋势=反相生长, 健康收敛是下降) */
     volatile int diverged;        /* 1=当前处于发散态 (pa>>pe 且 anti 大), NR 显示 DIV */
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
     int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
@@ -295,13 +296,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             }
         }
 
-        /* CrossFader */
+        /* CrossFader — 帧边界新旧 Wc 线性混合 (delayless, SFANC 2024):
+           a: 1→0, fx.wc = a·wc_old + (1-a)·wc_cur.
+           自然结束 (P1-1): 末帧残留 (1/fade_len)·wc_old ≈ 0.06% 由恢复的 LMS
+           下一拍微调吸收, 不做硬 memcpy — fade 期间梯度冻结 (下方 R-6),
+           硬覆盖无 LMS 状态可救, 只会引入一步硬跳变. */
         if (ctx->fade_cnt > 0) {
             float a = (float)ctx->fade_cnt / cfg.fade_len;
             for (int i = 0; i < S*L; i++)
                 ctx->fx.wc[i] = a * ctx->wc_old[i] + (1.0f - a) * ctx->wc_cur[i];
-            if (InterlockedDecrement(&ctx->fade_cnt) == 0)
-                memcpy(ctx->fx.wc, ctx->wc_cur, S*L*sizeof(float));
+            InterlockedDecrement(&ctx->fade_cnt);
         }
 
         /* R-13: Fx = Ŝ ⊗ ref_anc (256tap 带通, 群延迟 8ms) */
@@ -338,6 +342,8 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
 
         /* FxNLMS 实时路径: anti=Wc⊗ref_anc, 梯度用err_meas直接驱动 (不合成err)
            R-6: 静音/peak_mute/fade/啸叫陷波活跃时冻结梯度, 防止反馈环路.
+           P1-1 注: fade 期间冻结是有意为之 — 混合公式要求 fx.wc 是确定性线性组合,
+           冻结 100ms 的收敛损失可忽略, 这是 delayless 交接的正确代价, 非缺陷.
            BUG-3: cold_hold 冷启动**硬限幅段**(前1s, cold_hold>FS_ANC)冻结梯度 —
            输出被钳到 ±0.12 时若继续用 err 驱动 Wc, 强噪声下 Wc 开环增长;
            软释放段(后1s, cap 0.12→1.0)梯度活跃, Wc 在输出受界内自适应收敛. */
@@ -690,10 +696,22 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
 static void check_wc_divergence(rt_ctx_t *ctx) {
     float wc_max = sm_wc_max_abs(ctx->wc_snapshot, S * L);
 
-    /* P0-2: 输出能量发散救援 — anti_rms 连续 3s 超限 → 回滚 Wc + 冷启动 ramp.
-       阈值随 mic_pre_gain 自适应收缩 (R-54). */
+    /* P0-4: 输出能量发散救援 — 三重门控才回滚 last_good_wc:
+       (1) anti_rms 连续 2s 超限 (输出能量大);
+       (2) err_rms/ref_rms 高于 diverge_err_ratio (对消失败);
+       (3) err_ref 比上一秒高 0.1 以上 (err 逐秒恶化 = 反相生长).
+       2026-08-10 实测修正:
+       - 纯 anti>0.25 判发散 → 健康深对消 (err 已压到 0.018) 被误回滚 → 锯齿循环;
+       - 仅加 err_ref>0.6 仍不够: 本硬件 err 麦比 ref 麦热, 收敛中 err_ref 可达 1.3
+         (anti=0.2587 时 err_ref=0.97 且 err 仍在下降) → 仍会误杀收敛中的健康 Wc.
+       - 决定性判据 = err_ref 上升趋势: 健康收敛 err 逐秒下降, 真发散 (反相正反馈)
+         err 逐秒上升. 三重条件连续 2s → 回滚. 阈值随 mic_pre_gain 自适应收缩 (R-54). */
     float div_thresh = cfg.diverge_anti_rms / (cfg.mic_pre_gain > 0.1f ? cfg.mic_pre_gain : 1.0f);
-    if (ctx->anti_rms > div_thresh) {
+    float err_ref = (ctx->ref_rms > 0.001f) ? (ctx->err_rms / ctx->ref_rms) : 0.0f;
+    float err_ref_prev = ctx->prev_err_ref;
+    ctx->prev_err_ref = err_ref;
+    int err_rising = (err_ref > err_ref_prev + 0.1f);
+    if (ctx->anti_rms > div_thresh && err_ref > cfg.diverge_err_ratio && err_rising) {
         if (++ctx->diverge_sec >= 2) {
             memcpy(ctx->wc_shadow, ctx->last_good_wc, S*L*sizeof(float));
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
@@ -701,10 +719,10 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
             ctx->diverge_sec = 0;
             ctx->peak_rollback_cnt = 0;
             if (ctx->log_file)
-                fprintf(ctx->log_file, "# EVENT: Wc RESCUE anti_rms=%.3f > %.2f x2s\n",
-                        ctx->anti_rms, div_thresh);
-            printf("[WARN] anti_rms %.3f > %.2f for 2s — Wc rescued (rollback + ramp)\n",
-                   ctx->anti_rms, div_thresh);
+                fprintf(ctx->log_file, "# EVENT: Wc RESCUE anti_rms=%.3f err_ref=%.2f(prev %.2f) x2s\n",
+                        ctx->anti_rms, err_ref, err_ref_prev);
+            printf("[WARN] anti_rms %.3f err_ref %.2f→%.2f rising x2s — Wc rescued (rollback + ramp)\n",
+                   ctx->anti_rms, err_ref_prev, err_ref);
         }
     } else {
         ctx->diverge_sec = 0;
@@ -761,7 +779,7 @@ static void check_convergence(rt_ctx_t *ctx) {
 
 /* 去场景层 (gfanc-direct-weight): Reset 模式触发 — 无场景记忆, 直接过渡到
    scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用. */
-static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains) {
+static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains, int by_ocg) {
     memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float)); /* 过渡起点 */
     /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
     InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
@@ -771,9 +789,15 @@ static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains) {
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
     ctx->converged_frames = 0;
-    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset cos=%.3f clu=%d/%d\n",
+    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset %s cos=%.3f clu=%d/%d\n",
+                               by_ocg ? "ocg" : "cos",
                                cos_sim, ctx->ocg.active, ctx->ocg.n_clusters);
-    printf("  -> RESET (cos=%.2f < %.2f)\n", cos_sim, cfg.switch_threshold);
+    /* 诚实标注触发源: cos 门打 cos<τ; OCG 打簇索引变化 (cos 仅为诊断, 可能 ≥τ) */
+    if (by_ocg)
+        printf("  -> RESET (OCG clu=%d/%d, cos=%.2f diag)\n",
+               ctx->ocg.active, ctx->ocg.n_clusters, cos_sim);
+    else
+        printf("  -> RESET (cos=%.2f < %.2f)\n", cos_sim, cfg.switch_threshold);
 }
 
 int main(void) {
@@ -1079,8 +1103,10 @@ int main(void) {
     if (scene_ctrl_init(&ctx->sc, sub_filters, L) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); ret = 1; goto cleanup;
     }
-    /* OCG 聚类闸门初始化: τ 复用 switch_threshold (GFANC_RESET_THRESH) */
-    if (ocg_init(&ctx->ocg, ctx->sc.K, cfg.switch_threshold,
+    /* P0-2: 增益时间平滑参数 (默认已在 scene_ctrl_init 设好, env 覆盖) */
+    scene_ctrl_set_gain_smoothing(&ctx->sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
+    /* OCG 聚类闸门初始化: τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold) */
+    if (ocg_init(&ctx->ocg, ctx->sc.K, cfg.ocg_tau,
                  cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
         fprintf(stderr, "ERROR: ocg_init failed\n"); ret = 1; goto cleanup;
     }
@@ -1241,13 +1267,15 @@ int main(void) {
             check_convergence(ctx);
             /* 去场景层模式派发: reset=OCG 簇索引变化 → CrossFader 过渡到新 Wc;
                continuous=永不重置 (CNN 仅首秒 INIT 一次).
-               OCG (默认): 多质心聚类, 仅簇索引变化才重置 — 抑制簇内抖动/
-               慢漂移导致的反复重置 (ICASSP 2026). 关闭 (GFANC_OCG=0) 回退
-               旧闸门 cos(anchor,cur)<τ. */
+               OCG (默认关闭 — 2026-08-10 P0-3 实测证伪): 纯音深对消下增益在两
+               个模式间震荡 (帧间 cos 0.65-0.71), OCG 簇分配随震荡翻转 (0↔1↔2),
+               每次翻转都 RESET → 深对消被反复打断 (最高仅 ~18dB, 而 OCG 关可达
+               27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
+               cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
             if (cfg.gfanc_mode == 1) {          /* reset */
                 int do_reset = cfg.ocg_enable ? ocg_step(&ctx->ocg, gains)
                                               : (cos_sim < cfg.switch_threshold);
-                if (do_reset) apply_reset(ctx, cos_sim, gains);
+                if (do_reset) apply_reset(ctx, cos_sim, gains, cfg.ocg_enable);
             }                                   /* continuous: 不动作 */
         }
         memcpy(ctx->sc.prev_gains, gains, K * sizeof(float));

@@ -310,9 +310,11 @@ int main(int argc, char **argv)
     if (scene_ctrl_init(&sc, sub_filters, L) != 0) {
         fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); return 1;
     }
-    /* OCG 聚类闸门 (与实时版一致): τ 复用 switch_threshold */
+    /* P0-2: 增益时间平滑参数 (与实时版一致, env 覆盖) */
+    scene_ctrl_set_gain_smoothing(&sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
+    /* OCG 聚类闸门 (与实时版一致): τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold) */
     ocg_t ocg;
-    if (ocg_init(&ocg, sc.K, cfg.switch_threshold,
+    if (ocg_init(&ocg, sc.K, cfg.ocg_tau,
                  cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
         fprintf(stderr, "ERROR: ocg_init failed\n"); return 1;
     }

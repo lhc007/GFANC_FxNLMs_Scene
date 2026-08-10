@@ -39,7 +39,7 @@ typedef struct {
 typedef struct {
     int   K;                 /* 增益向量维数 = S*C = 30 */
     float tau_cos;           /* 簇半径阈值: cos(g',c) >= τ 归入, 否则新建簇
-                                (复用 cfg.switch_threshold, 默认 0.8) */
+                                (独立 cfg.ocg_tau, 默认 0.8; P0-1 解耦 switch_threshold) */
     float alpha;             /* 质心 EMA 漂移系数 (0~1; 0.1=慢漂移吸收) */
     int   max_clusters;      /* 簇上限 */
     ocg_cluster_t clusters[OCG_MAX_CLUSTERS];

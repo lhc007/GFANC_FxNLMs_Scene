@@ -24,10 +24,16 @@ typedef struct {
     float  wc_rms_target;       /* 自动标定: Wc 构造目标 RMS (基于 Ŝ 物理衰减) */
     float  prev_gains[SC_DW_MAX];  /* 上一秒增益 [S*C] (弱信号/CNN失败时保持) */
     int    prev_gains_valid;       /* 是否有可用历史增益 */
+
+    /* P0-2 增益时间平滑参数 (scene_ctrl_set_gain_smoothing 覆盖; 默认 0.5/0.85) */
+    float  gain_smooth_beta;       /* EMA 平滑系数 (0~1; 1=不平滑) */
+    float  gain_smooth_switch;     /* 旁路阈值 cos: 帧间低于此 → 场景切换, β 强制 1 */
 } scene_ctrl_t;
 
 int  scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len);
 void scene_ctrl_free(scene_ctrl_t *sc);
+/** 设置增益时间平滑参数 (P0-2). beta∈[0,1]; beta=1 关闭平滑; switch_cos 为场景切换旁路阈值. */
+void scene_ctrl_set_gain_smoothing(scene_ctrl_t *sc, float beta, float switch_cos);
 /** 直接权重 Wc 生产者: audio_1s → CNN → tanh 增益 → Wc[S*L].
  *  返回诊断用 argmax |gain| 带索引 (0..S*C-1, 弱信号/失败时沿用历史).
  *  输出 wc_out[S*L] (已 RMS 标定 + 取反), gains_out[S*C] (tanh 增益). */

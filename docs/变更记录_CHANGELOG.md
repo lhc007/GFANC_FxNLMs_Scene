@@ -31,6 +31,25 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-10] 论文改进逐项落地 v1.8: τ解耦 + 自适应增益平滑 + OCG 定案关闭 + 发散救援三重门控 + fade 清理 + LayerCAM 诊断
+- **状态**: 已提交 <此提交>
+- **基线**: bdf7639（fix: 实机验证闭环 — reset 闸门 0.6 + OCG 默认关 + safety_mute 判据修正）
+- **变更代码**:
+  - 新增: `tools/layercam_diagnose.py` — P2 LayerCAM 离线诊断（从 `data/*.bin` 载权复现运行时 CNN 前向, 频率遮挡归因为主判据）; `tone250/1000/250to1000/250to500.wav` — 测试纯音夹具（P2 验证 + 复现用）
+  - 修改: `include/gfanc_types.h` — P0-1 新增 `ocg_tau`（簇半径独立于 switch_threshold, 默认 0.8）+ env `GFANC_OCG_TAU`; P0-2 新增 `gain_smooth_beta/switch`（默认 0.5/0.85）+ env `GFANC_GAIN_SMOOTH`; P0-4 新增 `diverge_err_ratio`（默认 0.6）+ env `GFANC_DIVERGE_ERR_RATIO`; 默认参数注释同步 OCG 定案关闭结论
+  - 修改: `include/scene_controller.h`/`src/scene_controller.c` — P0-2 自适应增益 EMA 插入 `scene_ctrl_process`（帧间 cos<switch→β=1 立即跟随, 否则 β=0.5 慢速平滑）; 新增 `scene_ctrl_set_gain_smoothing` 接口
+  - 修改: `main_realtime.c` — P0-4 发散救援三重门控（anti 超限 且 err/ref>diverge_err_ratio 且 err_ref 逐秒上升 0.1, 连续 2s 才回滚）; P1-1 CrossFader 末帧 memcpy 移除（自然结束, 冻结期无 LMS 状态可救）; apply_reset 增 `by_ocg` 诚实标注触发源; 模式派发注释定案 OCG 关闭结论
+  - 修改: `main.c`/`include/ocg.h` — 离线与实时一致: ocg_init 传独立 `ocg_tau` + 增益平滑参数; 修正过期 τ 复用注释
+- **变更原因**: 论文改进逐项应用（目标=开窗降噪, 终极=稳定性降噪）。① OCG τ 复用 switch_threshold 方向耦合（降阈值治 cos 闸门却让 OCG 更敏感）; ② CNN 增益逐秒抖动（纯音 bands 2/6/14/17/19 跨秒翻转）未治, OCG/cos 闸门受害; ③ OCG 重开实机证伪需定案关闭; ④ diverge 救援纯 anti 阈值误杀健康深对消（本硬件 err 麦比 ref 热, 收敛中 err_ref 可达 1.3）; ⑤ fade 末 memcpy 硬覆盖丢 LMS 状态语义隐患; ⑥ 需要 CNN 决策归因诊断工具
+- **造成影响**:
+  - 行为: 默认配置下发散救援不再误杀健康深对消（实测 anti>0.25 持续 9s 零救援、26dB 深对消保持、零 RESET, 修复了 P0-3 的锯齿震荡）; 增益平滑吸收纯音带抖动、真场景切换（帧间 cos<0.85）β=1 无延迟; OCG 保持默认关闭（验证稳定配置 = OCG 关 + THRESH 0.6 + 平滑 + 三重门控, 代码保留待簇判据更鲁棒后评估）
+  - 配置: 新增环境变量 `GFANC_OCG_TAU`(0.8)、`GFANC_GAIN_SMOOTH`(0.5, 1=关平滑)、`GFANC_DIVERGE_ERR_RATIO`(0.6)
+  - 测试/回归: 实机 250Hz 深对消 26dB 零 RESET（P0-4 三重门控生效）; 旧exe 日志 A/B 证明 OCG 簇震荡独立于救援误杀（OCG 开≈18dB 每~1000cb RESET vs 关 27.5dB 零 RESET）; P2 频率遮挡归因 250Hz→233Hz / 1000Hz→984Hz 子带, 干净纯音下增益 std/mean≈0.00 → 实时抖动根因在实况信号非 CNN 固有
+  - 性能/内存: 无（平滑与三重门控均为每帧 O(SC) 标量运算, 无新增线程/锁）
+  - 未验证项: P1-1 实机回归（改动无功能影响, 预期零 RESET, 待用户硬件复跑确认）; 平滑在"半抖动半切换"中间态（cos≈0.85 附近）可能延迟一次切换 <1s（已接受）
+- **验证方式**: 实机纯音/路噪双场景日志对比（RESET 次数 / err 锯齿 / 深对消保持）; `python tools/layercam_diagnose.py tone250.wav` 归因验证; 离线 main.exe 与实时同构回归
+- **回退方式**: OCG 重开 `GFANC_OCG=1`; 关平滑 `GFANC_GAIN_SMOOTH=1`; 救援还原纯 anti 门 `GFANC_DIVERGE_ERR_RATIO=0`; 或 git revert 本提交
+
 ### [2026-08-10] 实机验证闭环: reset 闸门灵敏度 0.8→0.6 + OCG 默认关 + safety_mute 判据修正 + 重校准数据入库
 - **状态**: 已提交 <此提交>
 - **基线**: bf52a2e
