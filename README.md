@@ -1,38 +1,44 @@
-# GFANC FxNLMS — MIMO 主动降噪系统
+# GFANC FxNLMS — 主动降噪系统 (ANC)
 
-> **版本**: v1.6 (2026-08-08) | **分支**: gfanc-direct-weight
+> **版本**: v1.8 (2026-08-10) | **分支**: gfanc-direct-weight | 完整变更史见 [变更记录](docs/变更记录_CHANGELOG.md)
 
-> **v1.6 变更**: C 运行时改为**直接权重 Wc 生产者**（CNN 回归 30 维子带增益 → `tanh` → `Wc=Σ gain·sub`，彻底去掉 centroid/softmax 场景路径与 `scene_defs.bin` 依赖）；**死代码清理**（删除 OCG 聚类闸门 `ocg.c/ocg.h`、`scene_manager.h` 死函数、`test/` 脚手架、`GFANC_OCG_*` 参数）。v1.5 起已去掉场景层（无场景记忆/滞回/OCG）→ **Reset / Continuous 双模式**（CNN 只产 Wc，`gfanc_mode` 切换）；离线默认按**嵌入式处理延迟 3ms** 建模因果性（`GFANC_EMBED_DELAY_MS`）。
+## 这是什么？
 
-一个**主动降噪引擎**的纯 C 语言实现，从 Python 项目 [GFANC_Scene](GFANC_Scene) 移植。
+一个**主动降噪（ANC）引擎**的纯 C 语言实现（Python 项目 [GFANC_Scene](GFANC_Scene) 的 C 移植）。原理和降噪耳机一样：
 
-它会"听"到噪声，然后计算一个**反噪声**（与噪声波形相反的声音），通过扬声器播放出来，让噪声和反噪声在空间中互相抵消——就像噪声从未存在过一样。
+> **"听"到噪声 → 算出与噪声波形相反的声音（反噪声）→ 用扬声器播放 → 噪声和反噪声在空中抵消**，就像噪声没来过一样。
 
-## 它能做什么
+区别是不戴在耳朵上，而是用**独立的麦克风 + 扬声器**，可以消一整片区域的噪声——比如放在窗户开口处做**开窗降噪**。
 
-| 模式 | 说明 |
-|------|------|
-| **离线降噪** | 输入一段噪声录音（WAV 文件），输出降噪后的结果 |
-| **实时降噪** | 连接麦克风和扬声器，实时抵消环境噪声 |
+它有**两种用法**：
 
-## 你需要什么
+| 模式 | 干什么 | 适合谁 |
+|------|--------|--------|
+| **实时降噪** | 接上麦克风和扬声器，实时抵消你房间/窗边的噪声 | 最终使用场景 |
+| **离线降噪** | 输入一段噪声录音（WAV），输出降噪后的文件，并打印降噪量 | 评估效果、调参数 |
 
-### 硬件（实时模式）
+## 你需要什么（硬件清单）
 
-- **音频接口**：多通道声卡（4in/2out+，ASIO/WASAPI/WDM-KS 均可）
-- **麦克风**：参考麦 ×1 + 误差麦 ×3
-- **扬声器**：2 声道
-- **电脑**：Windows 10/11
+### 实时模式必需
 
-> 当前使用单设备 ASIO 声卡（共时钟驱动所有 ADC/DAC），时钟同步问题已解决。
-> 反馈抵消需运行 `calibrate_feedback.exe` 逐扬声器校准。
+| 硬件 | 要求 | 本项目实测配置（参考） |
+|------|------|------------------------|
+| **音频接口** | 多通道声卡，≥4 进 2 出，支持 ASIO | BEHRINGER UMC 404HD（ASIO 设备号 `23`） |
+| **参考麦克风** ×1 | 放在噪声源一侧，负责"听有什么噪声" | ECM8000 全指向测量麦 |
+| **误差麦克风** ×3 | 放在听音区（降噪目标位置），负责"听剩多少噪声" | ECM8000 |
+| **扬声器** ×2 | 播放反噪声 | 小书架箱 / 全频喇叭 |
+| **电脑** | Windows 10/11 | — |
 
-**噪声源必须同时覆盖参考麦克风和误差麦克风**——ANC 只能抵消两个位置都能"听到"的噪声。参考麦朝向噪声源，误差麦和扬声器朝向听音区。系统几何：**参考麦↔误差麦 64cm、扬声器↔误差麦 15cm**，建议安装在窗户开口处（参考麦朝向窗外，误差麦+扬声器朝向室内）。
+> ⚠️ **摆放几何决定能不能消**：参考麦朝向噪声源，误差麦+扬声器朝向听音区，摆成一条"前馈"线——**噪声先经过参考麦，再到达误差麦**，系统才有时间提前算出反噪声。本实测几何：**参考麦↔误差麦 64cm、扬声器↔误差麦 15cm**，建议装在窗户开口处（参考麦朝窗外、误差麦+扬声器朝室内）。
+> ⚠️ **只能消"两个麦都能听到"的噪声**：只在参考麦听到、误差麦听不到的噪声，物理上对消不了。
 
 ### 软件
 
-- **编译器**：GCC（通过 [MSYS2](https://www.msys2.org/) 安装）
-- **权重文件**：`data/` 目录下的 `.bin` 文件（已包含在项目中）
+- **GCC 编译器**（Windows 通过 [MSYS2](https://www.msys2.org/) 安装）
+- **Python**（仅当你需要**自己训练模型**或**重新测量声学路径**时才需要）
+- **权重文件**：`data/` 目录下的 `.bin` 已随项目自带——**不训练也能直接跑**
+
+---
 
 ## 快速开始
 
@@ -81,32 +87,31 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c s
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
 
 
-### 4. 校准反馈路径（实时模式首次运行前必须执行）
+### 4. 校准声学路径（首次使用 / 换了硬件 / 换了摆放位置 —— 必做）
 
-扬声器的反噪声会通过空气耦合回参考麦克风，形成正反馈（啸叫）。校准程序会测量这条声学路径并生成抵消滤波器：
+系统必须知道"扬声器的声音怎么传到麦克风"（声学路径），才能算出正确的反噪声。**这些路径完全取决于你的摆放几何，换了位置就必须重测**。共两项：
+
+| 校准项 | 测什么 | 什么时候重测 |
+|--------|--------|-------------|
+| **次级路径 + 环路延迟** | 扬声器→误差麦的传递 + FxLMS 对齐用的总延迟 | 换扬声器 / 换位置 / 换声卡 |
+| **反馈路径** | 扬声器→参考麦的正反馈（防啸叫） | 换扬声器 / 换位置 |
 
 ```bash
-# 编译校准程序（只需一次）
+# ① 编译两个校准程序（只需一次）
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 
-# 运行校准（自动逐扬声器两轮，每轮 4 秒）
+# ② 测次级路径 + 环路延迟（最关键）→ 生成 data/secondary_path_measured.bin + data/sec_bulk_delay.bin
+./calibrate_secondary.exe
+
+# ③ 测反馈路径（防啸叫）→ 生成 data/feedback_path_0.bin / feedback_path_1.bin
 ./calibrate_feedback.exe
 ```
 
-选择你的 ASIO 设备（如 `23`），保持房间安静，程序会自动在扬声器 0 和 1 上播放白噪声，用 NLMS 辨识反馈路径。完成后生成 `data/feedback_path_0.bin` 和 `data/feedback_path_1.bin`。
+> 📏 **校准质量规则**：校准时声卡输入 **SIG 常亮、CLIP 不亮**。CLIP 亮 = 输入削波，会污染路径辨识。探针响度用 `GFANC_CAL_NOISE` 调（默认 0.9）：削波就调小（如 0.4），SNR 不足就调大。ERLE < 8dB 的弱耦合路径会被自动置零（属正常保护）。**校准用的增益旋钮位置 = 运行时必须用同一位置**（路径系数嵌入了模拟增益）。
+> ⚠️ **只在麦克风/扬声器位置变化时需要重测**。文件缺失时反馈抵消自动禁用，不影响降噪但可能啸叫。
 
-> **只在麦克风或扬声器位置变化时需要重新校准**。文件缺失时反馈抵消自动禁用，不影响降噪效果但可能引发啸叫。
-
-> 💡 **首次运行前还需测环路延迟**（FxLMS 对齐必需）：
-> ```bash
-> gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-> ./calibrate_secondary.exe   # 生成 data/sec_bulk_delay.bin (环路延迟) + secondary_path_measured.bin
-> ```
-> 运行时自动加载最新的实测 Ŝ 并补偿环路延迟（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。**每次换安装位置/几何后都要重测**（详见 [次级路径测量](#次级路径测量python-farina-扫频法)）。
-
-> 📏 **校准质量规则**：校准时声卡输入 **SIG 常亮、CLIP 不亮**。CLIP 亮 = 输入削波，会污染路径辨识。
-> 探针响度由 `GFANC_CAL_NOISE` 控制（默认 0.9，反馈/次级两个校准程序都支持）：削波就调小（如 0.4），SNR 不足就调大。
-> ERLE < 8dB 的弱耦合路径会被自动置零（运行时忽略该扬声器→误差麦耦合），属正常保护。
+换硬件或换摆放位置后**从零到实时运行**的完整清单，见 [换硬件检查单](#换硬件检查单)。
 
 ### 5. 运行
 
@@ -127,6 +132,17 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 ```bash
 ./gfanc_realtime.exe
 ```
+运行后会列出音频设备，输入设备编号（如 `23`），开始实时降噪。按 `Ctrl+C` 停止。
+
+#### 怎么验证真的有效
+
+**用 250Hz 纯音验证，别用宽带噪音**。系统受环路延迟限制，只能对消窄带/周期成分——纯音最能反映真实对消能力：
+
+1. 手机/电脑放一段 **250Hz 纯音**，作为参考麦的噪声源
+2. 看终端每秒一行的表格：**NR 应到 10dB 以上**，误差麦电平应明显下降
+3. 拿开噪声源再放回，确认降噪跟随
+
+> ⚠️ 别用马路噪音/宽带 WAV 验证"真实降噪"——宽带随机噪声物理上消不了（预览预算为负），纯音才见真章。降噪数字只在**误差麦位置**有效（静音区 ≈ 声波波长/10），人耳远离误差麦时效果下降。
 
 关键操作要点：
 
@@ -137,6 +153,51 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 - 可选调参：`GFANC_MIC_GAIN`（输入预增益）、`GFANC_STEP`、`GFANC_WC_TARGET` 等见[系统参数表](#系统参数)。
 
 运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `23`），然后开始实时降噪。按 `Ctrl+C` 停止。
+
+---
+
+## 换硬件检查单
+
+> 换了**音频接口 / 扬声器 / 麦克风**，或换了**摆放位置**（如从桌面移到窗边）后，按这个顺序从零跑到实时运行。**核心原则：凡涉及"声音怎么在空气里走"的参数全部重测，模型权重不用动。**
+
+| 步骤 | 做什么 | 命令 / 产物 |
+|------|--------|------------|
+| 0 | 接线 + 调增益旋钮（参考麦→输入 0，误差麦→输入 1-3，扬声器→输出 0-1） | SIG 常亮、CLIP 不亮，记住旋钮位置 |
+| 1 | 编译校准程序（只做一次） | `gcc ... calibrate_secondary.exe` / `calibrate_feedback.exe` |
+| 2 | **测次级路径 + 环路延迟（最关键）** | `./calibrate_secondary.exe` → `secondary_path_measured.bin` + `sec_bulk_delay.bin` |
+| 3 | 测反馈路径（防啸叫） | `./calibrate_feedback.exe` → `feedback_path_0/1.bin` |
+| 4 | 编译实时版 | `gcc ... gfanc_realtime.exe` |
+| 5 | 运行 + 纯音验证 | `./gfanc_realtime.exe`，250Hz 纯音 NR ≥ 10dB、零 RESET |
+
+### 详细命令
+
+```bash
+# 0. 接线完成后，把增益旋钮调到 SIG 常亮、CLIP 不亮（记住位置，校准和运行必须一致）
+
+# 1. 编译校准程序（只需一次）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+
+# 2. 次级路径 + 环路延迟（最关键：换位置/扬声器/声卡必测）
+./calibrate_secondary.exe
+#   → data/secondary_path_measured.bin + data/sec_bulk_delay.bin（启动日志显示 Loop delay auto-loaded）
+#   更高 SNR 的替代测量（可选）: cd GFANC_Scene && python ../export/measure_secondary.py
+
+# 3. 反馈路径（防啸叫）
+./calibrate_feedback.exe
+#   → data/feedback_path_0.bin / data/feedback_path_1.bin
+
+# 4. 编译实时版
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
+
+# 5. 运行 + 验证
+./gfanc_realtime.exe     # 设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
+```
+
+### 换硬件时**不需要**重做的
+
+- **CNN 模型、子滤波器、权重导出**（`export_bin.py`）——除非你换的硬件改变了训练数据分布（一般不会）
+- **主路径（Pri）测量**——实时版**不加载**主路径；只有离线评估 `main.exe` 算 NR_true 才用得上（`export/measure_primary.py`）
 
 ## 运行示例
 
@@ -182,7 +243,7 @@ Done.
 | `NR_est` | **估计降噪量**（与实时版同公式，数字越大越好） | `4.6 dB` = 估计压低了 4.6 分贝 |
 | `NR_true` | **已知真值降噪量**（仅离线可用，Pri 模型精确计算扰动，最可信） | `4.4 dB` |
 | `err` / `refFilt` / `anti` | 残差 / 带通参考 / 反噪声 RMS | |
-| `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(reset 模式 cos<阈值 → 重置 Wc) |
+| `Note` | 状态 | `INIT`(启动) / `-`(正常) / `RESET`(reset 模式 cos<0.6 → 重置 Wc) |
 
 - **NR_true 是最可信的指标**（离线用 Pri 模型精确算出扰动，NR_est 与它逐秒偏差 <0.5dB）；10 dB 意味着噪声能量降到 1/10，20 dB 意味着降到 1/100
 - 注意：**离线默认 `GFANC_EMBED_DELAY_MS=0`**（R-58-8：训练世界无此延迟，3ms 会造成 anti 相位错位 48 样本 → 自适应发散）。启动日志打印净预览时间（基线 ≈ −1.9ms：64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
@@ -190,7 +251,7 @@ Done.
 
 ## 训练管线（直接权重 CNN）
 
-> 只想用现成权重跑系统，见 [快速开始](#快速开始)；本节是**训练/更换自己的模型**。训练完成后回到[快速开始 步骤 2](#2-导出权重仅需做过训练后执行) 导出。
+> 💡 本节是**训练/更换自己的模型**。训练完成后回到[快速开始 步骤 2](#2-导出权重仅需做过训练后执行) 导出。
 
 直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
 
@@ -308,11 +369,11 @@ CNN 神经网络每秒分析一次 1 秒窗口的噪声，回归 **30 维子带�
                                                     ↑ 1Hz, 双缓冲+原子交接
 ```
 
-**去场景层双模式**（`gfanc_mode`，v1.5）——CNN 不再做"场景切换"（无场景记忆/滞回/OCG），只产 Wc：
+**去场景层双模式**（`gfanc_mode`，v1.5）——CNN 不再做"场景切换"（无场景记忆/滞回），只产 Wc：
 
 | 模式 | CNN 行为 | Wc 行为 |
 |---|---|---|
-| **reset**（默认） | 每秒跑，输出新 30 维增益 + 候选 wc_cur | **OCG 多质心聚类闸门**（v1.7，ICASSP 2026）：对增益向量做在线聚类，仅**簇索引变化**才 → CrossFader 100ms 平滑过渡到新 Wc（`GFANC_OCG=0` 回退 `cos(anchor,cur)<0.8`） |
+| **reset**（默认） | 每秒跑，输出新 30 维增益 + 候选 wc_cur | **cos(anchor,cur) < 0.6** → CrossFader 100ms 平滑过渡到新 Wc（默认；OCG 多质心聚类闸门 v1.7 实测证伪后默认关，`GFANC_OCG=1` 可开） |
 | **continuous** | 每秒跑（仅诊断日志） | 仅首秒 INIT 设一次，FxNLMS 永不重置 |
 
 噪声类型变化是秒级到分钟级的，1 秒窗口保证足够的频率分辨率。reset 模式触发时 CrossFader 在 100ms 内平滑过渡，防止可闻瞬态。
@@ -485,17 +546,19 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 变步长 (VS-LMS) | 双 EMA 尖峰检测, 突发降步至 5% | 误差相对自身基线跳变→降步防反馈过冲; 平滑收敛全速 (2026-08-05) |
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
-| 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: OCG 簇索引变化 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
-| Reset 触发 (OCG) | OCG 多质心聚类闸门 (env: GFANC_OCG=0 关, 回退旧闸门) | v1.7 新增: 增益向量在线聚类, 簇索引变化才重置 (ICASSP 2026); 簇半径复用 switch_threshold (cos 相似度) |
-| 聚类半径 τ | 0.8 (env: GFANC_RESET_THRESH) | cos(g', centroid) < τ → 新建簇; 簇内抖动/慢漂移被质心吸收不触发 |
+| 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos(anchor,cur)<0.6 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
+| Reset 触发 | 默认 cos(anchor,cur)<0.6 (env: GFANC_RESET_THRESH) | 场景真正切换才重置; 0.6 是实机纯音深对消验证值 (0.8 在深对消时误杀健康 Wc, 见 CHANGELOG) |
+| OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估 |
+| 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
 | 质心漂移 α | 0.1 (env: GFANC_OCG_ALPHA) | 质心 EMA 跟随增益方向 (吸收慢漂移) |
 | 簇上限 | 8 (env: GFANC_OCG_CLUSTERS) | LRU 淘汰最久未命中簇 |
+| 增益时间平滑 | β=0.5, 旁路 cos=0.85 (env: GFANC_GAIN_SMOOTH) | P0-2: 纯音带跨秒翻转抖动被 EMA 吸收; 帧间 cos<0.85 (真场景切换) → β=1 立即跟随无延迟 |
 | Reset 过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 嵌入式处理延迟 | 3ms 默认 (env: GFANC_EMBED_DELAY_MS) | 离线 pad Ŝ 模拟 ADC+DSP+DAC 因果缺口 (v1.5) |
 | 冷启动 ramp | 400ms | 输出从 0 平滑渐入 |
 | 冷启动 Wc 衰减 | 0.3 (env: GFANC_WC_COLD) | CNN 预设衰减系数 |
 | 冷启动软释放 | 前 1s cap0.12(梯度冻结), 后 1s cap→1.0 | 消除启动啸叫 (v1.2) |
-| Wc 发散救援 | anti_rms > 阈值持续 2s | 回滚 Wc + 重新 ramp |
+| Wc 发散救援 | anti_rms>0.25 且 err/ref>0.6 且 err_ref 逐秒上升 0.1, 连续 2s (env: GFANC_DIVERGE_ERR_RATIO) | P0-4 三重门控: 回滚 Wc + 重新 ramp; 防误杀健康深对消 (纯 anti 阈值会把 err_ref 达 1.3 的收敛中 Wc 误回滚) |
 | Wc 发散冻结 | max\|Wc\| > 30×wc_init_max | 自动冻结 LMS 梯度 (自适应基准) |
 | 在线 Ŝ 辨识 | μ=5e-6 (env: GFANC_SEC_MU) | NLMS, 零探测噪声 |
 | 音频缓冲 | 128 样本 (env: GFANC_BUFFER, 32-1024) | ASIO buffer; 越小延迟越低但易爆音 (128 稳定甜点, 实测环路 ~12.4ms) |
