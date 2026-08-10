@@ -8,6 +8,7 @@ MyNoiseDataset: 从 CSV(File_path + gain_*) + WAV 目录加载 (signal, target).
   整批 GPU 卷积做 (快 5-10 倍, 数学等价, 与 C 端 fir_tick 严格一致)
 """
 import os
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -48,11 +49,23 @@ def make_bandpass_tensor(bp_path, device):
     return bp.flip(0).view(1, 1, -1), bp.numel() - 1
 
 
-def prepare_batch(x, bp_w, bp_pad):
-    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_process 一致)."""
+def prepare_batch(x, bp_w, bp_pad, gain_range=None):
+    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_process 一致).
+
+    gain_range=(lo,hi): 归一化后乘对数均匀随机增益, 模拟部署端缩放基准漂移
+    (scene_controller.c 每秒独立 max-min 的 denom 在漂 → CNN 输入逐秒抖,
+     2026-08-10 实机抖动根因). 训练时教 CNN"输入整体缩放 ≠ 增益方向改变".
+    """
     x = F.conv1d(x, bp_w, padding=bp_pad)[:, :, :SAMPLE_LEN]
     scale = x.amax(dim=-1, keepdim=True) - x.amin(dim=-1, keepdim=True)
-    return torch.where(scale > 1e-10, x / scale.clamp(min=1e-10), x)
+    x = torch.where(scale > 1e-10, x / scale.clamp(min=1e-10), x)
+    if gain_range is not None:
+        lo, hi = gain_range
+        # 对数均匀: 几何均值=1, 不改变训练分布中心
+        g = torch.exp(torch.rand(x.size(0), 1, 1, device=x.device) *
+                      (math.log(hi) - math.log(lo)) + math.log(lo))
+        x = x * g
+    return x
 
 
 # ═══════════════════════════════════════════════════════════════

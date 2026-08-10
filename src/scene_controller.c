@@ -32,6 +32,8 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
     memset(sc->prev_gains, 0, sizeof(sc->prev_gains));
     sc->gain_smooth_beta   = 0.5f;   /* P0-2 默认, 可被 scene_ctrl_set_gain_smoothing 覆盖 */
     sc->gain_smooth_switch = 0.85f;
+    sc->norm_denom_valid = 0;        /* 输入归一化 EMA 稳定标定 (2026-08-10) */
+    sc->norm_ema_alpha   = 0.1f;
 
     /* stub RMS: 所有子滤波器等权求和 → RMS.
        R-24: 静态临时缓冲 (init 期一次性使用, ≤32KB) */
@@ -126,9 +128,21 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
 
     /* R-24: CNN 输入缓冲改为静态 (消除每秒 64KB malloc/free).
        单调用者 (主线程), 无重入风险. */
+    /* EMA 稳定标定 (2026-08-10): 每秒独立 denom 逐秒漂移 → CNN 输入逐秒抖
+       (实机抖动根因). 平滑基准慢速跟随, 归一化用平滑值; 弱信号保底 (上面
+       denom<=0.01 return) 仍用 raw denom, 静音帧不污染基准. */
+    if (sc->norm_denom_valid)
+        sc->norm_denom_smooth = (1.0f - sc->norm_ema_alpha) * sc->norm_denom_smooth
+                              + sc->norm_ema_alpha * denom;
+    else {
+        sc->norm_denom_smooth = denom;
+        sc->norm_denom_valid = 1;
+    }
+    float use_denom = fmaxf(sc->norm_denom_smooth, 0.01f);   /* 防除零/过小 */
+
     static float cnn_in_buf[16000];
     float *cnn_in = cnn_in_buf;
-    for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / denom;
+    for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / use_denom;
 
     /* CNN 前向 → 30 维原始 logits */
     float logits[SC_DW_MAX];

@@ -28,6 +28,13 @@ typedef struct {
     /* P0-2 增益时间平滑参数 (scene_ctrl_set_gain_smoothing 覆盖; 默认 0.5/0.85) */
     float  gain_smooth_beta;       /* EMA 平滑系数 (0~1; 1=不平滑) */
     float  gain_smooth_switch;     /* 旁路阈值 cos: 帧间低于此 → 场景切换, β 强制 1 */
+
+    /* 输入归一化稳定标定 (2026-08-10): 每秒独立 minmax 的 denom 逐秒漂移 → CNN 输入
+       逐秒抖 (实机抖动根因). EMA 平滑让缩放基准慢速跟随, 消除跳变. alpha=新值权重
+       (0.1 ≈ 10s 时间常数). 与训练侧幅度增强 (0.5~2.0) 自洽. */
+    float  norm_denom_smooth;      /* 平滑后的归一化 denom */
+    int    norm_denom_valid;       /* 是否有历史基准 */
+    float  norm_ema_alpha;         /* EMA 系数 (默认 0.1) */
 } scene_ctrl_t;
 
 int  scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len);

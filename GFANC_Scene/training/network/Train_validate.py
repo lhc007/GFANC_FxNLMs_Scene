@@ -44,6 +44,10 @@ LR = 0.01            # MIMO 原配置 (Adam, 每 5 轮 ×0.5)
 WEIGHT_DECAY = 1e-4
 LR_STEP = 5
 LR_GAMMA = 0.5
+# 幅度不变性增强 (2026-08-10): 归一化后乘对数均匀随机增益, 教 CNN"输入整体缩放
+# ≠ 增益方向改变" → 治部署端每秒独立 minmax 的 denom 漂移导致的实机抖动.
+# None=不增强; 验证/评估不走增强 (选模公平). 若验证 cos 明显下降, 收窄范围.
+GAIN_RANGE = (0.5, 2.0)
 
 # 数据路径 — 与 label_real_noise.py / recluster_real.py 输出一致
 DATA_DIR      = r'D:\Dataset\Real_world_Dataset'
@@ -68,9 +72,10 @@ def _init_bandpass(device):
     _bp_w, _bp_pad = make_bandpass_tensor(_BP_PATH, device)
 
 
-def prepare_batch(x):
-    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_process 一致)."""
-    return _pbatch(x, _bp_w, _bp_pad)
+def prepare_batch(x, gain_range=None):
+    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_process 一致).
+    gain_range=(lo,hi): 幅度不变性增强 (训练用; 验证/评估不传, 保证选模公平)."""
+    return _pbatch(x, _bp_w, _bp_pad, gain_range)
 
 
 # 使用均匀分布初始化卷积层权重
@@ -116,7 +121,7 @@ def train_single_epoch(model, data_loader, loss_fn, optimizer, device, scaler=No
 
     for input, target in data_loader:
         input, target = input.to(device, non_blocking=True), target.to(device, non_blocking=True)
-        input = prepare_batch(input)
+        input = prepare_batch(input, gain_range=GAIN_RANGE)
 
         # 混合精度上下文
         with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
