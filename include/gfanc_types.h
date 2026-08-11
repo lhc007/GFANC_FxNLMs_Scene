@@ -113,6 +113,33 @@ typedef struct {
        否则 β 慢速平滑, 吸收带选择抖动 (OCG/cos 闸门不再被抖动触发). */
     float gain_smooth_beta;    /* EMA 平滑系数 (env: GFANC_GAIN_SMOOTH, 默认 0.5; 1=关闭平滑) */
     float gain_smooth_switch;  /* 旁路阈值: 帧间增益 cos 低于此视为场景切换, β 强制 1 (默认 0.85) */
+
+    /* 环境安静检测 (P0-5, 治"噪声消失后反相声残留/嗡嗡声") 阶段③ 判据 (2026-08-11):
+       唯一可靠信号 = 参考麦塌底 (ref<quiet_ref_max = 无真实噪声进参考麦). 深对消/
+       1000Hz 天花板时 ref 都停在 0.048, 只有噪声真停才塌到 0.040. anti 仍在输出
+       (anti>quiet_anti_rms = 有残留反相要消) 持续 quiet_hold 秒 → 判定噪声消失 →
+       冻结梯度 + 逐样本衰减 Wc, 反噪声平滑消退.
+       实测证伪 NR/err 门 (不再用于进入): 反噪声还开着时声学上仍在"抵消"底噪,
+       NR 保持 8-12dB 不塌 → 用它当门槛安静永远进不去; 反噪声衰减过渡期 err 先
+       冲到 0.08 再塌 → err 门把 3s 计数打断. quiet_nr_db/quiet_err_max 字段保留
+       仅为 env 兼容, 不再参与判定.
+       退出: ref 重回安静基准的 quiet_exit 倍 (路噪回归) 或 err 重回安静期 err
+       基准的 quiet_err_exit 倍 (纯音回归 — 纯音 ref 只比底噪高 20%, ref 判据
+       够不着, 靠 err 先冲高触发) → 重建 INIT. */
+    float quiet_anti_rms;      /* anti 高于此才考虑安静判定 (env: GFANC_QUIET_ANTI, 默认 0.02) */
+    float quiet_nr_db;         /* [弃用, 仅 env 兼容] 原 NR 门 (阶段③ 实测 NR 不塌, 已移出判据) */
+    int   quiet_hold;          /* 连续秒数 (env: GFANC_QUIET_HOLD, 默认 3) */
+    float quiet_exit;          /* ref 重回安静基准×此值 → 退出安静重建 (env: GFANC_QUIET_EXIT, 默认 1.5) */
+    float quiet_ref_max;       /* 参考麦残差低于此才算"无噪声进入" (env: GFANC_QUIET_REF,
+                                  默认 0.045): 深对消/1000Hz 时 ref=0.048 仍高, 被此门挡住 */
+    float quiet_err_max;       /* [弃用, 仅 env 兼容] 原 err 门 (阶段③ 实测反噪声过渡期 err
+                                  先冲高打断计数, 已移出判据) */
+    float quiet_err_exit;      /* 安静中 err 重回 err 基准×此值 → 退出重建 (env: GFANC_QUIET_ERR_EXIT,
+                                  默认 2.0): 治纯音回归 ref 判据够不着时靠 err 跳变退出 */
+    int   quiet_ref_memory;    /* 距 ref 上次高于 quiet_ref_max 的秒数上限: 超过视为"从来就
+                                  安静", 不判定噪声消失 — 防宽带弱噪声 (ref 一直低于门槛,
+                                  如马路噪音 ref≈0.038) 被绝对阈值误判而砍掉反相 (env:
+                                  GFANC_QUIET_MEMORY, 默认 20) */
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -151,6 +178,16 @@ typedef struct {
                            翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
     0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
                            帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
+    0.02f, 8.0f, 3, 1.5f, 0.045f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
+                           quiet_hold, quiet_exit, quiet_ref_max, quiet_err_max(弃用),
+                           quiet_err_exit, quiet_ref_memory.
+                           P0-5 阶段④: anti>0.02 且 ref<0.045 且"ref 曾于 quiet_ref_memory
+                           秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
+                           NR/err 门已移出判据 (实测 NR 噪声停后不塌 8-12dB、err 过渡期
+                           先冲高). quiet_ref_memory 守卫治阶段④ 实测: 宽带弱噪声
+                           (ref≈0.038 < 门槛) 被绝对阈值误判"噪声消失" → 反相被砍 → 0dB.
+                           退出: ref 重回 1.5× 或 err 重回 2.0× 安静基准 → 重建.
+                           quiet_anti_rms 0.05→0.02: 残余 anti≈0.03 也能抓到. */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -185,6 +222,14 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
     if ((s = getenv("GFANC_OCG_HOLD")))     cfg->ocg_hold    = atoi(s);
     if ((s = getenv("GFANC_GAIN_SMOOTH"))) cfg->gain_smooth_beta = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_ANTI"))) cfg->quiet_anti_rms = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_NR")))   cfg->quiet_nr_db    = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_HOLD"))) cfg->quiet_hold     = atoi(s);
+    if ((s = getenv("GFANC_QUIET_EXIT"))) cfg->quiet_exit     = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_REF")))  cfg->quiet_ref_max  = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_ERR")))  cfg->quiet_err_max  = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_ERR_EXIT"))) cfg->quiet_err_exit = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_MEMORY"))) cfg->quiet_ref_memory = atoi(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

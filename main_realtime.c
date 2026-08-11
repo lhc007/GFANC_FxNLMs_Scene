@@ -161,6 +161,15 @@ typedef struct {
     volatile LONG cold_hold;     /* cold start anti 硬限幅保护, 2s 后释放 */
     int    diverge_sec;           /* anti_rms 连续超限秒数 (≥2s 触发 Wc 救援) */
     float  prev_err_ref;          /* P0-4: 上一秒 err_rms/ref_rms (上升趋势=反相生长, 健康收敛是下降) */
+    /* P0-5: 环境安静检测 (治"噪声消失后嗡嗡声"): anti 大但 NR 低 → 冻结+衰减 Wc */
+    int    quiet_sec;             /* anti 无对消效果连续秒数 (>=quiet_hold 进入安静) */
+    int    quiet_since_active;    /* 距 ref 上次高于 quiet_ref_max 的秒数 — 防弱噪声误判为"噪声消失" */
+    volatile int quiet_active;    /* 1=安静模式: 回调冻结梯度 + 衰减 Wc */
+    float  quiet_floor;           /* 安静期 ref_rms 基准 (EMA, 退出判定: ref 重回基准×quiet_exit) */
+    float  quiet_err_floor;       /* 安静期 err_rms 基准 (EMA, 退出判定: err 重回基准×quiet_err_exit) */
+    int    reinit_needed;         /* 安静退出后请求重建 INIT (下秒 first_sec=1) */
+    int    init_skip_agc;         /* 重建 INIT 时跳过自动增益重标定 (保留已标定增益) */
+    float  leak_ema;              /* 自适应 leak 连续 EMA (治 anti_rms 跨档 1×↔5×↔10× 跳变) */
     volatile int diverged;        /* 1=当前处于发散态 (pa>>pe 且 anti 大), NR 显示 DIV */
     int      nan_in_cnt;        /* NaN/Inf 输入样本累计 (R-8 看门狗) */
     int      nan_out_hold;      /* 连续 NaN anti 样本计数, >FS_ANC 触发 FIR 复位 */
@@ -331,13 +340,16 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         }
 
         /* 自适应 leak: anti RMS 偏高时自动加强正则化, 防 Wc 慢性漂移.
-           平时 leak 不变, anti>0.06 时逐渐加大 (max 10×). 滞后释放防抖动. */
+           平时 leak 不变, anti>0.06 时逐渐加大 (max 10×). 滞后释放防抖动.
+           2026-08-11 (P0-5): 离散分档 (1/2/5/10×) 改连续映射 + EMA — anti_rms
+           跨档 (如 0.10↔0.15) 时 leak 每秒硬跳 → Wc 生长率阶跃 → anti 幅度 1Hz
+           泵动 (听感: 持续滋滋). 连续化 + 慢 EMA 消除阶跃. */
         {   float ar = ctx->anti_rms;  /* 上一帧平滑值 */
             float mult = 1.0f;
-            if      (ar > 0.15f) mult = 10.0f;
-            else if (ar > 0.10f) mult = 5.0f;
-            else if (ar > 0.06f) mult = 2.0f;
-            ctx->fx.leak = cfg.leak * mult;
+            if      (ar > 0.18f) mult = 10.0f;
+            else if (ar > 0.06f) mult = 1.0f + 9.0f * (ar - 0.06f) / 0.12f;  /* 连续 1→10× */
+            ctx->leak_ema += 0.001f * (mult - ctx->leak_ema);  /* ~62ms 时间常数 */
+            ctx->fx.leak = cfg.leak * ctx->leak_ema;
         }
 
         /* FxNLMS 实时路径: anti=Wc⊗ref_anc, 梯度用err_meas直接驱动 (不合成err)
@@ -348,11 +360,14 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
            输出被钳到 ±0.12 时若继续用 err 驱动 Wc, 强噪声下 Wc 开环增长;
            软释放段(后1s, cap 0.12→1.0)梯度活跃, Wc 在输出受界内自适应收敛. */
         if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
+            || ctx->quiet_active
             || ctx->cold_hold > FS_ANC
             || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
             fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
-            /* 静音/啸叫期间 Wc 持续衰减 — 反馈事件后 Wc 自行退回到安全区 */
-            if (ctx->safety_mute || ctx->peak_mute
+            /* 静音/安静/啸叫期间 Wc 持续衰减 — 反馈事件/噪声消失后 Wc 自行退回到安全区.
+               P0-5: quiet_active 时冻结梯度 + 衰减 Wc → anti 平滑消退, 治"噪声消失后
+               嗡嗡声" (0.04 底噪不被当有效噪声持续降). */
+            if (ctx->safety_mute || ctx->peak_mute || ctx->quiet_active
                 || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
                 const float dk = 1.0f - WC_MUTE_DECAY;  /* 半衰期~0.25s */
                 for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= dk;
@@ -628,12 +643,13 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
     sm_fmt_top_gains(gains, ctx->sc.K, topbuf, sizeof(topbuf));
-    printf("[CNN] top=%s cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s gain=%.0fx cb=%d%s\n",
+    printf("[CNN] top=%s cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s%s gain=%.0fx cb=%d%s\n",
            topbuf, cos_sim,
            ctx->ocg.active, ctx->ocg.n_clusters,
            nr_str, ctx->anti_rms,
            ctx->safety_mute ? " [MUTE]" : "",
            ctx->peak_mute ? " [PMUTE]" : "",
+           ctx->quiet_active ? " [QUIET]" : "",
            ctx->ramp_cnt > 0 ? " [RAMP]" : "",
            cfg.mic_pre_gain, ctx->callback_count,
            ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
@@ -897,6 +913,8 @@ int main(void) {
     if (!ctx) { fprintf(stderr, "OOM: rt_ctx_t\n"); ret = 1; goto cleanup; }
     ctx->cnn_buf_ready = -1;  /* -1=无就绪块, 0/1=该块已满 */
     ctx->anti_est_offset = 0;  /* BUG-1: 分散采样相位, 每帧随机化 (0..63) */
+    ctx->leak_ema = 1.0f;      /* P0-5: 自适应 leak 连续 EMA 初值 (1×) */
+    ctx->quiet_since_active = 0x7fffffff; /* 哨兵: 启动不算"刚有大噪声", 须 ref 曾高于门槛才允许安静判定 */
     /* R-14: 初始化 4 通道抗混叠低通 (fc=6.5kHz @48k, 2阶 Butterworth) */
     for (int c = 0; c < 4; c++) biquad_init_lpf(&ctx->aa_filt[c], 6500.0f, 48000.0f);
     g_ctx = ctx;
@@ -1181,6 +1199,17 @@ int main(void) {
         LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
         if (ready < 0) continue;
 
+        /* P0-5: 安静退出 (噪声回归) → 下秒走 first_sec INIT 重建 Wc.
+           跳过自动增益重标定 — 保留已标定增益, 防噪声回归瞬间重标定.
+           清 quiet_active (恢复派发) + 取消挂起的 CrossFader (避免与 INIT 冲突). */
+        if (ctx->reinit_needed) {
+            ctx->quiet_active = 0;
+            InterlockedExchange(&ctx->fade_cnt, 0);
+            ctx->first_sec = 1;
+            ctx->reinit_needed = 0;
+            ctx->init_skip_agc = 1;
+        }
+
         float gains[SC_DW_MAX] = {0};
         int new_scene;
         const int K = ctx->sc.K;
@@ -1222,8 +1251,9 @@ int main(void) {
             sm_fmt_top_gains(gains, K, topbuf, sizeof(topbuf));
             printf("[CNN] INIT top=%s (ramp %dms, mute_hold %dms)\n",
                    topbuf, init_ramp_ms, cfg.mute_hold_ms);
-            /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ── */
-            if (!getenv("GFANC_MIC_GAIN")) {
+            /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ──
+               P0-5: 安静重建时跳过 (init_skip_agc) — 保留已标定增益 */
+            if (!getenv("GFANC_MIC_GAIN") && !ctx->init_skip_agc) {
                 /* 自动增益标定: 目标 ref≈0.03 (-30dBFS), 上限 5×.
                    超过 5× 的部分需通过 UMC 物理旋钮提升 — 数字增益同步放大反馈残余. */
                 float auto_gain = TARGET_REF_RMS / (ctx->ch_rms[0] + 1e-10f);
@@ -1236,6 +1266,7 @@ int main(void) {
                        capped ? " (capped@20x — 提高 UMC 物理旋钮)" : "");
             }
             ctx->first_sec = 0;
+            ctx->init_skip_agc = 0;
         } else {
             /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur).
                Reset 模式以该值作触发判据; Continuous 模式仅供诊断. */
@@ -1245,7 +1276,7 @@ int main(void) {
 
             /* 运行时统计日志 (C1) */
             if (ctx->log_file) {
-                fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s\n",
+                fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s,%d,%d\n",
                         log_sec++, new_scene, gains[new_scene], cos_sim,
                         ctx->nr_level, ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
                         ctx->safety_mute ? "MUTE" : "",
@@ -1266,14 +1297,78 @@ int main(void) {
 
             check_wc_divergence(ctx);
             check_convergence(ctx);
+
+            /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
+               判据 (2026-08-11 阶段④ 修正): 唯一可靠信号是参考麦塌底
+               (ref < quiet_ref_max = 无真实噪声进入参考麦) 且"曾经有大噪声最近才停"
+               (quiet_since_active <= quiet_ref_memory)。深对消/1000Hz 天花板时
+               ref 都停在 0.048 (音仍进参考麦), 只有噪声真停才塌到 0.040.
+               anti 仍在输出 (anti > quiet_anti_rms = 有残留要消) → 持续 quiet_hold 秒
+               → 进入安静模式: 回调冻结梯度 + 逐样本衰减 Wc, 反噪声平滑消退.
+               不用 NR 判据 (阶段③ 实测证伪): 反噪声还开着时它声学上仍在"抵消"
+               底噪, NR 保持 8-12dB 不塌, 用它当门槛 → 安静永远进不去, 残留不消.
+               不用 err 判据 (同实测): 反噪声衰减过渡期 err 会先冲到 0.08 再塌,
+               用它当门槛会把 3s 计数打断, 安静迟触发.
+               quiet_since_active 守卫 (阶段④ 实测加): 马路噪音宽带频谱下同样响度
+               ref 只有 0.038 (低于 0.045 门槛), 被绝对阈值误判为"噪声停了" → anti
+               被砍到 0 → 全程 0dB。守卫要求 ref 曾在 quiet_ref_memory 秒内高于门槛
+               (真有大噪声), 才允许判定"噪声消失"。弱噪声 (ref 一直低于门槛) 不再
+               触发安静, 反相继续生长。
+               退出: ref_rms 重回安静基准的 quiet_exit 倍 (路噪回归) 或 err_rms 重回
+               安静期 err 基准的 quiet_err_exit 倍 (纯音回归 — 纯音 ref 只比底噪高
+               20%, ref 判据够不着, 靠 err 先冲高 0.026→0.07+ 触发) → 重建 INIT. */
+            /* ref 活跃追踪: 每 1s 更新. ref 高于门槛=有真噪声, 清零; 否则累计秒数. */
+            if (ctx->ref_rms > cfg.quiet_ref_max)
+                ctx->quiet_since_active = 0;
+            else if (ctx->quiet_since_active < 0x7fffffff)
+                ctx->quiet_since_active++;
+            if (ctx->quiet_active) {
+                /* 安静中: 持续追踪 ref/err 基准 (anti 衰减后 ref/err 回落至真底噪), 检测噪声回归.
+                   quiet_floor 慢 EMA: 反噪声消退期间 ref 仍含污染, 慢跟随防误判回归 */
+                ctx->quiet_floor = 0.9f * ctx->quiet_floor + 0.1f * ctx->ref_rms;
+                ctx->quiet_err_floor = 0.9f * ctx->quiet_err_floor + 0.1f * ctx->err_rms;
+                if (ctx->ref_rms > ctx->quiet_floor * cfg.quiet_exit
+                    || ctx->err_rms > ctx->quiet_err_floor * cfg.quiet_err_exit) {
+                    /* 保持 quiet_active=1 到重建块统一清除: 本秒派发块被抑制,
+                       避免用旧的 quiet 期 CNN 方向误触发一次 RESET */
+                    ctx->reinit_needed = 1;
+                    if (ctx->log_file)
+                        fprintf(ctx->log_file, "# EVENT: quiet exit ref=%.4f>%.4fx%.0f err=%.4f>%.4fx%.0f\n",
+                                ctx->ref_rms, ctx->quiet_floor, cfg.quiet_exit,
+                                ctx->err_rms, ctx->quiet_err_floor, cfg.quiet_err_exit);
+                    printf("[QUIET] exit ref=%.4f>%.4fx%.0f err=%.4f>%.4fx%.0f — 噪声回归, 重建降噪\n",
+                           ctx->ref_rms, ctx->quiet_floor, cfg.quiet_exit,
+                           ctx->err_rms, ctx->quiet_err_floor, cfg.quiet_err_exit);
+                }
+            } else if (ctx->anti_rms > cfg.quiet_anti_rms
+                       && ctx->ref_rms < cfg.quiet_ref_max
+                       && ctx->quiet_since_active <= cfg.quiet_ref_memory
+                       && ctx->ramp_cnt == 0 && ctx->cold_hold == 0
+                       && !ctx->safety_mute && !ctx->peak_mute) {
+                if (++ctx->quiet_sec >= cfg.quiet_hold) {
+                    ctx->quiet_sec = 0;
+                    ctx->quiet_active = 1;
+                    ctx->quiet_floor = ctx->ref_rms;
+                    ctx->quiet_err_floor = ctx->err_rms;
+                    if (ctx->log_file)
+                        fprintf(ctx->log_file, "# EVENT: QUIET anti=%.3f NR=%.1f ref=%.4f err=%.4f x%ds\n",
+                                ctx->anti_rms, ctx->nr_level, ctx->ref_rms, ctx->err_rms, cfg.quiet_hold);
+                    printf("[QUIET] 噪声消失: anti=%.3f NR=%.1fdB ref=%.4f err=%.4f (无对消效果) — 反噪声消退\n",
+                           ctx->anti_rms, ctx->nr_level, ctx->ref_rms, ctx->err_rms);
+                }
+            } else {
+                ctx->quiet_sec = 0;
+            }
+
             /* 去场景层模式派发: reset=OCG 簇索引变化 → CrossFader 过渡到新 Wc;
                continuous=永不重置 (CNN 仅首秒 INIT 一次).
+               P0-5: quiet_active 期间跳过 — 反噪声在消退, 不允许重置重新拉高 Wc.
                OCG (默认关闭 — 2026-08-10 P0-3 实测证伪): 纯音深对消下增益在两
                个模式间震荡 (帧间 cos 0.65-0.71), OCG 簇分配随震荡翻转 (0↔1↔2),
                每次翻转都 RESET → 深对消被反复打断 (最高仅 ~18dB, 而 OCG 关可达
                27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
                cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
-            if (cfg.gfanc_mode == 1) {          /* reset */
+            if (!ctx->quiet_active && cfg.gfanc_mode == 1) {   /* reset (安静期不派发) */
                 int do_reset = cfg.ocg_enable ? ocg_step(&ctx->ocg, gains)
                                               : (cos_sim < cfg.switch_threshold);
                 if (do_reset) apply_reset(ctx, cos_sim, gains, cfg.ocg_enable);

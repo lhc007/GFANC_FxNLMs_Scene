@@ -31,6 +31,23 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-11] P0-5 环境安静检测（治"噪声消失后反相声残留/嗡嗡声" + 宽带弱噪声误杀守卫 + leak 连续化治滋滋）v1.9
+- **状态**: 已提交 <此提交>
+- **基线**: 2ad4b69
+- **变更代码**:
+  - 修改: `include/gfanc_types.h` — P0-5 新增安静检测参数组（`quiet_anti_rms=0.02` / `quiet_ref_max=0.045` / `quiet_hold=3` / `quiet_exit=1.5` / `quiet_err_exit=2.0` / `quiet_ref_memory=20`; `quiet_nr_db`/`quiet_err_max` 标记弃用, 仅 env 兼容）+ env `GFANC_QUIET_*` 加载
+  - 修改: `main_realtime.c` — 环境安静状态机（进入=anti>0.02 && ref<0.045 && quiet_since_active≤20 持续 3s → 冻结梯度 + 逐样本衰减 Wc 至静音; 退出=ref 重回 1.5× 或 err 重回 2.0× 安静基准 → 重建 INIT）; **quiet_since_active 哨兵守卫**（启动初始化 0x7fffffff, 不算"刚有大噪声"; ref>门槛清零, 否则累计——弱噪声从启动就在则永不触发安静）; leak 离散分档改连续映射 + `leak_ema` 慢 EMA
+  - 新增: `Noise Examples/tone250_30s.wav` / `tone1000_30s.wav` / `tone500_30s.wav` / `exam_tone_road_tone_60s.wav` / `test_ocg_250_1000_250_45s.wav` 等测试纯音夹具（250Hz-only 隔离滋滋声 + 弱噪声复现用）; 根目录旧 tone wav 移入 `Noise Examples/`
+- **变更原因**: 治实机两个听感问题。① **噪声停后扬声器继续输出残余反相声**（嗡嗡 5-7s 不消）: 安静检测判据三阶段演进——首版 anti>0.05&&NR<6 够不着残余（0.03）; 阶段③ 实测证伪 NR 门（噪声停后 NR 保持 8-12dB 不塌, 反相声学上仍在抵消底噪）→ 改 **ref 塌底判据**; 阶段⑤ 暴露**宽带弱噪声误杀**（马路噪音 ref≈0.038 < 绝对门槛 0.045, 被误判"噪声消失" → 反相砍到 0 → 30s 全程 0dB, 根因=绝对阈值照 250Hz ref=0.048 标定, 同响度宽带 ref 更低）→ 加哨兵守卫。② **运行期滋滋声**: leak 离散分档（1/2/5/10×）每秒硬跳 → anti 1Hz 泵动, 改连续映射 + EMA
+- **造成影响**:
+  - 行为: 默认配置下噪声消失 → ~3s 后 `[QUIET]` 冻结梯度 + 衰减 Wc → 1-2s 内静音; 噪声回归 → `[QUIET] exit` + 重建。宽带弱噪声（ref<0.045）不再被误判为"噪声消失", 反相持续生长
+  - 配置: 新增 `GFANC_QUIET_ANTI`(0.02) / `GFANC_QUIET_REF`(0.045) / `GFANC_QUIET_HOLD`(3) / `GFANC_QUIET_EXIT`(1.5) / `GFANC_QUIET_ERR_EXIT`(2.0) / `GFANC_QUIET_MEMORY`(20)
+  - 测试/回归: 离线 NR_true 9.8/9.6/9.3 **无回归**（改动只加门, 不动自适应路径）; 实机 [QUIET] 触发→衰减→exit→重建全通
+  - 性能/内存: 无（安静检测为 1Hz 标量运算, 无新增线程/锁）
+  - 未验证项: 阶段⑤ 哨兵守卫版实机复测待跑（弱噪声不再被误杀 / 噪声停→[QUIET]+静音 / 回归→exit+重建）; 滋滋声是否根除待 250Hz-only 测试隔离（可能含扬声器硬件成分）
+- **验证方式**: 实机跑马路噪音（ref<0.045）确认反相持续生长不再被砍; 放 250Hz（ref>0.048）→ 停 → `[QUIET] 噪声消失` + 静音 → 再放 → `[QUIET] exit` + 重建; 离线三文件回归
+- **回退方式**: `GFANC_QUIET_MEMORY=9999` 关闭哨兵守卫（恢复阶段③ 行为）; 或 git revert 本提交
+
 ### [2026-08-10] 论文改进逐项落地 v1.8: τ解耦 + 自适应增益平滑 + OCG 定案关闭 + 发散救援三重门控 + fade 清理 + LayerCAM 诊断
 - **状态**: 已提交 <此提交>
 - **基线**: bdf7639（fix: 实机验证闭环 — reset 闸门 0.6 + OCG 默认关 + safety_mute 判据修正）

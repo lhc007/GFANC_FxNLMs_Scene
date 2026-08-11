@@ -25,6 +25,9 @@ test/test_signal.wav
 test/gen_test_wav.exe
 test/test_fir.exe
 
+# Local backups (模型/训练产物备份, 不入库)
+backup_*/
+
 # Claude Code (local)
 .claude/
 .agents/
