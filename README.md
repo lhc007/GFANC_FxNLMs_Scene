@@ -134,6 +134,11 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 ```
 运行后会列出音频设备，输入设备编号（如 `23`），开始实时降噪。按 `Ctrl+C` 停止。
 
+> **想试场景切换（OCG 聚类闸门）？** 默认**关闭**（`GFANC_OCG=0`，稳定性最佳，日常开窗降噪用默认即可）。想验证"换噪声类型自动切换反相"时再开：
+> - **PowerShell**：`$env:GFANC_OCG="1"; ./gfanc_realtime.exe`（关掉：重开终端即可，或 `Remove-Item Env:GFANC_OCG`）
+> - **Git Bash / WSL**：`GFANC_OCG=1 ./gfanc_realtime.exe`
+> ⚠️ OCG 会在检测到新噪声类型时重置 Wc 以跟随，纯音深对消下可能引入抖动（实测证伪后默认关，见 [CHANGELOG](docs/变更记录_CHANGELOG.md)）——验证用，不是默认稳定配置。
+
 #### 怎么验证真的有效
 
 **用 250Hz 纯音验证，别用宽带噪音**。系统受环路延迟限制，只能对消窄带/周期成分——纯音最能反映真实对消能力：
@@ -550,7 +555,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos(anchor,cur)<0.6 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
 | Reset 触发 | 默认 cos(anchor,cur)<0.6 (env: GFANC_RESET_THRESH) | 场景真正切换才重置; 0.6 是实机纯音深对消验证值 (0.8 在深对消时误杀健康 Wc, 见 CHANGELOG) |
-| OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估 |
+| OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估; 开启命令见 [§5 运行](#5-运行) |
 | 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
 | 质心漂移 α | 0.1 (env: GFANC_OCG_ALPHA) | 质心 EMA 跟随增益方向 (吸收慢漂移) |
 | 簇上限 | 8 (env: GFANC_OCG_CLUSTERS) | LRU 淘汰最久未命中簇 |
