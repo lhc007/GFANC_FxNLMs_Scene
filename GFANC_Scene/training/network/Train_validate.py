@@ -53,9 +53,9 @@ GAIN_RANGE = (0.5, 2.0)
 LOG_EVERY = 50
 
 # 数据路径 — 与 label_real_noise.py / recluster_real.py 输出一致
-DATA_DIR      = r'D:\Dataset\Real_world_Dataset'
-TRAIN_CSV     = os.path.join(DATA_DIR, 'Index_real_Training_data.csv')
-VALID_CSV     = os.path.join(DATA_DIR, 'Index_real_Validate_data.csv')
+DATA_DIR      = r'D:\Dataset\Synthetic_Dataset'
+TRAIN_CSV     = os.path.join(DATA_DIR, 'Index_synth_Training_data.csv')
+VALID_CSV     = os.path.join(DATA_DIR, 'Index_synth_Validate_data.csv')
 # WAV 目录 = CSV 同目录下 {Training,Validate}_data (File_path 仅为文件名)
 TRAIN_WAV_DIR = os.path.join(DATA_DIR, 'Training_data')
 VALID_WAV_DIR = os.path.join(DATA_DIR, 'Validate_data')

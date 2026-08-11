@@ -105,6 +105,8 @@ typedef struct {
     float ocg_tau;             /* 簇半径阈值: cos(g',c)>=τ 归入, 否则新建簇 (env: GFANC_OCG_TAU, 默认 0.8) */
     float ocg_alpha;           /* 质心 EMA 漂移系数 (env: GFANC_OCG_ALPHA, 默认 0.1) */
     int   ocg_max_clusters;    /* 簇上限 (env: GFANC_OCG_CLUSTERS, 默认 8) */
+    int   ocg_hold;            /* 持续性判据: 候选簇需连续命中帧数 (1Hz→帧数≈秒数, 默认 3)
+                                  (env: GFANC_OCG_HOLD, 默认 3; <=1 回退立即切换) */
 
     /* CNN 增益时间平滑 (P0-2, 治纯音带跨秒翻转抖动 — bands 2/6/14/17/19):
        自适应 EMA — 帧间 cos < switch (场景真切换) → β=1 立即跟随 (无延迟);
@@ -141,15 +143,12 @@ typedef struct {
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
-    0, 0.8f, 0.1f, 8,   /* ocg_enable, ocg_tau, ocg_alpha, ocg_max_clusters (OCG 聚类闸门).
-                           ocg_enable 1→0 (2026-08-10): 纯音深对消下 OCG 簇抖动
-                           (cos 0.99-1.00 也触发) 与 τ 复用 switch_threshold 的耦合
-                           都加剧 reset 误杀.
-                           2026-08-10 P0-3 复测 (τ 解耦 + 增益平滑后): 仍失败 —
-                           深对消被 diverge 救援打断后增益漂移落到簇外 (cos 0.52),
-                           OCG 建新簇 → 连续 RESET → 深对消丢失, 簇 0↔1 ping-pong.
-                           验证有效配置 = OCG 关 + THRESH 0.6 + 增益平滑 (P0-2).
-                           OCG 保留代码, 待簇判据更鲁棒后 (如持续性差异) 再评估. */ \
+    0, 0.8f, 0.1f, 8, 3, /* ocg_enable, ocg_tau, ocg_alpha, ocg_max_clusters, ocg_hold.
+                           ocg_enable 默认 0 (2026-08-10 P0-3 证伪): 纯音深对消下增益
+                           双模震荡 → 簇翻转 → 每次翻转 RESET, 深对消丢失 (开≈18dB vs 关 27.5dB).
+                           2026-08-11 修复: 实机 CNN 稳定 (前提① cos>0.95 达成) +
+                           ocg_hold 持续性判据 (前提②: 候选簇连续 3s 命中才切换, 治抖动
+                           翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
     0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
                            帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
 }
@@ -184,6 +183,7 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_OCG_TAU")))     cfg->ocg_tau     = (float)atof(s);
     if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha = (float)atof(s);
     if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
+    if ((s = getenv("GFANC_OCG_HOLD")))     cfg->ocg_hold    = atoi(s);
     if ((s = getenv("GFANC_GAIN_SMOOTH"))) cfg->gain_smooth_beta = (float)atof(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */

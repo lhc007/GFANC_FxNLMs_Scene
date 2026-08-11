@@ -46,14 +46,25 @@ typedef struct {
     int   n_clusters;        /* 当前簇数 (诊断) */
     int   active;            /* 当前滤波器的簇索引 (诊断) */
     unsigned frame;          /* 帧计数器 (LRU 时间戳) */
+
+    /* 持续性判据 (P0-3 修复, 2026-08-11): 簇索引变化时不立即切换,
+       要求候选簇连续命中 hold_frames 帧才真正切换 (1Hz → 帧数≈秒数).
+       抑制纯音深对消下增益双模震荡 → 簇翻转 → 每次翻转 RESET 的抖动误杀;
+       真场景切换连续多帧同簇, 正常触发. */
+    int   hold_frames;       /* 候选簇需连续命中帧数 (cfg.ocg_hold, 默认 3) */
+    int   pending_cluster;   /* 候选簇索引 (-1=无) */
+    int   pending_count;     /* 候选簇已连续命中帧数 */
 } ocg_t;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** 初始化 (在 K 确定后调用, 即 scene_ctrl_init 之后). 失败返回 -1. */
-int  ocg_init(ocg_t *ocg, int K, float tau_cos, float alpha, int max_clusters);
+/** 初始化 (在 K 确定后调用, 即 scene_ctrl_init 之后). 失败返回 -1.
+ *  hold_frames: 持续性判据 — 候选簇需连续命中帧数 (1Hz → 帧数≈秒数).
+ *                <=1 回退旧行为 (立即切换); 默认 3. */
+int  ocg_init(ocg_t *ocg, int K, float tau_cos, float alpha, int max_clusters,
+              int hold_frames);
 
 /** 用首个增益向量建立簇 0 (INIT 时调用; 之后簇状态由 ocg_step 维护). */
 void ocg_reset(ocg_t *ocg, const float *gains);

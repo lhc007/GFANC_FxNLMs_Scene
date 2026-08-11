@@ -1105,9 +1105,10 @@ int main(void) {
     }
     /* P0-2: 增益时间平滑参数 (默认已在 scene_ctrl_init 设好, env 覆盖) */
     scene_ctrl_set_gain_smoothing(&ctx->sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
-    /* OCG 聚类闸门初始化: τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold) */
+    /* OCG 聚类闸门初始化: τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold);
+       持续性命中帧数 ocg_hold (P0-3 修复, 前提②) */
     if (ocg_init(&ctx->ocg, ctx->sc.K, cfg.ocg_tau,
-                 cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
+                 cfg.ocg_alpha, cfg.ocg_max_clusters, cfg.ocg_hold) != 0) {
         fprintf(stderr, "ERROR: ocg_init failed\n"); ret = 1; goto cleanup;
     }
     /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.

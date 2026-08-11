@@ -8,7 +8,8 @@
 #include "ocg.h"
 #include "scene_manager.h"
 
-int ocg_init(ocg_t *ocg, int K, float tau_cos, float alpha, int max_clusters)
+int ocg_init(ocg_t *ocg, int K, float tau_cos, float alpha, int max_clusters,
+             int hold_frames)
 {
     memset(ocg, 0, sizeof(*ocg));
     if (K < 1 || K > GFANC_C_MAX * GFANC_S_MAX) return -1;
@@ -18,7 +19,10 @@ int ocg_init(ocg_t *ocg, int K, float tau_cos, float alpha, int max_clusters)
     ocg->alpha = (alpha > 0.0f) ? alpha : 0.1f;
     ocg->max_clusters = (max_clusters < 1) ? 1 : max_clusters;
     if (ocg->max_clusters > OCG_MAX_CLUSTERS) ocg->max_clusters = OCG_MAX_CLUSTERS;
+    ocg->hold_frames = (hold_frames < 1) ? 1 : hold_frames;   /* 持续性判据 (>=1) */
     ocg->active = -1;
+    ocg->pending_cluster = -1;
+    ocg->pending_count = 0;
     return 0;
 }
 
@@ -42,6 +46,8 @@ void ocg_reset(ocg_t *ocg, const float *gains)
     ocg->n_clusters = 1;
     ocg->active = 0;
     ocg->frame = 0;
+    ocg->pending_cluster = -1;   /* 持续性判据: 重置后无候选 */
+    ocg->pending_count = 0;
 
     ocg_cluster_t *c0 = &ocg->clusters[0];
     c0->valid = 1;
@@ -76,10 +82,11 @@ int ocg_step(ocg_t *ocg, const float *gains)
 {
     ocg->frame++;
 
-    /* 零增益 (弱信号保持/CNN 失败) → 无方向, 保持当前滤波器 */
+    /* 零增益 (弱信号保持/CNN 失败) → 无方向, 保持当前滤波器.
+       同时清空候选 (持续弱信号期间的候选已无意义, 恢复后重新计时) */
     float n = 0.0f;
     for (int k = 0; k < ocg->K; k++) n += gains[k] * gains[k];
-    if (n < 1e-8f) return 0;
+    if (n < 1e-8f) { ocg->pending_cluster = -1; ocg->pending_count = 0; return 0; }
 
     /* 最近簇 (余弦相似度, 尺度不变) */
     int best = -1;
@@ -113,13 +120,33 @@ int ocg_step(ocg_t *ocg, const float *gains)
             for (int k = 0; k < ocg->K; k++) ctr[k] /= acc;
     }
 
-    /* 论文式 (4): 仅簇索引变化才更换滤波器 */
-    if (ocg->active < 0) {   /* 防御: 未初始化 (INIT 应已 ocg_reset) */
-        ocg->active = kp;
+    /* 防御: 未初始化 (INIT 应已 ocg_reset) */
+    if (ocg->active < 0) { ocg->active = kp; return 0; }
+
+    /* 持续性判据 (P0-3 修复): 簇索引变化不立即切换, 候选簇需连续命中
+       hold_frames 帧才真正切换. 抖动帧 (深对消下增益双模震荡, 帧间 cos
+       0.99-1.00 也可能切换簇) 为稀疏/交替命中, 无法凑满连续帧 → 不误杀;
+       真场景切换连续多帧同簇 → 正常切换.
+       候选期间 FxNLMS 继续用旧滤波器, 不打断收敛 (这是 OCG 的原始目的). */
+    if (kp == ocg->active) {
+        /* 回到活动簇: 候选取消 (抖动结束/误入已回) */
+        ocg->pending_cluster = -1;
+        ocg->pending_count = 0;
         return 0;
     }
-    if (kp != ocg->active) {
+    if (kp == ocg->pending_cluster) {
+        /* 候选簇继续命中: 累计 */
+        ocg->pending_count++;
+    } else {
+        /* 新的候选簇 (或从 active 跳来的第一帧): 重新计时.
+           A→B→A→B 交替时每帧都换候选, 永远不满 hold — 抑制乒乓 */
+        ocg->pending_cluster = kp;
+        ocg->pending_count = 1;
+    }
+    if (ocg->pending_count >= ocg->hold_frames) {
         ocg->active = kp;
+        ocg->pending_cluster = -1;
+        ocg->pending_count = 0;
         return 1;
     }
     return 0;

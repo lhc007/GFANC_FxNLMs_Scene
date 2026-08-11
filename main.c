@@ -312,10 +312,11 @@ int main(int argc, char **argv)
     }
     /* P0-2: 增益时间平滑参数 (与实时版一致, env 覆盖) */
     scene_ctrl_set_gain_smoothing(&sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
-    /* OCG 聚类闸门 (与实时版一致): τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold) */
+    /* OCG 聚类闸门 (与实时版一致): τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold);
+       持续性命中帧数 ocg_hold (P0-3 修复, 前提②) */
     ocg_t ocg;
     if (ocg_init(&ocg, sc.K, cfg.ocg_tau,
-                 cfg.ocg_alpha, cfg.ocg_max_clusters) != 0) {
+                 cfg.ocg_alpha, cfg.ocg_max_clusters, cfg.ocg_hold) != 0) {
         fprintf(stderr, "ERROR: ocg_init failed\n"); return 1;
     }
     /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
@@ -477,6 +478,18 @@ int main(int argc, char **argv)
     for (int i = 0; i < 105; i++) printf("-");
     printf("\n");
 
+    /* A/B 对照 (GFANC_CNN_FIXED=1): 覆盖 CNN 输出为固定增益 (250Hz 纯音的实测输出),
+       证明"CNN 频率盲 → 输出方向恒定"对降噪的实际影响 (仅 FxLMS 自适应). */
+    int cnn_fixed = getenv("GFANC_CNN_FIXED") ? atoi(getenv("GFANC_CNN_FIXED")) : 0;
+    static const float fixed_gains[SC_DW_MAX] = {
+        /* spk0 (低频→高频): 250Hz 实测 tanh 输出 */
+        0.34f, 0.52f, 0.93f, 0.54f, 0.41f, 0.55f, 0.63f, 0.30f,
+        -0.04f, -0.05f, 0.00f, -0.05f, -0.03f, -0.02f, 0.73f,
+        /* spk1 */
+        0.45f, 0.47f, 0.72f, 0.49f, 0.63f, 0.48f, 0.31f, 0.16f,
+        0.28f, 0.15f, 0.09f, 0.07f, 0.04f, -0.04f, 0.40f
+    };
+
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
@@ -488,6 +501,11 @@ int main(int argc, char **argv)
             scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
         else {
             memcpy(gains, sc.prev_gains, K * sizeof(float));
+        }
+        if (cnn_fixed) {
+            /* A/B: 覆盖为固定增益 → Wc 恒定, 只剩 FxLMS 逐样本自适应 */
+            memcpy(gains, fixed_gains, K * sizeof(float));
+            scene_ctrl_construct_wc(&sc, gains, wc_cur);
         }
 
         /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) */
