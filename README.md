@@ -559,6 +559,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
 | 质心漂移 α | 0.1 (env: GFANC_OCG_ALPHA) | 质心 EMA 跟随增益方向 (吸收慢漂移) |
 | 簇上限 | 8 (env: GFANC_OCG_CLUSTERS) | LRU 淘汰最久未命中簇 |
+| 聚类持续性 | 3 (env: GFANC_OCG_HOLD, 1Hz→≈秒数; <=1 立即切换) | P0-3 持续性判据: 候选簇连续命中 N 帧才切换 — 治抖动翻转, 实机 250↔1000 双向真切换的关键 |
 | 增益时间平滑 | β=0.5, 旁路 cos=0.85 (env: GFANC_GAIN_SMOOTH) | P0-2: 纯音带跨秒翻转抖动被 EMA 吸收; 帧间 cos<0.85 (真场景切换) → β=1 立即跟随无延迟 |
 | Reset 过渡 | 1600 样本 (100ms) | CrossFader, =20Hz×2 周期 |
 | 嵌入式处理延迟 | 3ms 默认 (env: GFANC_EMBED_DELAY_MS) | 离线 pad Ŝ 模拟 ADC+DSP+DAC 因果缺口 (v1.5) |
