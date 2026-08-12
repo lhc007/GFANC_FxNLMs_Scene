@@ -91,11 +91,12 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c s
 
 ### 4. 校准声学路径（首次使用 / 换了硬件 / 换了摆放位置 —— 必做）
 
-系统必须知道"扬声器的声音怎么传到麦克风"（声学路径），才能算出正确的反噪声。**这些路径完全取决于你的摆放几何，换了位置就必须重测**。共两项：
+系统必须知道"扬声器的声音怎么传到麦克风"（声学路径），才能算出正确的反噪声。**这些路径完全取决于你的摆放几何，换了位置就必须重测**。共三项：
 
 | 校准项 | 测什么 | 什么时候重测 |
 |--------|--------|-------------|
-| **次级路径 + 环路延迟** | 扬声器→误差麦的传递 + FxLMS 对齐用的总延迟 | 换扬声器 / 换位置 / 换声卡 |
+| **次级路径 Ŝ** | 扬声器→误差麦的传递（扫频法，运行时默认加载） | 换扬声器 / 换位置 |
+| **环路延迟** | FxLMS 对齐用的总延迟（`calibrate_secondary.exe`） | 换声卡 / 换缓冲 / 首次 |
 | **反馈路径** | 扬声器→参考麦的正反馈（防啸叫） | 换扬声器 / 换位置 |
 
 ```bash
@@ -268,9 +269,94 @@ Done.
 - 注意：**离线默认 `GFANC_EMBED_DELAY_MS=0`**（R-58-8：训练世界无此延迟，3ms 会造成 anti 相位错位 48 样本 → 自适应发散）。启动日志打印净预览时间（基线 ≈ −1.9ms：64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）；实时还受 PC 控制路径延迟限制（净预览 ≈ −9ms，见下文"离线验证"）
 
 
+## 完整命令流（训练 → 实时运行）
+
+> 从训练到实时降噪的**一套完整命令**，按先后顺序执行。整条流程分两段：
+> - 🎯 **训练数据**（阶段 A）：纯 Python，产物落在 `GFANC_Scene/` 与 `data/`。**可选**——仓库自带训练好的权重，不训练可直接跳到阶段 B。
+> - 🎯 **系统运行**（阶段 B/C/D）：编译 + 声学校准 + 实时运行。首次 / 换硬件 / 换摆放必做，之后每次运行只走阶段 D。
+
+| 阶段 | 内容 | 必做？ | 何时做 |
+|------|------|--------|--------|
+| 🎯 训练数据 A | 子滤波器 → 标签 → 训练 CNN → 导出 `data/*.bin` | 仅重训模型 | 换模型 / 模型效果差 |
+| 🎯 系统运行 B | 编译两个校准程序 | 一次 | 首次 |
+| 🎯 系统运行 C | 声学路径校准（次级路径 Ŝ / 环路延迟 / 反馈） | 必做 | 首次 / 换硬件 / 换摆放 |
+| 🎯 系统运行 D | 编译实时版 + 运行验证 | 必做 | 每次 |
+
+### 🎯 训练数据（阶段 A — 可选）
+
+```bash
+# A0. 一次性依赖
+pip install numpy scipy pandas torch torchaudio
+
+# A1. 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
+cd GFANC_Scene
+python training/control_filters/Pre_training_broadband_and_decompose.py
+#    → models/MIMO_Pretrained_Control_filters_broadband.mat
+#      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
+
+# A2. 用实测声学路径 + 子滤波器基重标真实噪声标签（gain_0..29）
+python training/labeling/label_real_noise.py
+#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
+#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
+
+# A2b. 合成数据增强（可选，治 CNN 输入失聪；默认 60000/7500/7500，打标签 ~5.5h）
+python training/labeling/make_synthetic_dataset.py
+#    → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\*.wav
+#      + Index_synth_{split}_data.csv + Gains_synth_{split}_data.npy（LMS_MU=0.001, LMS_REPET=3）
+#      --gen-only 只生成；--label-only 只打标签（重跑不用再生成）
+
+# A3. 两阶段训练直接权重 CNN（合成预训练 → 真实微调，低 LR 防坍缩回低频处方）
+python training/network/Train_validate_synth.py
+#    → models/MIMO_M5_DirectWeight_Pretrain.pth（合成预训练，保留）
+#      + models/MIMO_M5_DirectWeight_Real.pth（真实微调后，export 自动加载）
+#      纯真实训练仍可用：python training/network/Train_validate.py
+
+# A4. 评估（可选）
+python training/network/evaluate.py
+python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
+#      基线对照：--model models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth（应复现 ≈35.8%）
+
+# A5. 导出 C 二进制（CNN 权重 + 子滤波器 + 声学路径 + 带通 + 批次指纹）
+cd ..
+python export/export_bin.py
+#    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
+```
+
+> 💡 **不训练的用户**：`data/` 已随仓库自带（`GFANC_Scene/Primary and Secondary Path/*.npy` 声学路径也在），跳过阶段 A，从阶段 B 开始即可。
+
+### 🎯 系统运行（阶段 B/C/D — 必做）
+
+```bash
+# B. 编译两个校准程序（只需一次）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+
+# C1. 测次级路径 Ŝ（扬声器→误差麦，扫频法 SNR 最高，运行时默认加载其产物）
+cd GFANC_Scene && python ../export/measure_secondary.py && cd ..
+python export/export_bin.py        # 重导，让新测的 secondary_path.bin 生效
+#    → data/secondary_path.bin
+
+# C2. 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
+./calibrate_secondary.exe
+#    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
+
+# C3. 测反馈路径（扬声器→参考麦，防啸叫）
+./calibrate_feedback.exe
+#    → data/feedback_path_0.bin / data/feedback_path_1.bin
+
+# D1. 编译实时版
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
+
+# D2. 运行 + 纯音验证
+./gfanc_realtime.exe
+#    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
+```
+
+> ⚠️ **换摆放后只重做 C1 + C3**；C2 仅在换声卡或 `GFANC_BUFFER` 时重做。模型权重（阶段 A 产物）不随摆放变化，无需重导。
+
 ## 训练管线（直接权重 CNN）
 
-> 💡 本节是**训练/更换自己的模型**。训练完成后回到[快速开始 步骤 2](#2-导出权重仅需做过训练后执行) 导出。
+> 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 A（训练数据）** 的 A5 步，导出为 C 二进制。
 
 直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
 
@@ -284,45 +370,7 @@ Done.
 
 ### 命令顺序
 
-```bash
-# 0) 一次性依赖
-pip install numpy scipy pandas torch torchaudio
-
-# 1) 生成子滤波器（宽带 FxNLMS 训练主滤波器 → sqrt-Hann DFT 分解为 15 个子带）
-cd GFANC_Scene
-python training/control_filters/Pre_training_broadband_and_decompose.py
-#    → models/MIMO_Pretrained_Control_filters_broadband.mat
-#      仅当子滤波器基变更时才需重跑（声学路径/分解参数更换后）
-
-# 2) 重标标签（只重标已有 WAV，不重切）
-python training/labeling/label_real_noise.py
-#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
-#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
-
-# 2b) 合成数据生成 + 打标签（可选增强，治 CNN 输入失聪；默认 60000/7500/7500，打标签 ~5.5h）
-python training/labeling/make_synthetic_dataset.py
-#    → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\*.wav
-#      + Index_synth_{split}_data.csv + Gains_synth_{split}_data.npy（LMS_MU=0.001, LMS_REPET=3）
-#      --gen-only 只生成；--label-only 只打标签（重跑不用再生成）
-
-# 3) 两阶段训练直接权重 CNN（合成预训练 → 真实微调，低 LR 防坍缩回）
-python training/network/Train_validate_synth.py
-#    → models/MIMO_M5_DirectWeight_Pretrain.pth（合成预训练，保留）
-#      + models/MIMO_M5_DirectWeight_Real.pth（真实微调后，export 自动加载）
-#      纯真实训练仍可用：python training/network/Train_validate.py
-
-# 4) 评估（可选：测试集整向量 cos / 逐扬声器 cos / MSE）
-python training/network/evaluate.py
-
-# 4b) 判别力验证（可选：Checkpoint 3 —— CNN 输出最近均值分类，治失聪目标 ≥70%）
-python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
-#      基线对照：--model models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth（应复现 ≈35.8%）
-
-# 5) 导出 C 二进制（自动检测直接权重模型）
-cd ..
-python export/export_bin.py
-#    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
-```
+训练/更换模型的完整命令见上文 **完整命令流 · 阶段 A（训练数据）**。本节补充训练特有的细节：
 
 ### 说明
 
