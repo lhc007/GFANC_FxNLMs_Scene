@@ -39,11 +39,16 @@
 - **验证方法**：24-bit WAV 明确报错；48kHz 含 12kHz 无折叠峰。
 - **修复状态**：🔧 ①✅②✅(简易)③结构重构已消除（原修复点不存在，已从"已修复"降级）。
 
-【R-27 权重版本防护 · 一般 · [P2/3] → 🔧 部分】
+【R-27 权重版本防护 · 一般 · [P2/3] → 🔧 部分（批次指纹已做，manifest 留 Phase-3）】
 - **位置**：binary_loader.c；export_bin.py
 - **问题描述**：版本混配无防线。
 - **修复方案**：v2 头（已做 R-16-②）+ manifest.json/sha256 清单。
-- **修复状态**：🔧 头已做；**manifest 未做**。
+- **修复状态**：🔧 头已做；**2026-08-12 批次指纹已实现**（替代方案）——
+  - `export_bin.py` 对 [排序后的 `cnn_*.bin` + `sub_filters.bin` + `bandpass_fir.bin` + `bandpass_anc.bin`] 做链式 crc32 → 写 `data/batch_id.bin`（hex）+ `data/batch_info.json`（溯源清单）。
+  - C 端 `bin_batch_crc()/bin_check_batch()`（binary_loader.c）加载后重算比对，不一致打 `[WARN] 批次混配检测`（不阻断，与"损坏数据好过拒绝启动"哲学一致）。`main.c` + `main_realtime.c` 均接入。
+  - **声学路径不入指纹**（secondary/primary/feedback 是安装态可替换的测量值，换 Ŝ 属 R-16-①/BUG-8 设计行为，避免误报）。
+  - 验证：离线 `main.exe` 指纹一致 + 篡改 batch_id 触发 WARN + 缺文件向后兼容跳过；三目标零警告编译；NR 无回归（road_noise-15 NR_true 9.3dB）。
+  - **完整 manifest.json/sha256 每文件清单未做**——留 Phase-3 OTA/量产时随签名 bundle + 版本号一起做（见第七节 2026-08-12 记录）。
 
 【R-50 反馈路径 spk1 校准极弱 · 建议 · [Phase-1] → 🔧 已重标定，质量存疑】
 - **位置**：data/feedback_path_0/1.bin
@@ -165,7 +170,8 @@
 - **修复状态**：🟡 数据结论 ratio≤1.6×，低风险。
 
 【ADV-B5 仅 3 类场景 · 中等 · [训练侧] → 🟡 设计权衡，接受不改】
-- **位置**：scene_defs.bin (K=3)
+> ⚠ **2026-08-08 标注：本条描述的 scene-classifier + centroid 机制已被 v1.6 直接权重架构移除**（[ad54be8] `C 运行时直接权重 v1.6 — CNN 30维增益回归 Wc`）。DW 模式下无 scene_defs/centroid，CNN 直接回归 30 维子带增益。K=3 聚类结论为训练侧历史归档；"预设不精确由 FxLMS 纠正"的推理在 DW 下依然成立（甚至更直接——预设即完整 Wc）。
+- **位置**：scene_defs.bin (K=3)（v1.6 起不再生成/加载）
 - **问题描述**：3 centroid 凸组合表达力不足，混合场景不精确。
 - **验证方法**：2026-08-06 重跑 `recluster_real.py`——表征度肘部法 + 质心去重护栏自动选 **K=3**（K=4 新质心与现有 cos=0.974 > 0.95 护栏 = 冗余场景）；4 类真实噪声（road/children/construction/railway）聚成 3 个重叠场景（railway 横跨 scene0/2）。"3 类表达力不足"在当前数据上不成立。
 - **修复状态**：🟡 **接受不改**——K=3 为当前数据最优聚类；CNN 仅作暖启动，预设不精确由 FxLMS 逐样本自适应纠正（R-13-② 实测新旧预设离线 NR 曲线完全一致），无实际证据表明 K 少影响降噪。扩 K 需新数据且收益未证，不值得。
@@ -177,7 +183,8 @@
 - **修复状态**：🟡 **接受不改**（理论依据）；如需确证可做电平敏感性实验（固定 vs 变电平下 CNN 预设 Wc 是否该变），但预期无实质收益。纯 C 无法独立修复，也不需修。
 
 【CNN 置信度（场景泵浦根因）· [训练侧] → 🟡 接受现状，代码侧已缓解】
-- **位置**：CNN 推理（实时 max_prob 0.4-0.6）
+> ⚠ **2026-08-08 标注：本条描述的"场景 0↔1 反复切换"机制已被 v1.6 直接权重架构移除**（[ad54be8]，无 softmax 场景分类）。该问题在 DW 下形态变为"CNN 实机抖动"（30 维增益帧间跳变），已由 [bb6e419]（2026-08-10）幅度不变性增强 + 部署 EMA 稳定标定单独处理。本条保留为训练侧历史归档。
+- **位置**：CNN 推理（实时 max_prob 0.4-0.6；v1.6 起为 30 维增益 tanh 回归）
 - **问题描述**：低置信度导致场景 0↔1 反复切换、冷启动保护频繁。
 - **验证方法**：2026-08-06 量化根因——训练目标 soft-label **top-1 概率均值仅 0.53**（场景重叠严重，质心最大 cos 0.931；21.6% 样本峰值弱 ≤0.5）。低置信度是场景重叠的数据结构反映，不是训练缺陷；且 flat blend = 稳健平均滤波器，低置信度可能是鲁棒性特性。
 - **修复状态**：🟡 **接受现状**——代码侧 3 帧滞回已缓解泵浦；训练侧强行锐化（降 SOFT_TEMP）会过度自信，收益存疑且有过拟合风险。实质改善需新数据/新场景体系，当前不值得。
@@ -251,7 +258,20 @@
 - **ADV-D4 / R-28 `##__VA_ARGS__`**：LOG 宏改 C 标准兼容写法（`gfanc_types.h`，仅 main_realtime.c:735 一处调用，无行为变化）。
 - **ADV-F3 回调 WCET 监控**：新增 `GFANC_WCET` 门控的 rdtsc 计时（`main_realtime.c`），默认关零开销。
 
-**未变更（仍待 Phase-2/3）**：R-27（manifest/sha256）、R-30（梯度 E 归一化）、R-25/R-24（CNN 激活缓冲静态化/int8）、R-21（HAL）、ADV-E 系列（量产）。
+**未变更（仍待 Phase-2/3）**：R-27（每文件 manifest/sha256 清单；**批次指纹 2026-08-12 已做**，见下）、R-30（梯度 E 归一化）、R-25/R-24（CNN 激活缓冲静态化/int8）、R-21（HAL）、ADV-E 系列（量产）。
+
+**2026-08-06~08-08 架构切换（报告基线缺口补记）**：合并报告（08-03）验证基线为 `realtime-io`（scene-classifier）。此后到 08-10 前发生的关键变更，原第七节漏记，此处补全：
+- **2026-08-07 `5e68e13` / `80cbb55`**：BUG-8 精化——Ŝ 选择先"固定优先 C 校准实测"，后定案**默认扫频法 `secondary_path.bin` + `GFANC_SEC_FILE` 手动覆盖**（mtime 比较有缺陷：export 每次刷新 mtime 误判"更新"，08-07 教训）。
+- **2026-08-08 `ad54be8`**：**C 运行时直接权重 v1.6**——CNN 从 K 维 softmax 场景分类改为 **30 维 tanh 子带增益回归**，直接构造 Wc（`Wc = Σ gains×sub_filters`）；移除 scene_defs/centroid/场景切换逻辑（[变更记录_CHANGELOG](变更记录_CHANGELOG.md) 2026-08-08 条目）。**这是"当前架构"基线**；报告第八节 ADV-B5、CNN 置信度条目已加"已被 v1.6 移除"标注。
+- **2026-08-08 `fd6bf28` / `dfdf23a`**：OCG 在线聚类闸门 v1.7（多质心聚类替代 cos 单锚点 reset 判定）。
+- **2026-08-09~11**：两阶段训练管线（合成数据 + Wc-only 重训）、梯度相位修复 R-58-10/11、OCG 持续性判据 v1.8、P0-5 环境安静检测 v1.9（详见 [变更记录_CHANGELOG](变更记录_CHANGELOG.md)）。
+
+**2026-08-12 批次指纹（R-27 软件部分落地）**：
+- **背景**：DW 架构下 `Wc = Σ gains(CNN) × sub_filters`，CNN 与 sub_filters 必须同源；单文件 v2 头 crc32 只能防单文件损坏，防不了"CNN 重导但 sub_filters 还是旧批"的**跨文件静默混配**（K=30/L=1024/CRC 全合法）。
+- **实现**：`export_bin.py` 对 [排序后的 `cnn_*.bin`+`sub_filters.bin`+`bandpass_fir.bin`+`bandpass_anc.bin`] 做链式 crc32 → `data/batch_id.bin`（hex）+ `data/batch_info.json`（溯源清单）；C 端 `bin_batch_crc()/bin_check_batch()`（`binary_loader.c`，新增）加载后重算比对，不一致打 `[WARN] 批次混配检测`（不阻断，与"损坏数据好过拒绝启动"哲学一致）。`main.c` + `main_realtime.c` 均接入。
+- **声学路径不入指纹**：secondary/primary/feedback 是安装态可替换的测量值（换 Ŝ 属 R-16-①/BUG-8 设计行为），避免误报。
+- **验证**：三目标零警告编译；离线 `main.exe` 指纹一致 `0x94b9b20c` / 篡改 batch_id 触发 WARN / 缺 batch_id.bin 向后兼容跳过；NR 无回归（road_noise-15 NR_true 9.3dB）。
+- **遗留**：完整每文件 manifest/sha256 留 Phase-3，随 OTA 签名 bundle + 单调版本号 + 原子替换一起做（裸 sha256 无签名根对对抗篡改无意义）。
 
 **2026-08-10 sec_online 链路验证**（ADV-E2 状态更新，`src/sec_online.c`）：
 - **接线正确**：`sec_online_mu>0` → `sec_online_init`（main_realtime.c:1028）+ 逐样本 `sec_online_update`（L359-360，仅正常运行时、`ramp_cnt==0`）写入 `ctx->sec_coeffs`，与 Fx FIR 共用**同一缓冲**（L1018 `sec_firs[idx].coeffs = sec_coeffs + idx*sp`）。同线程顺序执行（先 Fx 后更新，下样本生效），无数据竞争。

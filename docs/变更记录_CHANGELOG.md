@@ -31,6 +31,25 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-12] R-27 批次指纹落地（防 cnn/sub_filters/bandpass 跨批混配）+ 审查报告第七节补记 v1.6 DW 架构切换
+- **状态**: 工作区未提交
+- **基线**: 3248221
+- **变更代码**:
+  - 新增: `src/binary_loader.c` — `bin_crc32_chain`（链式 crc32, 匹配 Python `zlib.crc32(data, prev)` 续算语义）+ `bin_batch_crc()`（对排序后 `data/cnn_*.bin` + `sub_filters.bin` + `bandpass_fir.bin` + `bandpass_anc.bin` 原始字节折入链式 crc, 用 `_findfirst`/`qsort` 枚举排序）+ `bin_check_batch()`（读 `data/batch_id.bin` hex 比对, 不一致打 `[WARN] 批次混配检测`, 缺文件跳过）
+  - 修改: `include/binary_loader.h` — 新增 `bin_batch_crc`/`bin_check_batch` 原型 + 说明
+  - 修改: `main.c` / `main_realtime.c` — CNN 加载成功后调 `bin_check_batch()`（WARN 不阻断）
+  - 修改: `export/export_bin.py` — 新增第 5c 段: 对批内文件算链式 crc32 → 写 `data/batch_id.bin`（hex）+ `data/batch_info.json`（溯源清单, 含 batch_id + 文件列表）
+  - 修改: `docs/GFANC_综合审查报告_合并版.md` — R-27 状态更新为"批次指纹已做, manifest/sha256 留 Phase-3"; 第七节补记 2026-08-06~08-08 架构切换缺口（BUG-8 Ŝ 选择定案 / v1.6 DW / OCG v1.7）+ 2026-08-12 批次指纹记录; ADV-B5 / CNN 置信度条目加"已被 v1.6 移除"标注
+- **变更原因**: R-27"版本混配无防线"剩最后缺口。DW 架构（v1.6）下 `Wc = Σ gains(CNN 30维) × sub_filters`，CNN 与 sub_filters 必须同源；单文件 v2 头 crc32 只能防单文件损坏，防不了"CNN 重导但 sub_filters 还是旧批"的**跨文件静默混配**（K=30/L=1024/单文件 CRC 全合法, 现有 R-3/R-4 检查全过）。声学路径（secondary/primary/feedback）不入指纹——它们是安装态可替换的测量值, 换 Ŝ 属 R-16-①/BUG-8 设计行为, 入指纹会误报。
+- **造成影响**:
+  - 行为: 启动加载权重后多打印一行 `[batch] 批次指纹一致 0x……`（默认）或 `[WARN] 批次混配检测……`（混配时, 仅警告不阻断, 与"损坏数据好过拒绝启动"哲学一致）; 旧 data/ 无 `batch_id.bin` 时打印跳过提示（向后兼容）
+  - 配置: 无新增 env（指纹由 export_bin.py 每次导出自动更新）
+  - 测试/回归: 离线 `main.exe` 指纹一致 `0x94b9b20c`（C 重算 == Python 生成）; 篡改 batch_id → `[WARN] 批次混配检测` 且 exit=0; 删 batch_id.bin → 跳过提示; road_noise-15 NR_true 9.3dB 无回归; 三目标零警告编译
+  - 性能/内存: 启动时多读 ~59 个 cnn 文件一次（合计 ~数百 KB, 毫秒级, 一次性）
+  - 未验证项: 真实"跨批混配"（整文件替换为另一批 crc 合法文件）未做端到端实测——已用篡改 batch_id 等价覆盖比对逻辑; 实时版未实机跑（批次校验代码路径与离线共享, 编译通过）
+- **验证方式**: 见上"测试/回归"; C 端链式 crc 与 Python `zlib.crc32` 语义对齐已用真实 data/ 逐位比对验证
+- **回退方式**: 删除 `data/batch_id.bin` 即恢复旧行为（校验自动跳过）; 或 git revert 本提交
+
 ### [2026-08-11] P0-5 环境安静检测（治"噪声消失后反相声残留/嗡嗡声" + 宽带弱噪声误杀守卫 + leak 连续化治滋滋）v1.9
 - **状态**: 已提交 <此提交>
 - **基线**: 2ad4b69

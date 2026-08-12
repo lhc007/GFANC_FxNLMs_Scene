@@ -7,7 +7,7 @@
 R-16-②: v2 格式添加 16B 头 {magic"GFNC", version, n_floats, crc32}.
 C 端 bin_load_float 自动检测 magic — 新格式校验, 旧格式直接加载.
 """
-import os, sys, json, struct, zlib
+import os, sys, json, struct, zlib, glob
 import numpy as np
 import scipy.io as sio
 import torch
@@ -224,6 +224,35 @@ bp_anc_coeff = firwin(64, [20, 1500], fs=16000, pass_zero='bandpass',
 write_bin('bandpass_anc', bp_anc_coeff)
 print(f'  bandpass_anc.bin: {len(bp_anc_coeff)} taps, '
       f'gd={(64-1)/(2*16000)*1000:.1f}ms (vs 1024tap gd={(1024-1)/(2*16000)*1000:.1f}ms)')
+
+# ── 5c. 批次指纹 (R-27) — 防 cnn/sub_filters/bandpass 跨批混配 ──
+# 指纹 = 对 [排序后的 cnn_*.bin + sub_filters + bandpass_fir + bandpass_anc]
+#       原始字节做链式 crc32 (与 C 端 binary_loader.c bin_crc32_chain 语义一致:
+#       zlib.crc32(data, prev) 续算). 声学路径 (primary/secondary/feedback…) 是
+#       安装态可替换的测量值, 不入指纹 — 换 Ŝ 属设计行为 (R-16-①/BUG-8).
+def _batch_crc32():
+    files = sorted(glob.glob(str(OUT_DIR / 'cnn_*.bin'))) + [
+        str(OUT_DIR / 'sub_filters.bin'),
+        str(OUT_DIR / 'bandpass_fir.bin'),
+        str(OUT_DIR / 'bandpass_anc.bin'),
+    ]
+    crc = 0
+    for p in files:
+        with open(p, 'rb') as f:
+            data = f.read()
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+    return crc, files
+
+batch_crc, batch_files = _batch_crc32()
+with open(OUT_DIR / 'batch_id.bin', 'w') as f:
+    f.write('0x%08x\n' % batch_crc)
+batch_info = {
+    'batch_id': '0x%08x' % batch_crc,
+    'count': len(batch_files),
+    'files': [os.path.relpath(p, OUT_DIR.parent).replace('\\', '/') for p in batch_files],
+}
+write_json('batch_info.json', batch_info)
+print(f'  batch_id.bin: 0x{batch_crc:08x} ({len(batch_files)} files)')
 
 # ── 6. 全局配置 ──
 config = {

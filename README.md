@@ -67,7 +67,9 @@ set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
 python export/export_bin.py
 ```
 
-导出内容：CNN 权重（58 个 `.bin`）、子滤波器、主/次路径、带通 FIR、配置 JSON。**直接权重模式（v1.6）跳过场景 centroids**（`scene_defs.bin` 不再生成/加载）。
+导出内容：CNN 权重（58 个 `.bin`）、子滤波器、主/次路径、带通 FIR、配置 JSON、**批次指纹**（`batch_id.bin` + `batch_info.json`，见下）。**直接权重模式（v1.6）跳过场景 centroids**（`scene_defs.bin` 不再生成/加载）。
+
+**批次指纹（R-27）**：`export_bin.py` 每次导出都会对 [CNN 权重 + 子滤波器 + 两个带通] 计算一个链式 crc32 指纹写入 `data/batch_id.bin`。运行时加载时会重算比对，防止 **CNN 与 sub_filters 来自不同批次**（同一 K=30/L=1024、单文件 crc 都合法但语义不同训练世界）导致的 Wc 预设错位。不一致时启动打印 `[WARN] 批次混配检测……`（仅警告不阻断，FxLMS 会自适应纠正，只影响暖启动收敛），**重跑一次 `export/export_bin.py` 即可修复**。声学路径（secondary/primary/feedback）不参与指纹——它们是按安装摆放可单独替换的测量值。
 
 ### 3. 编译
 
@@ -686,3 +688,6 @@ A: 离线模式自动将输入重采样到 16000 Hz。支持 16-bit PCM WAV。
 
 **Q: 实时版使用什么音频 API？**
 A: PortAudio 运行时加载 (`libportaudio64bit-asio.dll`)，支持 ASIO / WASAPI / WDM-KS 后端，通过 `src/pa_loader.c` 动态加载 DLL。
+
+**Q: 启动时打印 `[WARN] 批次混配检测` 是什么？要紧吗？**
+A: 表示 `data/` 里的 **CNN 权重 / 子滤波器 / 带通** 不是同一次 `export_bin.py` 导出的（比如只拷了某个旧的 `sub_filters.bin` 或 `cnn_*.bin` 进来）。直接权重架构下 `Wc = Σ 增益 × 子滤波器`，两者必须同源，混配会让启动 Wc 预设初值错位。**不要紧**——FxLMS 会自动收敛纠正，仅影响开机/切场景时暖启动慢一点；但建议**重跑一次 `python export/export_bin.py`** 让整批一致，指纹警告即消失。注意：`secondary_path.bin`、`feedback_path_*.bin` 等声学路径文件是**故意不参与**指纹的（按摆放可单独重测），替换它们不会触发此警告。

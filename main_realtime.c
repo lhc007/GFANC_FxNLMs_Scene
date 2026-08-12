@@ -907,6 +907,9 @@ int main(void) {
     }
     printf("  OK K=%d L=%d\n", cnn_m5_get_K(), sub_len / (SC_C*SC_S));
 
+    /* R-27: 批次指纹 — 检测 cnn/sub_filters/bandpass 是否跨批混配 (WARN, 不阻断) */
+    bin_check_batch();
+
     /* 初始化 ANC 模块 */
     PaStream *stream = NULL;
     ctx = calloc(1, sizeof(rt_ctx_t));  /* 堆分配, 避免 ~211KB 栈压力 */

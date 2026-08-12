@@ -232,6 +232,9 @@ int main(int argc, char **argv)
     if (cnn_m5_init() != 0) { fprintf(stderr, "CNN init failed\n"); return 1; }
     printf("  CNN loaded.\n");
 
+    /* R-27: 批次指纹 — 检测 cnn/sub_filters/bandpass 是否跨批混配 (WARN, 不阻断) */
+    bin_check_batch();
+
     /* 2a. 带通 FIR */
     fir_filter_t bp_fir = { bp_coeff, (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t)), BP_LEN, 0 };
 
