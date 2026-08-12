@@ -47,9 +47,9 @@
 | 你想做什么 | 走哪条路 |
 |-----------|---------|
 | 从头训练 + 实时降噪（默认） | 阶段 0 → 1 → 2 → 3 → 4 全流程 |
-| 先用现成模型跑通（可选捷径） | 阶段 0 → 1 → 3 → 4（跳过训练 2） |
+| 先用现成模型跑通（可选捷径） | 阶段 0 → 1 → 3 → 4（跳过训练 2；主路径测量可省） |
 
-**为什么先测次级路径再训练？** 子滤波器生成（阶段 2-①）和打标签（阶段 2-②）都以 `secondary_path.npy` 为输入，所以**阶段 1 测次级路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（阶段 3），与训练无关。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到阶段 2-⑥ 重导一次让新测 Ŝ 生效。
+**为什么先测声学路径再训练？** 子滤波器生成（阶段 2-①）和打标签（阶段 2-②）都以 `secondary_path.npy` 和 `primary_path.npy` 为输入，所以**阶段 1 测声学路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（训练用不到，阶段 1 里一起测完）。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到阶段 2-⑥ 重导一次让新测 Ŝ 生效。
 
 **核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
 
@@ -92,16 +92,16 @@
 | 步骤 | 做什么 | 对应完整命令流 |
 |------|--------|--------------|
 | 0 | 接线 + 调增益旋钮（参考麦→输入 0，误差麦→输入 1-3，扬声器→输出 0-1） | SIG 常亮、CLIP 不亮，记住旋钮位置 |
-| 1 | **测次级路径 Ŝ（每次换位置/几何必测）** | 阶段 1 → `secondary_path.npy`；导出见阶段 2-⑥ |
-| 2 | **测环路延迟（首次 / 换声卡·缓冲必测）** | 阶段 3-② → `sec_bulk_delay.bin`（运行时自动补偿） |
-| 3 | 测反馈路径（防啸叫） | 阶段 3-③ → `feedback_path_0/1.bin` |
-| 4 | 编译实时版 | 阶段 3-④ |
+| 1 | **测次级路径 Ŝ（每次换位置/几何必测）** | 阶段 1-② → `secondary_path.npy`；导出见阶段 2-⑥ |
+| 2 | **测环路延迟（首次 / 换声卡·缓冲必测）** | 阶段 1-④ → `sec_bulk_delay.bin`（运行时自动补偿） |
+| 3 | 测反馈路径（防啸叫） | 阶段 1-⑤ → `feedback_path_0/1.bin` |
+| 4 | 编译实时版 | 阶段 3-① |
 | 5 | 运行 + 纯音验证 | 阶段 4-①（250Hz 纯音 NR ≥ 10dB、零 RESET） |
 
 ### 换硬件时**不需要**重做的
 
 - **CNN 模型、子滤波器、权重导出**（`export_bin.py`）——除非你换的硬件改变了训练数据分布（一般不会）
-- **主路径（Pri）测量**——实时版**不加载**主路径；只有离线评估 `main.exe` 算 NR_true 才用得上（`export/measure_primary.py`）
+- **主路径（Pri）测量**——实时版**不加载**主路径；仅**训练打标签（阶段 2-②）、离线评估 `main.exe` 算 NR_true** 需要（`export/measure_primary.py`，见阶段 1-③）。若重训则需先重测
 
 ## 运行示例
 
@@ -157,15 +157,15 @@ Done.
 
 > 面向**从零开始、自己训练数据**的完整流程，按阶段 0 → 4 顺序执行。核心依赖关系：
 > - **次级路径 Ŝ 必须先测（阶段 1）再训练（阶段 2）**——子滤波器生成、打标签都以它为输入（与仓库自带的那份 `secondary_path.npy` 是同一文件）；
-> - 环路延迟、反馈路径是**纯部署项**，与训练无关（阶段 3）；
+> - 环路延迟、反馈路径是**纯部署项**，与训练无关（阶段 1 里一起测，训练用不到）；
 > - 想先用现成模型跑通（可选捷径）：阶段 0 → 1 → 3 → 4，跳过阶段 2，但换硬件/摆放后需回阶段 2-⑥ 重导一次让新测 Ŝ 生效。
 
 | 阶段 | 内容 | 必做？ | 何时做 |
 |------|------|--------|--------|
 | 🎯 准备 0 | 下载项目 + 装 Python 依赖 | 必做 | 首次 |
-| 🎯 声学路径测量 1 | 测次级路径 Ŝ（扫频法）→ `secondary_path.npy` | 必做 | 首次 / 换硬件 / 换摆放 |
+| 🎯 声学路径测量 1 | 编译校准程序 + 测次级路径/主路径/环路延迟/反馈路径 | 必做 | 首次 / 换硬件 / 换摆放 |
 | 🎯 训练数据 2 | 子滤波器 → 打标签 → 训练 CNN → 导出 `data/*.bin` | 必做（本文档面向从头训练） | 首次 / 换模型 |
-| 🎯 编译部署 3 | 环路延迟 + 反馈路径 + 编译实时版/离线版 | 必做 | 首次 / 换硬件 / 换摆放 |
+| 🎯 编译 3 | 编译实时版/离线版 | 必做 | 首次 |
 | 🎯 系统运行 4 | 实时运行 + 纯音验证 | 必做 | 每次 |
 
 ### 🎯 准备（阶段 0 — 必做，只做一次）
@@ -179,27 +179,48 @@ pip install numpy scipy pandas torch torchaudio
 
 ### 🎯 声学路径测量（阶段 1 — 必做）
 
-> ⚠️ **次级路径 Ŝ 是训练与运行的共用输入**：子滤波器生成（阶段 2-①）、打标签（阶段 2-②）、导出（阶段 2-⑥）都读 `GFANC_Scene/Primary and Secondary Path/secondary_path.npy`，运行时加载的是它导出的 `data/secondary_path.bin`。**必须先测、先于任何训练。** 前置条件：硬件接好、摆放就位（参考麦朝噪声源、误差麦+扬声器朝听音区）、增益旋钮 SIG 常亮 CLIP 不亮。
+> ⚠️ **四种声学路径一次测完**。其中**次级路径 Ŝ 和主路径 Pri 是训练输入**（子滤波器生成 2-①、打标签 2-②、导出 2-⑥ 都用），**环路延迟、反馈路径是运行部署项**（与训练无关，但同属"测量"、共用同一套硬件布置，一起测完最顺）。前置条件：硬件接好、摆放就位（参考麦朝噪声源、误差麦+扬声器朝听音区）、增益旋钮 SIG 常亮 CLIP 不亮。
 
 ```bash
-# 1-① 测次级路径 Ŝ（扬声器→误差麦，Farina 指数扫频法，SNR 最高、免疫时钟滑移）
+# 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+
+# 1-② 测次级路径 Ŝ（扬声器→误差麦，Farina 指数扫频法，SNR 最高、免疫时钟滑移）
+#     训练 + 运行共用输入，必须先测、先于任何训练
 #     脚本用相对路径找 Primary and Secondary Path/，需从 GFANC_Scene 目录运行
 cd GFANC_Scene
 python ../export/measure_secondary.py --interactive   # 首次：配置声卡设备
 python ../export/measure_secondary.py                 # 日常测量（--duration/--repetitions/--amplitude 见"次级路径测量"章节）
 cd ..
 #    → 覆盖 GFANC_Scene/Primary and Secondary Path/secondary_path.npy
-#      新测值在阶段 2-⑥ 导出时写入 data/secondary_path.bin（运行时加载）
-#      若跳过训练（阶段 2），回到阶段 2-⑥ 重导一次让新测路径生效
+
+# 1-③ 测主路径 Pri（参考麦→误差麦）— 仅重训/离线评估需要
+#     [重要] 把扬声器从窗框拆下、搬到室外噪声源位置再接 (source-channel 对应其声卡输出通道)
+#     训练打标签/子滤波器用它; 运行时不用; 跳过训练可省 (离线评估 NR_true 也要它)
+cd GFANC_Scene
+python ../export/measure_primary.py --source-channel 0 --duration 8 --repetitions 4
+cd ..
+#    → 覆盖 GFANC_Scene/Primary and Secondary Path/primary_path.npy
+
+# 1-④ 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
+./calibrate_secondary.exe
+#    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
+#    该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
+#    想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
+
+# 1-⑤ 测反馈路径（扬声器→参考麦，防啸叫）
+./calibrate_feedback.exe
+#    → data/feedback_path_0.bin / data/feedback_path_1.bin
 ```
 
 ### 🎯 训练数据（阶段 2 — 必做，面向从头训练）
 
-> 输入依赖：阶段 1 测好的 `secondary_path.npy`（子滤波器 / 打标签必需）+ `primary_path.npy`（仓库自带；换环境可用 `export/measure_primary.py` 重测——离线评估 NR_true 也用它，见"离线验证"）。
+> 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（**两者都是子滤波器 / 打标签的输入**）。只跑现成模型（跳过本阶段）时用仓库自带的那两份 .npy，但那是别人环境的测量值——**从头训练务必在阶段 1 实测**。
 
 ```bash
 # 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
-#    输入: Primary and Secondary Path/secondary_path.npy（Ŝ, MIMO FxNLMS 训练必需）
+#    输入: Primary and Secondary Path/{primary,secondary}_path.npy（Pri 扰动 + Ŝ 滤波参考, MIMO FxNLMS 训练必需）
 cd GFANC_Scene
 python training/control_filters/Pre_training_broadband_and_decompose.py
 #    → models/MIMO_Pretrained_Control_filters_broadband.mat
@@ -236,27 +257,13 @@ python export/export_bin.py
 #    默认自动查找同级目录的 GFANC_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
 ```
 
-### 🎯 编译部署（阶段 3 — 必做）
+### 🎯 编译（阶段 3 — 必做）
 
 ```bash
-# 3-① 编译两个校准程序（只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-
-# 3-② 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
-./calibrate_secondary.exe
-#    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
-#    该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
-#    想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
-
-# 3-③ 测反馈路径（扬声器→参考麦，防啸叫）
-./calibrate_feedback.exe
-#    → data/feedback_path_0.bin / data/feedback_path_1.bin
-
-# 3-④ 编译实时版
+# 3-① 编译实时版
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
 
-# 3-⑤ 编译离线评估版（可选 — 处理 WAV 算 NR_true，见"离线验证"）
+# 3-② 编译离线评估版（可选 — 处理 WAV 算 NR_true，见"离线验证"）
 gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
 ```
 
@@ -271,7 +278,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 ./main.exe "Noise Examples/road_noise_0-34.wav"
 ```
 
-> ⚠️ **换摆放后**：重做阶段 1（测 Ŝ）+ 阶段 3-③（反馈路径）+ 阶段 4（运行验证）；阶段 3-②（环路延迟）仅换声卡或 `GFANC_BUFFER` 时重做。**训练数据（阶段 2）不随摆放变化**——不重训时 CNN 预设 Wc 与现场 Ŝ 的偏差靠 FxLMS 自适应纠正；换了摆放后效果明显变差，可重走 阶段 1 → 2 → 3 → 4 重训。
+> ⚠️ **换摆放后**：重做阶段 1-②（次级路径）+ 1-⑤（反馈路径）+ 阶段 4（运行验证）；1-④（环路延迟）仅换声卡或 `GFANC_BUFFER` 时重做；1-③（主路径）和训练（阶段 2）不随摆放变化——不重训时 CNN 预设 Wc 与现场 Ŝ 的偏差靠 FxLMS 自适应纠正；换了摆放后效果明显变差，可重走 阶段 1 → 2 → 3 → 4 重训（含重测主路径）。
 
 ## 训练管线（直接权重 CNN）
 
@@ -454,9 +461,11 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ 
 │  anti_total = anti_ff + anti_fb → 限幅±1.0 → 线性内插×3 → DAC │
 │                                                               │
 └──────────────────────────────────────────────────────────────┘
+```
+
 ## 反馈路径校准
 
-反馈抵消功能需逐扬声器校准声学路径。校准命令见上文 **完整命令流 · 阶段 3-③**（`calibrate_feedback.exe` → `feedback_path_0/1.bin`）。
+反馈抵消功能需逐扬声器校准声学路径。校准命令见上文 **完整命令流 · 阶段 1-⑤**（`calibrate_feedback.exe` → `feedback_path_0/1.bin`）。
 
 校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
 ```
@@ -468,7 +477,7 @@ Feedback spk1: 256 taps, RMS=0.0011
 
 ## 次级路径测量（Python，Farina 扫频法）
 
-提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦。**测量命令见上文 完整命令流 · 阶段 1**（需从 `GFANC_Scene` 目录运行，脚本用相对路径找 `Primary and Secondary Path/`）。工具额外支持：
+提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦。**测量命令见上文 完整命令流 · 阶段 1-②**（需从 `GFANC_Scene` 目录运行，脚本用相对路径找 `Primary and Secondary Path/`）。工具额外支持：
 
 - `--interactive`：首次使用配置声卡设备
 - `--duration <秒>` / `--repetitions <次数>`：延长扫频 / 多次重复时域平均，提高 SNR
