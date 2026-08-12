@@ -31,6 +31,58 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-12] 训练脚本拆分 — 保留 Train_validate.py 纯合成训练, 拆出 finetune_real.py 真实微调, 删 Train_validate_synth.py
+- **状态**: 已提交 <此提交>
+- **基线**: 0a199aa（与上两条同基线, 实际基于打标签拆分后的工作区状态）
+- **变更代码**:
+  - 新增: `GFANC_Scene/training/network/finetune_real.py` — 真实数据微调(单功能): 加载 2-③ 纯合成产物 → 真实数据低 LR 微调(LR_FT=0.003 / EPOCHS_FT=25), 默认就地覆盖 `MIMO_M5_DirectWeight_Real.pth`; 训练循环同步 Train_validate.py 最新增强(GAIN_RANGE 幅度不变性 + LOG_EVERY 进度打印 + 逐扬声器 cos), 保留旧 train_phase 的 cos_max=-inf 修复; CLI --pretrain-pth / --out / --epochs-ft / --lr-ft / --batch
+  - 删除: `GFANC_Scene/training/network/Train_validate_synth.py` — 两阶段二合一脚本(合成预训练 + 真实微调), 与 Train_validate.py 纯合成训练重叠(--no-finetune 分支 = 无 GAIN_RANGE/40 轮/写 Pretrain.pth 的降级变体); 全仓库无代码 import, 仅注释/文档引用
+  - 修改: `README.md` — 2-⑤ 命令改 `finetune_real.py`, 删 Pretrain.pth 产物行与 --no-finetune 说明; 2-④ 注释"两阶段微调"→"真实微调"; 训练管线"说明"段两阶段路线措辞改 `finetune_real.py`
+- **变更原因**: 延续"一功能一文件"重构: `Train_validate_synth.py` 的 `--no-finetune` 分支与 `Train_validate.py` 纯合成训练功能重叠但更弱; 用户确认保留 `Train_validate.py` 不动, 把唯一独有的真实微调拆成单功能文件
+- **造成影响**:
+  - 行为: 训练入口变化 — 纯合成训练仍走 `Train_validate.py`(未改动); 真实微调从 `Train_validate_synth.py` 改为 `finetune_real.py`, 输出默认就地覆盖 Real.pth(与旧两阶段一致, export_bin 自动加载); `MIMO_M5_DirectWeight_Pretrain.pth` 概念废弃(旧文件成孤儿, 不影响任何流程)
+  - 配置: `finetune_real.py` 参数 --pretrain-pth/--out/--epochs-ft/--lr-ft/--batch 替代旧的 --epochs-pre/--lr-pre/--no-finetune 等
+  - 测试/回归: 冒烟 1 轮微调循环跑通(输出临时路径, 未碰 Real.pth, 哈希不变); `Train_validate.py` 零改动
+  - 性能/内存: 不涉及
+  - 未验证项: 完整 25 轮真实微调未跑(数小时 GPU); 微调后判别力/降噪待验证(该路线当前未部署)
+- **验证方式**: py_compile 两脚本; grep README/GFANC_Scene/docs 无 `Train_validate_synth` 残留(CHANGELOG 历史条目除外, 历史只增不改); 冒烟 `finetune_real.py --epochs-ft 1 --out <tmp>` 确认训练循环 + 检查点保存, 且 Real.pth 哈希不变
+- **回退方式**: git revert 本提交; 旧 `Train_validate_synth.py` 可从 git 历史找回
+
+### [2026-08-12] README 阶段 2 训练命令修正 — 纯合成训练为主流程, 两阶段真实微调降为可选
+- **状态**: 已提交 <此提交>
+- **基线**: 0a199aa
+- **变更代码**:
+  - 修改: `README.md` — ① 阶段 2 命令重排: 2-② = `make_synthetic_dataset.py`（**从零生成**合成数据 + LMS 打标签, 由原"可选增强"升为主流程必做, 注释明确 60000/7500/7500、4 类谱形、Pri/Sec 过路径、为何必须生成）; 2-③ = `Train_validate.py` 纯合成训练（主流程, 标注"脚本默认读 Index_synth_*"）; 2-④/2-⑤ = `label_real_noise.py` 真实打标签 + `Train_validate_synth.py` 两阶段训练（明确标注可选、当前流程没用、--no-finetune 等价纯合成）; 评估 → 2-⑥, 导出 → 2-⑦; ② 导出编号引用全局同步 2-⑥ → 2-⑦（快速上手选择表、批次指纹 R-27、换硬件检查单、完整命令流、训练管线导出提示）; ③ "训练管线·数据与标签"段数据源由真实为主改为**合成数据为主**（Synthetic_Dataset）, 补"为什么必须生成合成数据"（真实 4 类全低频坍缩、判别力 35.8% vs 75%）, 澄清合成是独立数据集不是增强; ④ 澄清 `MIMO_M5_DirectWeight_Real.pth` 名字带 Real 但实为纯合成训练产物
+- **变更原因**: 用户对抗性审查阶段 2 三条命令: ① "我测试效果好的用的是合成数据, 但命令里没有生成合成数据的命令?"——生成命令就是 `make_synthetic_dataset.py`, 但原注释"合成数据增强（可选）"措辞误导, 让人以为是增强已有真实数据, 实为从零生成独立数据集; ② "合成数据增强怎么增强?做了什么?"——补 4 类谱形生成 + 同一 LMS 管线打标签机制说明; ③ "两阶段训练这也不对吧?我当前用的直接就是合成数据吧?"——核实 git commit 2ad4b69"合成数据全量重训 (Train_validate.py, cos=0.9706)"与 `Train_validate.py:56-58`(DATA_DIR=Synthetic_Dataset, 读 Index_synth_*)确认部署模型确为**纯合成训练、无真实微调**, 原文档 2-④"两阶段"与实际流程不符
+- **造成影响**:
+  - 行为: 纯文档修订, 无代码/运行时行为变化
+  - 配置: 无
+  - 测试/回归: 不涉及
+  - 性能/内存: 不涉及
+  - 未验证项: 无
+- **验证方式**: grep 核对阶段 2 编号引用全自洽（2-①~2-⑦ 定义与引用一一对应, 无残留旧编号 2-⑥=导出）; 交叉核对数据流: `Train_validate.py:56-58` 读 Index_synth_*、`Train_validate_synth.py:61-69` 两阶段依赖 Index_real_*、`make_synthetic_dataset.py:77-78` 加载 broadband.mat
+- **回退方式**: git revert 本提交
+
+### [2026-08-12] 训练打标签拆分为"一功能一文件" — generate_synthetic / cut_real_noise / label_wavs, 删两个多合一脚本
+- **状态**: 已提交 <此提交>
+- **基线**: 0a199aa
+- **变更代码**:
+  - 新增: `GFANC_Scene/training/labeling/generate_synthetic.py` — 合成数据生成(4 类谱形 WAV + probe), 从 make_synthetic_dataset.py 抽出; 删死代码 generate_split
+  - 新增: `GFANC_Scene/training/labeling/cut_real_noise.py` — 真实长录音切割(cut_config.json 状态机) + 首建分层拆分(0.8/0.1/0.1, BLOCK_SIZE 防泄漏), 新增 --max-per-category 类别平衡; 从 label_real_noise.py 抽出
+  - 新增: `GFANC_Scene/training/labeling/label_wavs.py` — 统一 LMS 打标签(--wav-dir + --tag {real,synth}), 合并两脚本打标签段为唯一实现; category 列 real=类别前缀 / synth='synthetic'; 丢弃 real 旧 CSV 的 idx 空列
+  - 删除: `make_synthetic_dataset.py` / `label_real_noise.py`(两多合一脚本; 全仓库无 import 依赖, 仅注释引用)
+  - 修改: `recluster_real.py`/`Train_validate.py`/`verify_discrimination.py` — 注释引用改新文件名(输出格式不变)
+  - 修改: `README.md` — 阶段 2-② 拆为 generate_synthetic + label_wavs --tag synth; 2-④ 拆为 cut_real_noise + label_wavs --tag real; 训练管线"数据与标签/说明"段同步
+- **变更原因**: 用户诉求"每个功能单独文件, 需要时直接运行单独文件"——原两个脚本各耦合两件事(生成+打标签 / 切割+打标签), 打标签核心循环在两处逐行重复; 用户理想是消除重复
+- **造成影响**:
+  - 行为: 命令变化 — 旧 `make_synthetic_dataset.py --gen-only/--label-only` → 新 `generate_synthetic.py` + `label_wavs.py --tag synth`; 旧 `label_real_noise.py` → 新 `cut_real_noise.py` + `label_wavs.py --tag real`。输出文件格式不变(Index_{tag}_{split}.csv 列 File_path/category/gain_*, Gains_{tag}_{split}.npy), 下游 Train_validate/noise_dataset/verify_discrimination/recluster_real 无缝
+  - 配置: 新增 --max-per-category(类别平衡); 旧 TOTAL_SEGMENTS=80000 采样预算改由 --max-per-category 表达(复现旧规模=20000/类); cut_config.json 状态文件兼容复用
+  - 测试/回归: 待小样本冒烟验证
+  - 性能/内存: 切割脚本不再加载 Pri/Sec + 子滤波器(GPU 资源), 纯 CPU; 打标签/生成与旧等价
+  - 未验证项: 全量 60000 样本未跑(打标签 ~5.5h GPU); 真实切割对真实 raw 数据未跑(无样本)
+- **验证方式**: 小样本 CPU 冒烟 — generate_synthetic --n-train 5/--n-val 2/--n-test 2 + label_wavs --tag synth → CSV 列结构 + MyNoiseDataset 加载; cut_real_noise 用临时 raw 假 wav + --max-per-category → 段数/分层断言
+- **回退方式**: git revert 本提交
+
 ### [2026-08-12] README 声学路径测量阶段扩为四项 — 主路径/环路延迟/反馈路径并入阶段 1, 阶段 3 只剩编译
 - **状态**: 工作区未提交
 - **基线**: c5ffcbb

@@ -104,7 +104,7 @@ def per_second_windows(sig_16k):
 
 
 def feature_input_spectrum(win, subs, bp_w, bp_pad):
-    """窗口 → 带通 → 15 子带能量 (归1). 与 make_synthetic_dataset probe 同口径."""
+    """窗口 → 带通 → 15 子带能量 (归1). 与 generate_synthetic.py probe 同口径."""
     x = torch.from_numpy(win).float().unsqueeze(0).unsqueeze(0).to(bp_w.device)
     x = _pbatch(x, bp_w, bp_pad).squeeze().cpu().numpy()   # 带通 20-1500 (与 CNN 输入一致)
     e = []

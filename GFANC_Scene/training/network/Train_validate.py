@@ -52,7 +52,7 @@ GAIN_RANGE = (0.5, 2.0)
 # 会让用户误以为卡住. 每 LOG_EVERY 个 batch 打印一次 loss.
 LOG_EVERY = 50
 
-# 数据路径 — 与 label_real_noise.py / recluster_real.py 输出一致
+# 数据路径 — 与 label_wavs.py / recluster_real.py 输出一致
 DATA_DIR      = r'D:\Dataset\Synthetic_Dataset'
 TRAIN_CSV     = os.path.join(DATA_DIR, 'Index_synth_Training_data.csv')
 VALID_CSV     = os.path.join(DATA_DIR, 'Index_synth_Validate_data.csv')

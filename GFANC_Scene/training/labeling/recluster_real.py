@@ -1,11 +1,11 @@
 """
-真实噪声 K-means 场景聚类 — 在 label_real_noise.py 的 LMS 标注之后运行.
+真实噪声 K-means 场景聚类 — 在 label_wavs.py --tag real 的 LMS 标注之后运行.
 
 用法:
     python training/labeling/recluster_real.py
 
 流程:
-    1. 加载 label_real_noise.py 保存的 LMS 增益 (Gains_real_*.npy)
+    1. 加载 label_wavs.py 保存的 LMS 增益 (Gains_real_*.npy)
     2. K-means 扫描 K=[2..12], 表征度肘部法 + 去重护栏自动选最优 K
     3. 生成 scene_definitions_real.json (自动命名)
     4. 生成 SoftLabels (余弦相似度 → softmax)
@@ -65,7 +65,7 @@ gains_train = np.load(os.path.join(DATA_DIR, 'Gains_real_Training_data.npy'))
 gains_val   = np.load(os.path.join(DATA_DIR, 'Gains_real_Validate_data.npy'))
 gains_test  = np.load(os.path.join(DATA_DIR, 'Gains_real_Testing_data.npy'))
 
-# L2 归一化: 消除响度差异, 按频谱模式聚类 (与 label_real_noise.py 一致;
+# L2 归一化: 消除响度差异, 按频谱模式聚类 (与 label_wavs.py 一致;
 # C端 construct_wc 对 centroid 做 max归一化, 只使用相对模式, 空间必须对齐)
 from sklearn.preprocessing import normalize
 gains_train = normalize(gains_train, norm='l2')

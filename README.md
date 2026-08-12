@@ -49,13 +49,13 @@
 | 从头训练 + 实时降噪（默认） | 阶段 0 → 1 → 2 → 3 → 4 全流程 |
 | 先用现成模型跑通（可选捷径） | 阶段 0 → 1 → 3 → 4（跳过训练 2；主路径测量可省） |
 
-**为什么先测声学路径再训练？** 子滤波器生成（阶段 2-①）和打标签（阶段 2-②）都以 `secondary_path.npy` 和 `primary_path.npy` 为输入，所以**阶段 1 测声学路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（训练用不到，阶段 1 里一起测完）。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到阶段 2-⑥ 重导一次让新测 Ŝ 生效。
+**为什么先测声学路径再训练？** 子滤波器生成（阶段 2-①）和打标签（阶段 2-②）都以 `secondary_path.npy` 和 `primary_path.npy` 为输入，所以**阶段 1 测声学路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（训练用不到，阶段 1 里一起测完）。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到阶段 2-⑦ 重导一次让新测 Ŝ 生效。
 
 **核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
 
 **校准时注意**：增益旋钮调到 **SIG 常亮、CLIP 不亮**，且**校准和运行时必须用同一位置**（路径系数嵌入了模拟增益）。探针响度用 `GFANC_CAL_NOISE` 调（默认 0.9）：削波就调小（如 0.4），SNR 不足就调大。ERLE < 8dB 的弱耦合路径会被自动置零（属正常保护）。文件缺失时反馈抵消自动禁用，不影响降噪但可能啸叫。
 
-**批次指纹（R-27）**：导出时对 [CNN 权重 + 子滤波器 + 两个带通] 算链式 crc32 写入 `data/batch_id.bin`；运行时重算比对，防止 CNN 与 sub_filters 来自不同训练批次导致 Wc 预设错位。不一致时启动打印 `[WARN] 批次混配检测……`（仅警告不阻断，FxLMS 会自适应纠正，只影响暖启动收敛）——**重跑一次导出（完整命令流 · 阶段 2-⑥）即可修复**。声学路径不参与指纹（可单独替换）。
+**批次指纹（R-27）**：导出时对 [CNN 权重 + 子滤波器 + 两个带通] 算链式 crc32 写入 `data/batch_id.bin`；运行时重算比对，防止 CNN 与 sub_filters 来自不同训练批次导致 Wc 预设错位。不一致时启动打印 `[WARN] 批次混配检测……`（仅警告不阻断，FxLMS 会自适应纠正，只影响暖启动收敛）——**重跑一次导出（完整命令流 · 阶段 2-⑦）即可修复**。声学路径不参与指纹（可单独替换）。
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）；编译也可用 `make` / `make realtime`（Makefile 已含全部模块）。换硬件或换摆放后从零到实时运行的完整清单见 [换硬件检查单](#换硬件检查单)。
 
@@ -92,7 +92,7 @@
 | 步骤 | 做什么 | 对应完整命令流 |
 |------|--------|--------------|
 | 0 | 接线 + 调增益旋钮（参考麦→输入 0，误差麦→输入 1-3，扬声器→输出 0-1） | SIG 常亮、CLIP 不亮，记住旋钮位置 |
-| 1 | **测次级路径 Ŝ（每次换位置/几何必测）** | 阶段 1-② → `secondary_path.npy`；导出见阶段 2-⑥ |
+| 1 | **测次级路径 Ŝ（每次换位置/几何必测）** | 阶段 1-② → `secondary_path.npy`；导出见阶段 2-⑦ |
 | 2 | **测环路延迟（首次 / 换声卡·缓冲必测）** | 阶段 1-④ → `sec_bulk_delay.bin`（运行时自动补偿） |
 | 3 | 测反馈路径（防啸叫） | 阶段 1-⑤ → `feedback_path_0/1.bin` |
 | 4 | 编译实时版 | 阶段 3-① |
@@ -158,7 +158,7 @@ Done.
 > 面向**从零开始、自己训练数据**的完整流程，按阶段 0 → 4 顺序执行。核心依赖关系：
 > - **次级路径 Ŝ 必须先测（阶段 1）再训练（阶段 2）**——子滤波器生成、打标签都以它为输入（与仓库自带的那份 `secondary_path.npy` 是同一文件）；
 > - 环路延迟、反馈路径是**纯部署项**，与训练无关（阶段 1 里一起测，训练用不到）；
-> - 想先用现成模型跑通（可选捷径）：阶段 0 → 1 → 3 → 4，跳过阶段 2，但换硬件/摆放后需回阶段 2-⑥ 重导一次让新测 Ŝ 生效。
+> - 想先用现成模型跑通（可选捷径）：阶段 0 → 1 → 3 → 4，跳过阶段 2，但换硬件/摆放后需回阶段 2-⑦ 重导一次让新测 Ŝ 生效。
 
 | 阶段 | 内容 | 必做？ | 何时做 |
 |------|------|--------|--------|
@@ -179,13 +179,9 @@ pip install numpy scipy pandas torch torchaudio
 
 ### 🎯 声学路径测量（阶段 1 — 必做）
 
-> ⚠️ **四种声学路径一次测完**。其中**次级路径 Ŝ 和主路径 Pri 是训练输入**（子滤波器生成 2-①、打标签 2-②、导出 2-⑥ 都用），**环路延迟、反馈路径是运行部署项**（与训练无关，但同属"测量"、共用同一套硬件布置，一起测完最顺）。前置条件：硬件接好、摆放就位（参考麦朝噪声源、误差麦+扬声器朝听音区）、增益旋钮 SIG 常亮 CLIP 不亮。
+> ⚠️ **四种声学路径一次测完**。其中**次级路径 Ŝ 和主路径 Pri 是训练输入**（子滤波器生成 2-①、打标签 2-②、导出 2-⑦ 都用），**环路延迟、反馈路径是运行部署项**（与训练无关，但同属"测量"、共用同一套硬件布置，一起测完最顺）。前置条件：硬件接好、摆放就位（参考麦朝噪声源、误差麦+扬声器朝听音区）、增益旋钮 SIG 常亮 CLIP 不亮。
 
 ```bash
-# 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-
 # 1-② 测次级路径 Ŝ（扬声器→误差麦，Farina 指数扫频法，SNR 最高、免疫时钟滑移）
 #     训练 + 运行共用输入，必须先测、先于任何训练
 #     脚本用相对路径找 Primary and Secondary Path/，需从 GFANC_Scene 目录运行
@@ -203,6 +199,11 @@ python ../export/measure_primary.py --source-channel 0 --duration 8 --repetition
 cd ..
 #    → 覆盖 GFANC_Scene/Primary and Secondary Path/primary_path.npy
 
+# 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+
+
 # 1-④ 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
 ./calibrate_secondary.exe
 #    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
@@ -216,7 +217,9 @@ cd ..
 
 ### 🎯 训练数据（阶段 2 — 必做，面向从头训练）
 
-> 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（**两者都是子滤波器 / 打标签的输入**）。只跑现成模型（跳过本阶段）时用仓库自带的那两份 .npy，但那是别人环境的测量值——**从头训练务必在阶段 1 实测**。
+> 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（子滤波器、合成数据生成/打标签、导出全都要）。只跑现成模型（跳过本阶段）时用仓库自带的那两份 .npy，但那是别人环境的测量值——**从头训练务必在阶段 1 实测**。
+>
+> **当前部署模型 = 纯合成训练**（2-② 生成合成数据 → 2-③ `Train_validate.py` 纯合成训练，**没有真实数据微调**）。真实微调（2-④/2-⑤）是**可选**路径，当前流程没用。
 
 ```bash
 # 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
@@ -226,30 +229,50 @@ python training/control_filters/Pre_training_broadband_and_decompose.py
 #    → models/MIMO_Pretrained_Control_filters_broadband.mat
 #      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
 
-# 2-② 用实测声学路径 + 子滤波器基重标真实噪声标签（gain_0..29）
-#    输入: Primary and Secondary Path/{primary,secondary}_path.npy + 子滤波器基
-python training/labeling/label_real_noise.py
-#    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
-#      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
+# 2-② 生成合成训练数据 + LMS 打标签 —— 当前训练数据**全部来自这里**（从零生成，独立数据集）
+#    ① 生成 4 类谱形 1s WAV：窄带 / 宽带 / 1-f^α 谱倾斜 / 谐波，覆盖 20-1500Hz 全子带空间
+#       → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\synth_*.wav（60000/7500/7500）
+python training/labeling/generate_synthetic.py
+#       --n-train/--n-val/--n-test 自定义规模；--probe-only --n-probe 300 只跑谱形覆盖检查
+#    ② LMS 打标签 = 合成 WAV 过实测声学路径（Pri/Sec）→ FxNLMS 拟合最优子带增益 gain_0..29
+#       → Index_synth_{Training,Validate,Testing}_data.csv + Gains_synth_*.npy
+#         （LMS_MU=0.001, LMS_REPET=3，打标签 ~5.5h）
+python training/labeling/label_wavs.py --wav-dir D:\Dataset\Synthetic_Dataset --tag synth
+#    为什么要生成：真实 4 类噪声全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方
+#      （判别力 35.8% vs 输入谱 75%）；合成多样谱形逼 CNN 学"输入谱→增益"映射（治输入失聪）
 
-# 2-③ 合成数据增强（可选，治 CNN 输入失聪；默认 60000/7500/7500，打标签 ~5.5h）
-python training/labeling/make_synthetic_dataset.py
-#    → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\*.wav
-#      + Index_synth_{split}_data.csv + Gains_synth_{split}_data.npy（LMS_MU=0.001, LMS_REPET=3）
-#      --gen-only 只生成；--label-only 只打标签（重跑不用再生成）
+# 2-③ 纯合成训练直接权重 CNN —— 当前部署模型走的就这条路
+python training/network/Train_validate.py
+#    读 D:\Dataset\Synthetic_Dataset\Index_synth_{Training,Validate}_data.csv（脚本默认即此路径）
+#    → models/MIMO_M5_DirectWeight_Real.pth（export 自动加载；名字带 Real，但就是纯合成训练的产物）
 
-# 2-④ 两阶段训练直接权重 CNN（合成预训练 → 真实微调，低 LR 防坍缩回低频处方）
-python training/network/Train_validate_synth.py
-#    → models/MIMO_M5_DirectWeight_Pretrain.pth（合成预训练，保留）
-#      + models/MIMO_M5_DirectWeight_Real.pth（真实微调后，export 自动加载）
-#      纯真实训练仍可用：python training/network/Train_validate.py
+# ────────────────────────────────────────────────────────────────────
+# 可选：真实数据微调（当前部署模型没用，纯合成已够好；要走才需要 2-④/2-⑤）
 
-# 2-⑤ 评估（可选）
+# 2-④ 真实噪声切割 + LMS 打标签（可选，仅走 2-⑤ 真实微调时需要；与 2-② **并用**，不是替代）
+#    ① 切割 + 首建分层拆分：cut_config.json 状态机（把待切文件名从 cut 移到 uncut 后重跑；
+#       首建自动按 0.8/0.1/0.1 拆 Train/Val/Test，连续块防同录音相邻片段泄漏）
+#       --max-per-category N：每类最多保留 N 段（类别平衡，默认不限）
+python training/labeling/cut_real_noise.py
+#    ② 真实噪声过同一 LMS 管线标 gain_0..29
+#       → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
+#         （增益用与部署一致的 broadband 子滤波器基拟合）
+python training/labeling/label_wavs.py --wav-dir D:\Dataset\Real_world_Dataset --tag real
+
+# 2-⑤ 真实数据微调（可选，跟在 2-③ 之后）：加载 2-③ 纯合成产物 → 真实数据低 LR 微调
+#     （LR_FT=0.003，防把合成学到的多样光谱映射又坍缩回真实低频处方）
+python training/network/finetune_real.py
+#    → models/MIMO_M5_DirectWeight_Real.pth（就地覆盖；export 自动加载）
+#      默认加载同路径的 2-③ 纯合成产物作起点 — 保留原产物需先备份，或：
+#      --pretrain-pth <path> 换起始检查点；--out <path> 输出到别处再手动改名
+
+# 2-⑥ 评估（可选）
 python training/network/evaluate.py
 python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
 #      基线对照：--model models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth（应复现 ≈35.8%）
+# ──────────────────────────────────────────────────────────────────── 
 
-# 2-⑥ 导出 C 二进制（CNN 权重 + 子滤波器 + 声学路径 + 带通 + 批次指纹）
+# 2-⑦ 导出 C 二进制（CNN 权重 + 子滤波器 + 声学路径 + 带通 + 批次指纹）
 #     阶段 1 新测的 secondary_path.npy 在此写入 data/secondary_path.bin
 cd ..
 python export/export_bin.py
@@ -276,22 +299,25 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 # 4-② 运行离线评估版（可选 — 处理一段噪声录音，见"运行示例"）
 ./main.exe "Noise Examples/road_noise_0-34.wav"
+
+./main.exe "Noise Examples/road_noise-15.wav"
 ```
 
 > ⚠️ **换摆放后**：重做阶段 1-②（次级路径）+ 1-⑤（反馈路径）+ 阶段 4（运行验证）；1-④（环路延迟）仅换声卡或 `GFANC_BUFFER` 时重做；1-③（主路径）和训练（阶段 2）不随摆放变化——不重训时 CNN 预设 Wc 与现场 Ŝ 的偏差靠 FxLMS 自适应纠正；换了摆放后效果明显变差，可重走 阶段 1 → 2 → 3 → 4 重训（含重测主路径）。
 
 ## 训练管线（直接权重 CNN）
 
-> 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 2（训练数据）** 的 2-⑥ 步，导出为 C 二进制。
+> 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 2（训练数据）** 的 2-⑦ 步，导出为 C 二进制。
 
 直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
 
 ### 数据与标签
 
-- 数据源：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）
+- 数据源（主）：`D:\Dataset\Synthetic_Dataset` —— 阶段 2-② `generate_synthetic.py` **从零生成** + `label_wavs.py --tag synth` 打标签的合成噪声（60000/7500/7500），**当前部署模型只用它训练**（commit：合成全量重训 cos=0.9706）
+- 数据源（可选）：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）—— 仅走 2-④/2-⑤ 真实微调时用
 - 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
-- 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]），由 `label_real_noise.py` 用**实测声学路径 + 子滤波器基**生成 —— 正是直接权重 CNN 的回归目标
-- 合成数据（可选增强）：`make_synthetic_dataset.py` 生成 4 族多样谱形（窄带/宽带/1-f^α/谐波，20-1500Hz 全子带覆盖）后走**同一套 LMS 管线**标成 `gain_*`。**治 CNN 输入失聪**——真实 4 类全低频主导、谱形接近，从零训练输出坍缩到同一低频处方（判别力 35.8% vs 输入谱 75%），合成数据逼 CNN 学输入再低 LR 微调
+- 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]）—— 合成/真实走**同一套 LMS 管线**（`label_wavs.py --tag {synth,real}`，唯一实现），用**实测声学路径 + 子滤波器基**拟合，正是直接权重 CNN 的回归目标
+- **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，20-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**
 - **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
 
 ### 命令顺序
@@ -301,10 +327,10 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 ### 说明
 
 - **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
-- **何时必须重标（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——`label_real_noise.py` 的 `USE_LOG_SPACING` 须为 `False`。
+- **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-④ 打标签自动加载 broadband.mat，无需另改）。
 - **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
 - **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
-- **合成数据管线**：`make_synthetic_dataset.py` 统一负责生成+打标签（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成样本全走该管线标成 `gain_*`）。两阶段训练 `Train_validate_synth.py`：合成预训练逼 CNN 学「输入谱→增益」多样映射，再低 LR 真实微调适配真实统计量、防坍缩回低频处方。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入，目标从 35.8% 提到 ≥70%
+- **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线 = 2-⑤ `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入，目标从 35.8% 提到 ≥70%
 
 ## 项目结构
 
