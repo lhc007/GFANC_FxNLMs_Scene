@@ -31,6 +31,21 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-12] README 校准工具分工澄清: 扫频法=Ŝ 内容、calibrate_secondary=环路延迟、calibrate_feedback=反馈路径
+- **状态**: 工作区未提交
+- **基线**: c4c512e
+- **变更代码**:
+  - 修改: `README.md` — 修正快速上手/换硬件检查单/详细命令/扫频法章节中"calibrate_secondary 是主测量、扫频法是可选替代"的错误定位: 运行时默认加载 `secondary_path.bin`(扫频法, [main_realtime.c:870](/main_realtime.c#L870)), 环路延迟 `sec_bulk_delay.bin` 只由 calibrate_secondary 测([main_realtime.c:988](/main_realtime.c#L988)); 三步校准命令重排 (②Ŝ→③环路延迟→④反馈), 文件表补充"顺带 NLMS 版 Ŝ 默认不用"
+- **变更原因**: 用户追问三个校准工具分工时发现 README 描述与运行时实际加载逻辑矛盾——详细命令把 calibrate_secondary 标为主测量, 但运行时默认加载的是扫频法产物; 照 README 只跑 calibrate_secondary 会导致 Ŝ 内容不生效
+- **造成影响**:
+  - 行为: 纯文档修订, 无代码/运行时行为变化
+  - 配置: 无
+  - 测试/回归: 不涉及
+  - 性能/内存: 不涉及
+  - 未验证项: 无
+- **验证方式**: 对照 [main_realtime.c:868-870](/main_realtime.c#L868-L870)(默认 Ŝ 文件) 与 [main_realtime.c:986-1006](/main_realtime.c#L986-L1006)(环路延迟来源) 逐条核对 README 描述
+- **回退方式**: git revert 本提交
+
 ### [2026-08-12] R-18 离线抗混叠升级 biquad + R-50 反馈标定峰位 sanity 门禁 + 审查报告按"待办/归档"重排
 - **状态**: 已提交 6c72e4b
 - **基线**: 34f94a6

@@ -103,10 +103,13 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c s
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
 gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 
-# ② 测次级路径 + 环路延迟（最关键）→ 生成 data/secondary_path_measured.bin + data/sec_bulk_delay.bin
+# ② 测次级路径 Ŝ（最关键：换位置/几何必测）→ 扫频法生成 data/secondary_path.bin（运行时默认加载）
+cd GFANC_Scene && python ../export/measure_secondary.py && cd .. && python export/export_bin.py
+
+# ③ 测环路延迟（首次 / 换声卡·缓冲必测）→ 生成 data/sec_bulk_delay.bin（运行时自动补偿）
 ./calibrate_secondary.exe
 
-# ③ 测反馈路径（防啸叫）→ 生成 data/feedback_path_0.bin / feedback_path_1.bin
+# ④ 测反馈路径（防啸叫）→ 生成 data/feedback_path_0.bin / feedback_path_1.bin
 ./calibrate_feedback.exe
 ```
 
@@ -172,10 +175,11 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 |------|--------|------------|
 | 0 | 接线 + 调增益旋钮（参考麦→输入 0，误差麦→输入 1-3，扬声器→输出 0-1） | SIG 常亮、CLIP 不亮，记住旋钮位置 |
 | 1 | 编译校准程序（只做一次） | `gcc ... calibrate_secondary.exe` / `calibrate_feedback.exe` |
-| 2 | **测次级路径 + 环路延迟（最关键）** | `./calibrate_secondary.exe` → `secondary_path_measured.bin` + `sec_bulk_delay.bin` |
-| 3 | 测反馈路径（防啸叫） | `./calibrate_feedback.exe` → `feedback_path_0/1.bin` |
-| 4 | 编译实时版 | `gcc ... gfanc_realtime.exe` |
-| 5 | 运行 + 纯音验证 | `./gfanc_realtime.exe`，250Hz 纯音 NR ≥ 10dB、零 RESET |
+| 2 | **测次级路径 Ŝ（每次换位置/几何必测）** | 扫频法 `measure_secondary.py` + `export_bin.py` → `secondary_path.bin`（运行时默认加载） |
+| 3 | **测环路延迟（首次 / 换声卡·缓冲必测）** | `./calibrate_secondary.exe` → `sec_bulk_delay.bin`（运行时自动补偿） |
+| 4 | 测反馈路径（防啸叫） | `./calibrate_feedback.exe` → `feedback_path_0/1.bin` |
+| 5 | 编译实时版 | `gcc ... gfanc_realtime.exe` |
+| 6 | 运行 + 纯音验证 | `./gfanc_realtime.exe`，250Hz 纯音 NR ≥ 10dB、零 RESET |
 
 ### 详细命令
 
@@ -186,19 +190,26 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
 gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 
-# 2. 次级路径 + 环路延迟（最关键：换位置/扬声器/声卡必测）
-./calibrate_secondary.exe
-#   → data/secondary_path_measured.bin + data/sec_bulk_delay.bin（启动日志显示 Loop delay auto-loaded）
-#   更高 SNR 的替代测量（可选）: cd GFANC_Scene && python ../export/measure_secondary.py
+# 2. 次级路径 Ŝ（最关键：每次换位置/几何/扬声器必测）
+#    扫频法 SNR 高 10-20dB、免疫时钟滑移，运行时默认加载其产物 secondary_path.bin
+cd GFANC_Scene && python ../export/measure_secondary.py
+cd .. && python export/export_bin.py
+#   → data/secondary_path.bin（启动日志显示 Ŝ file: data/secondary_path.bin）
 
-# 3. 反馈路径（防啸叫）
+# 3. 环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
+./calibrate_secondary.exe
+#   → data/sec_bulk_delay.bin（启动日志显示 Loop delay auto-loaded）
+#   注: 该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
+#       想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
+
+# 4. 反馈路径（防啸叫）
 ./calibrate_feedback.exe
 #   → data/feedback_path_0.bin / data/feedback_path_1.bin
 
-# 4. 编译实时版
+# 5. 编译实时版
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
 
-# 5. 运行 + 验证
+# 6. 运行 + 验证
 ./gfanc_realtime.exe     # 设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
 ```
 
@@ -503,9 +514,14 @@ python export/export_bin.py                           # 导出 .npy → data/sec
 
 方法: Farina 2000 AES 指数扫频，5s 扫频 20-7500Hz，多次重复时域平均，自动反卷积提取脉冲响应。相比白噪声 NLMS 法，SNR 高 10-20dB，天然免疫时钟滑移。
 
+**三个校准工具的分工**（换位置/几何/声卡时按需重测，不重复）：
+- **Ŝ 内容 → 扫频法**（`measure_secondary.py` + `export_bin.py` → `secondary_path.bin`）：每次换位置/几何/扬声器必测，运行时**默认加载**它。
+- **环路延迟 → `calibrate_secondary.exe`**（→ `sec_bulk_delay.bin`）：首次 / 换声卡或 `GFANC_BUFFER` 后必测，运行时自动补偿。它顺带产出的 NLMS 版 Ŝ（`secondary_path_measured.bin`）默认不用，需 `GFANC_SEC_FILE` 指定。
+- **反馈路径 → `calibrate_feedback.exe`**（→ `feedback_path_0/1.bin`）：防啸叫；换摆放后出现啸叫时重测。
+
 **Ŝ 文件选择 + 环路延迟补偿（v1.4）**：
 - 运行时**默认加载 `data/secondary_path.bin`**（扫频法产物）；`GFANC_SEC_FILE` 环境变量可强制指定其它文件（如 C 校准 `data/secondary_path_measured.bin`）。启动日志打印 `Ŝ file: ...`。
-- **必须测环路延迟**：`calibrate_secondary.exe` 会生成 `sec_bulk_delay.bin`（总环路延迟 @16k），运行时自动换算 `dsp_delay` 补偿 FxLMS 对齐（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。缓冲大小用 `GFANC_BUFFER` 调（默认 128 样本），实测 UMC ASIO + 128 帧环路 ≈ **12.4ms**（该值为 I/O+声学环路；控制路径另有 ANC 带通群延迟 2ms。旧 0.01s suggestedLatency 会把驱动顶到 512 样本 → 30ms，已修复）。
+- **环路延迟只由 `calibrate_secondary.exe` 测**：生成 `sec_bulk_delay.bin`（总环路延迟 @16k），运行时自动换算 `dsp_delay` 补偿 FxLMS 对齐（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。缓冲大小用 `GFANC_BUFFER` 调（默认 128 样本），实测 UMC ASIO + 128 帧环路 ≈ **12.4ms**（该值为 I/O+声学环路；控制路径另有 ANC 带通群延迟 2ms。旧 0.01s suggestedLatency 会把驱动顶到 512 样本 → 30ms，已修复）。
 - ⚠️ **每次换安装位置/几何后必须重测**（管道/桌面/窗户声学不同），否则实时 NR 会下降。
 
 ## 在线次级路径辨识
@@ -632,7 +648,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `src/sec_online.c` | 在线 Ŝ NLMS 辨识 (零探测噪声, 原地更新 sec_coeffs) |
 | `src/pa_loader.c` | PortAudio ASIO DLL 运行时加载 |
 | `src/calibrate_feedback.c` | 反馈路径 NLMS 校准 (逐扬声器, 16k ZOH×3 激励) |
-| `src/calibrate_secondary.c` | 次级路径 C 版白噪声校准 + 延迟/滑移诊断 |
+| `src/calibrate_secondary.c` | 环路延迟/滑移测量（→ `sec_bulk_delay.bin`）+ 顺带 NLMS 版 Ŝ（默认不用） |
 | `src/binary_loader.c` | .bin 二进制权重文件加载 (v2 格式, GFNC 头+CRC32) |
 | `include/gfanc_types.h` | 集中参数 + 分级日志 + 维度宏 |
 | `include/scene_manager.h` | 共享纯函数 (main.c + main_realtime.c 共用); `sm_cos_sim`(reset 判定)/`sm_wc_max_abs`/`sm_check_divergence`/`sm_check_convergence`; v1.6 已删 `sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`/`sm_wc_rms` 死代码 |
