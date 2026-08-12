@@ -31,6 +31,21 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-12] README 明确次级路径 Ŝ = 训练/运行共用输入 — 重训场景 C1 先于阶段 A
+- **状态**: 工作区未提交
+- **基线**: abd6617
+- **变更代码**:
+  - 修改: `README.md` — ① 完整命令流阶段 A 新增 ⚠️ 说明: A1 子滤波器 / A2 打标签 / A5 导出都读 `GFANC_Scene/Primary and Secondary Path/secondary_path.npy`(仓库自带), 针对自家环境重训须先做阶段 C1 现场测次级路径再回阶段 A; ② A1 注释补输入(secondary_path.npy, MIMO FxNLMS 训练必需), A2 注释补输入(primary/secondary_path.npy + 子滤波器基); ③ C1 注释补 ⚠️ 覆盖同一份 .npy(=训练输入), 重训先做本步; ④ 快速开始"要不要训练"句改为"阶段 A 以 secondary_path.npy 为输入, 换硬件不用重训"
+- **变更原因**: 用户对抗性质疑"生成子滤波器/次级滤波器怎么在系统运行阶段? 不然怎么训练子滤波器、打标签?"——核实代码依赖链 (Pre_training_broadband_and_decompose.py:365-414 读 secondary_path.npy; label_real_noise.py:94-95 读 primary/secondary .npy; export_bin.py:46-47 同槽位; measure_secondary.py:41+318 覆盖写同一 .npy) 确认次级路径 Ŝ 同时是训练输入与运行测量项; README 原 A→C 编排未说明"重训要先测路径"
+- **造成影响**:
+  - 行为: 纯文档修订, 无代码/运行时行为变化
+  - 配置: 无
+  - 测试/回归: 不涉及
+  - 性能/内存: 不涉及
+  - 未验证项: 无
+- **验证方式**: 逐文件核对依赖链 (Pre_training_broadband_and_decompose.py / label_real_noise.py / export_bin.py / measure_secondary.py 均指向同一 secondary_path.npy 槽位); 文档新增说明与代码实际读取路径一致
+- **回退方式**: git revert 本提交
+
 ### [2026-08-12] README 命令去重 — 完整命令流=唯一命令源, 快速开始/换硬件检查单改文字引用
 - **状态**: 工作区未提交
 - **基线**: 36f9fc6

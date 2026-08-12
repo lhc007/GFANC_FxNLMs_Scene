@@ -49,7 +49,7 @@
 | 只想跑实时降噪（不训练） | 阶段 0 → B → C → D（跳过训练数据 A） |
 | 自己训练 / 更换模型 | 阶段 0 → A → B → C → D 全流程 |
 
-**要不要训练？** 仓库 `data/` 自带训练好的权重（含声学路径），**不训练也能直接跑实时降噪**。训练（阶段 A）只影响模型；换硬件/换摆放不影响模型，只要求重测声学路径。
+**要不要训练？** 仓库 `data/` 自带训练好的权重（含声学路径），**不训练也能直接跑实时降噪**。训练（阶段 A）以 `secondary_path.npy` 为输入（见完整命令流 A 说明）；换硬件/换摆放**不用重训模型**，只需重测声学路径。
 
 **核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
 
@@ -180,17 +180,21 @@ pip install numpy scipy pandas torch torchaudio
 
 ### 🎯 训练数据（阶段 A — 可选）
 
+> ⚠️ **次级路径 Ŝ 是训练与运行的共用输入**：A1 子滤波器训练、A2 打标签、A5 导出都读 `GFANC_Scene/Primary and Secondary Path/secondary_path.npy`（仓库自带一份）。**针对自家安装环境重训 → 先做阶段 C1 现场测次级路径（覆盖这份 .npy），再回本阶段**；只跑仓库自带模型 → 跳过本阶段，直接用自带的 .npy。
+
 ```bash
 # A0. 一次性依赖（不训练跳过本阶段则无需执行）
 pip install numpy scipy pandas torch torchaudio
 
 # A1. 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
+#    输入: Primary and Secondary Path/secondary_path.npy（Ŝ, MIMO FxNLMS 训练必需）
 cd GFANC_Scene
 python training/control_filters/Pre_training_broadband_and_decompose.py
 #    → models/MIMO_Pretrained_Control_filters_broadband.mat
 #      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
 
 # A2. 用实测声学路径 + 子滤波器基重标真实噪声标签（gain_0..29）
+#    输入: Primary and Secondary Path/{primary,secondary}_path.npy + 子滤波器基
 python training/labeling/label_real_noise.py
 #    → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
 #      gain_* 列不变；旧 scene_id/band_ 列消失（场景聚类已不需要）
@@ -229,6 +233,8 @@ gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.
 gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 
 # C1. 测次级路径 Ŝ（扬声器→误差麦，扫频法 SNR 最高，运行时默认加载其产物）
+#     ⚠️ 覆盖 Primary and Secondary Path/secondary_path.npy —— 同是训练打标签/子滤波器的输入;
+#        针对自家环境重训模型 → 先做本步再走阶段 A
 cd GFANC_Scene && python ../export/measure_secondary.py && cd ..
 python export/export_bin.py        # 重导，让新测的 secondary_path.bin 生效
 #    → data/secondary_path.bin
