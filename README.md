@@ -42,103 +42,22 @@
 
 ## 快速开始
 
-### 1. 下载项目
+> 所有命令统一在下方 **完整命令流（训练 → 实时运行）**，按阶段 0 → A → B/C/D 顺序执行。这里先决定走哪条路：
 
-```bash
-git clone https://github.com/lhc007/GFANC_FxNLMs_Scene.git
-cd GFANC_FxNLMs_Scene
-```
+| 你想做什么 | 走哪条路 |
+|-----------|---------|
+| 只想跑实时降噪（不训练） | 阶段 0 → B → C → D（跳过训练数据 A） |
+| 自己训练 / 更换模型 | 阶段 0 → A → B → C → D 全流程 |
 
-项目目录中的 `data/` 文件夹包含了训练好的模型权重，不需要额外下载。
+**要不要训练？** 仓库 `data/` 自带训练好的权重（含声学路径），**不训练也能直接跑实时降噪**。训练（阶段 A）只影响模型；换硬件/换摆放不影响模型，只要求重测声学路径。
 
-### 2. 导出权重（仅需做过训练后执行）
+**核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
 
-仓库自带训练好的权重，**未训练过的直接跳过本步**。若你重新训练了 CNN 模型或子滤波器，需要重新导出为 C 可用的 `.bin` 文件（训练流程见 [训练管线](#训练管线直接权重-cnn)）：
+**校准时注意**：增益旋钮调到 **SIG 常亮、CLIP 不亮**，且**校准和运行时必须用同一位置**（路径系数嵌入了模拟增益）。探针响度用 `GFANC_CAL_NOISE` 调（默认 0.9）：削波就调小（如 0.4），SNR 不足就调大。ERLE < 8dB 的弱耦合路径会被自动置零（属正常保护）。文件缺失时反馈抵消自动禁用，不影响降噪但可能啸叫。
 
-```bash
-pip install numpy scipy torch   # 一次性依赖
-python export/export_bin.py     # 读取 GFANC_Scene 的模型和路径，写入 data/
-```
+**批次指纹（R-27）**：导出时对 [CNN 权重 + 子滤波器 + 两个带通] 算链式 crc32 写入 `data/batch_id.bin`；运行时重算比对，防止 CNN 与 sub_filters 来自不同训练批次导致 Wc 预设错位。不一致时启动打印 `[WARN] 批次混配检测……`（仅警告不阻断，FxLMS 会自适应纠正，只影响暖启动收敛）——**重跑一次导出（完整命令流 · 阶段 A5）即可修复**。声学路径不参与指纹（可单独替换）。
 
-默认自动查找同级目录的 `GFANC_Scene`，也可以手动指定：
-
-```bash
-set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
-python export/export_bin.py
-```
-
-导出内容：CNN 权重（58 个 `.bin`）、子滤波器、主/次路径、带通 FIR、配置 JSON、**批次指纹**（`batch_id.bin` + `batch_info.json`，见下）。**直接权重模式（v1.6）跳过场景 centroids**（`scene_defs.bin` 不再生成/加载）。
-
-**批次指纹（R-27）**：`export_bin.py` 每次导出都会对 [CNN 权重 + 子滤波器 + 两个带通] 计算一个链式 crc32 指纹写入 `data/batch_id.bin`。运行时加载时会重算比对，防止 **CNN 与 sub_filters 来自不同批次**（同一 K=30/L=1024、单文件 crc 都合法但语义不同训练世界）导致的 Wc 预设错位。不一致时启动打印 `[WARN] 批次混配检测……`（仅警告不阻断，FxLMS 会自适应纠正，只影响暖启动收敛），**重跑一次 `export/export_bin.py` 即可修复**。声学路径（secondary/primary/feedback）不参与指纹——它们是按安装摆放可单独替换的测量值。
-
-### 3. 编译
-
-打开终端（PowerShell 或 Git Bash），在项目目录下执行：
-
-**离线版**（处理 WAV 文件）：
-```bash
-gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
-```
-
-**实时版**（麦克风 → 扬声器）：
-```bash
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
-```
-> 编译命令需包含 `src/ocg.c`（OCG 聚类闸门 v1.7+）。也可以直接用 `make` / `make realtime`（Makefile 已包含全部模块）。
-
-需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）。
-
-
-### 4. 校准声学路径（首次使用 / 换了硬件 / 换了摆放位置 —— 必做）
-
-系统必须知道"扬声器的声音怎么传到麦克风"（声学路径），才能算出正确的反噪声。**这些路径完全取决于你的摆放几何，换了位置就必须重测**。共三项：
-
-| 校准项 | 测什么 | 什么时候重测 |
-|--------|--------|-------------|
-| **次级路径 Ŝ** | 扬声器→误差麦的传递（扫频法，运行时默认加载） | 换扬声器 / 换位置 |
-| **环路延迟** | FxLMS 对齐用的总延迟（`calibrate_secondary.exe`） | 换声卡 / 换缓冲 / 首次 |
-| **反馈路径** | 扬声器→参考麦的正反馈（防啸叫） | 换扬声器 / 换位置 |
-
-```bash
-# ① 编译两个校准程序（只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-
-# ② 测次级路径 Ŝ（最关键：换位置/几何必测）→ 扫频法生成 data/secondary_path.bin（运行时默认加载）
-cd GFANC_Scene && python ../export/measure_secondary.py && cd .. && python export/export_bin.py
-
-# ③ 测环路延迟（首次 / 换声卡·缓冲必测）→ 生成 data/sec_bulk_delay.bin（运行时自动补偿）
-./calibrate_secondary.exe
-
-# ④ 测反馈路径（防啸叫）→ 生成 data/feedback_path_0.bin / feedback_path_1.bin
-./calibrate_feedback.exe
-```
-
-> 📏 **校准质量规则**：校准时声卡输入 **SIG 常亮、CLIP 不亮**。CLIP 亮 = 输入削波，会污染路径辨识。探针响度用 `GFANC_CAL_NOISE` 调（默认 0.9）：削波就调小（如 0.4），SNR 不足就调大。ERLE < 8dB 的弱耦合路径会被自动置零（属正常保护）。**校准用的增益旋钮位置 = 运行时必须用同一位置**（路径系数嵌入了模拟增益）。
-> ⚠️ **只在麦克风/扬声器位置变化时需要重测**。文件缺失时反馈抵消自动禁用，不影响降噪但可能啸叫。
-
-换硬件或换摆放位置后**从零到实时运行**的完整清单，见 [换硬件检查单](#换硬件检查单)。
-
-### 5. 运行
-
-**离线版** — 处理一段噪声录音：
-```bash
-./main.exe "Noise Examples/mixed_7types_56s.wav"
-
-./main.exe "Noise Examples/road_noise_0-34.wav"
-
-./main.exe "Noise Examples/road_noise-15.wav"
-```
-
-运行后会生成两个文件：
-- `anti_out.wav` — 反噪声信号（2 声道，这是播放到扬声器的声音）
-- `error_out.wav` — 残差信号（3 声道，降噪后剩余的声音）
-
-**实时版** — 实时抵消环境噪声（默认参数即可，自动增益）：
-```bash
-./gfanc_realtime.exe
-```
-运行后会列出音频设备，输入设备编号（如 `23`），开始实时降噪。按 `Ctrl+C` 停止。
+需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）；编译也可用 `make` / `make realtime`（Makefile 已含全部模块）。换硬件或换摆放后从零到实时运行的完整清单见 [换硬件检查单](#换硬件检查单)。
 
 > **想试场景切换（OCG 聚类闸门）？** 默认**关闭**（`GFANC_OCG=0`，稳定性最佳，日常开窗降噪用默认即可）。想验证"换噪声类型自动切换反相"时再开：
 > - **PowerShell**：`$env:GFANC_OCG="1"; ./gfanc_realtime.exe`（关掉：重开终端即可，或 `Remove-Item Env:GFANC_OCG`）
@@ -164,55 +83,21 @@ cd GFANC_Scene && python ../export/measure_secondary.py && cd .. && python expor
 - **几何限制**：ANC 带通已砍 256→64tap（群延迟 8→2ms），控制路径 ≈ 10.8ms（带通 2ms + ASIO 8.4ms + 声学 0.4ms）vs 参考→误差预览 ~1.9ms → **净预览 ≈ −9ms**（原 256tap −18.5ms，详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）→ 只能实时消 <~55Hz 宽带 + 周期/窄带成分（实测 NR 约 4-6dB）。要更高需拉大参考麦与误差麦距离，或降声卡缓冲。
 - 可选调参：`GFANC_MIC_GAIN`（输入预增益）、`GFANC_STEP`、`GFANC_WC_TARGET` 等见[系统参数表](#系统参数)。
 
-运行后会列出音频设备，输入麦克风和扬声器的设备编号（如 `23`），然后开始实时降噪。按 `Ctrl+C` 停止。
-
 ---
 
 ## 换硬件检查单
 
-> 换了**音频接口 / 扬声器 / 麦克风**，或换了**摆放位置**（如从桌面移到窗边）后，按这个顺序从零跑到实时运行。**核心原则：凡涉及"声音怎么在空气里走"的参数全部重测，模型权重不用动。**
+> 换了**音频接口 / 扬声器 / 麦克风**，或换了**摆放位置**（如从桌面移到窗边）后，按这个顺序从零跑到实时运行。**核心原则：凡涉及"声音怎么在空气里走"的参数全部重测，模型权重不用动。** 所有命令见上文 **完整命令流 · 阶段 B/C/D**，这里只列步骤与产物。
 
-| 步骤 | 做什么 | 命令 / 产物 |
-|------|--------|------------|
+| 步骤 | 做什么 | 对应完整命令流 |
+|------|--------|--------------|
 | 0 | 接线 + 调增益旋钮（参考麦→输入 0，误差麦→输入 1-3，扬声器→输出 0-1） | SIG 常亮、CLIP 不亮，记住旋钮位置 |
-| 1 | 编译校准程序（只做一次） | `gcc ... calibrate_secondary.exe` / `calibrate_feedback.exe` |
-| 2 | **测次级路径 Ŝ（每次换位置/几何必测）** | 扫频法 `measure_secondary.py` + `export_bin.py` → `secondary_path.bin`（运行时默认加载） |
-| 3 | **测环路延迟（首次 / 换声卡·缓冲必测）** | `./calibrate_secondary.exe` → `sec_bulk_delay.bin`（运行时自动补偿） |
-| 4 | 测反馈路径（防啸叫） | `./calibrate_feedback.exe` → `feedback_path_0/1.bin` |
-| 5 | 编译实时版 | `gcc ... gfanc_realtime.exe` |
-| 6 | 运行 + 纯音验证 | `./gfanc_realtime.exe`，250Hz 纯音 NR ≥ 10dB、零 RESET |
-
-### 详细命令
-
-```bash
-# 0. 接线完成后，把增益旋钮调到 SIG 常亮、CLIP 不亮（记住位置，校准和运行必须一致）
-
-# 1. 编译校准程序（只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-
-# 2. 次级路径 Ŝ（最关键：每次换位置/几何/扬声器必测）
-#    扫频法 SNR 高 10-20dB、免疫时钟滑移，运行时默认加载其产物 secondary_path.bin
-cd GFANC_Scene && python ../export/measure_secondary.py
-cd .. && python export/export_bin.py
-#   → data/secondary_path.bin（启动日志显示 Ŝ file: data/secondary_path.bin）
-
-# 3. 环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
-./calibrate_secondary.exe
-#   → data/sec_bulk_delay.bin（启动日志显示 Loop delay auto-loaded）
-#   注: 该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
-#       想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
-
-# 4. 反馈路径（防啸叫）
-./calibrate_feedback.exe
-#   → data/feedback_path_0.bin / data/feedback_path_1.bin
-
-# 5. 编译实时版
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
-
-# 6. 运行 + 验证
-./gfanc_realtime.exe     # 设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
-```
+| 1 | 编译校准程序（只做一次） | 阶段 B |
+| 2 | **测次级路径 Ŝ（每次换位置/几何必测）** | 阶段 C1 → `secondary_path.bin`（运行时默认加载） |
+| 3 | **测环路延迟（首次 / 换声卡·缓冲必测）** | 阶段 C2 → `sec_bulk_delay.bin`（运行时自动补偿） |
+| 4 | 测反馈路径（防啸叫） | 阶段 C3 → `feedback_path_0/1.bin` |
+| 5 | 编译实时版 | 阶段 D1 |
+| 6 | 运行 + 纯音验证 | 阶段 D2（250Hz 纯音 NR ≥ 10dB、零 RESET） |
 
 ### 换硬件时**不需要**重做的
 
@@ -277,15 +162,26 @@ Done.
 
 | 阶段 | 内容 | 必做？ | 何时做 |
 |------|------|--------|--------|
+| 🎯 准备 0 | 下载项目 + 装 Python 依赖 | 必做 | 首次 |
 | 🎯 训练数据 A | 子滤波器 → 标签 → 训练 CNN → 导出 `data/*.bin` | 仅重训模型 | 换模型 / 模型效果差 |
 | 🎯 系统运行 B | 编译两个校准程序 | 一次 | 首次 |
 | 🎯 系统运行 C | 声学路径校准（次级路径 Ŝ / 环路延迟 / 反馈） | 必做 | 首次 / 换硬件 / 换摆放 |
 | 🎯 系统运行 D | 编译实时版 + 运行验证 | 必做 | 每次 |
 
+### 🎯 准备（阶段 0 — 必做，只做一次）
+
+```bash
+git clone https://github.com/lhc007/GFANC_FxNLMs_Scene.git
+cd GFANC_FxNLMs_Scene
+
+# 仅训练/导出需要 Python 依赖；只想跑系统（data/ 自带权重）可不装
+pip install numpy scipy pandas torch torchaudio
+```
+
 ### 🎯 训练数据（阶段 A — 可选）
 
 ```bash
-# A0. 一次性依赖
+# A0. 一次性依赖（不训练跳过本阶段则无需执行）
 pip install numpy scipy pandas torch torchaudio
 
 # A1. 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
@@ -320,6 +216,7 @@ python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWe
 cd ..
 python export/export_bin.py
 #    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
+#    默认自动查找同级目录的 GFANC_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
 ```
 
 > 💡 **不训练的用户**：`data/` 已随仓库自带（`GFANC_Scene/Primary and Secondary Path/*.npy` 声学路径也在），跳过阶段 A，从阶段 B 开始即可。
@@ -339,6 +236,8 @@ python export/export_bin.py        # 重导，让新测的 secondary_path.bin �
 # C2. 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
 ./calibrate_secondary.exe
 #    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
+#    该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
+#    想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
 
 # C3. 测反馈路径（扬声器→参考麦，防啸叫）
 ./calibrate_feedback.exe
@@ -347,9 +246,15 @@ python export/export_bin.py        # 重导，让新测的 secondary_path.bin �
 # D1. 编译实时版
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
 
-# D2. 运行 + 纯音验证
+# D1b. 编译离线评估版（可选 — 处理 WAV 算 NR_true，见"离线验证"）
+gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
+
+# D2. 运行实时版 + 纯音验证
 ./gfanc_realtime.exe
 #    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
+
+# D2b. 运行离线评估版（可选 — 处理一段噪声录音，见"运行示例"）
+./main.exe "Noise Examples/road_noise_0-34.wav"
 ```
 
 > ⚠️ **换摆放后只重做 C1 + C3**；C2 仅在换声卡或 `GFANC_BUFFER` 时重做。模型权重（阶段 A 产物）不随摆放变化，无需重导。
@@ -537,7 +442,7 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ 
 └──────────────────────────────────────────────────────────────┘
 ## 反馈路径校准
 
-反馈抵消功能需逐扬声器校准声学路径。详见 [快速开始 - 步骤 4](#4-校准反馈路径实时模式首次运行前必须执行)。
+反馈抵消功能需逐扬声器校准声学路径。校准命令见上文 **完整命令流 · 阶段 C3**（`calibrate_feedback.exe` → `feedback_path_0/1.bin`）。
 
 校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
 ```
@@ -549,16 +454,12 @@ Feedback spk1: 256 taps, RMS=0.0011
 
 ## 次级路径测量（Python，Farina 扫频法）
 
-提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦：
+提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦。**测量命令见上文 完整命令流 · 阶段 C1**（需从 `GFANC_Scene` 目录运行，脚本用相对路径找 `Primary and Secondary Path/`）。工具额外支持：
 
-```bash
-# 从 GFANC_Scene 目录运行 (脚本用相对路径找 Primary and Secondary Path/)
-cd GFANC_Scene
-python ../export/measure_secondary.py --interactive   # 首次: 配置设备
-python ../export/measure_secondary.py                 # 日常测量 (可加 --duration 10 --repetitions 6 --amplitude 0.95 提高SNR)
-cd ..
-python export/export_bin.py                           # 导出 .npy → data/secondary_path.bin
-```
+- `--interactive`：首次使用配置声卡设备
+- `--duration <秒>` / `--repetitions <次数>`：延长扫频 / 多次重复时域平均，提高 SNR
+- `--amplitude <0..1>`：调探针响度（默认 0.95，削波就调小）
+
 
 方法: Farina 2000 AES 指数扫频，5s 扫频 20-7500Hz，多次重复时域平均，自动反卷积提取脉冲响应。相比白噪声 NLMS 法，SNR 高 10-20dB，天然免疫时钟滑移。
 
@@ -621,7 +522,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos(anchor,cur)<0.6 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
 | Reset 触发 | 默认 cos(anchor,cur)<0.6 (env: GFANC_RESET_THRESH) | 场景真正切换才重置; 0.6 是实机纯音深对消验证值 (0.8 在深对消时误杀健康 Wc, 见 CHANGELOG) |
-| OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估; 开启命令见 [§5 运行](#5-运行) |
+| OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估; 开启命令见上文快速开始「想试场景切换」框 |
 | 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
 | 质心漂移 α | 0.1 (env: GFANC_OCG_ALPHA) | 质心 EMA 跟随增益方向 (吸收慢漂移) |
 | 簇上限 | 8 (env: GFANC_OCG_CLUSTERS) | LRU 淘汰最久未命中簇 |
