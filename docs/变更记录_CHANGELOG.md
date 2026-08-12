@@ -31,8 +31,26 @@
 
 ## 记录列表（最新在上）
 
-### [2026-08-12] R-27 批次指纹落地（防 cnn/sub_filters/bandpass 跨批混配）+ 审查报告第七节补记 v1.6 DW 架构切换
+### [2026-08-12] R-18 离线抗混叠升级 biquad + R-50 反馈标定峰位 sanity 门禁 + 审查报告按"待办/归档"重排
 - **状态**: 工作区未提交
+- **基线**: 34f94a6
+- **变更代码**:
+  - 修改: `main.c` — `resample_mono` 下采样抗混叠从"2 样本移动平均"升级为 2 阶 Butterworth biquad（与实时版 `main_realtime.c` R-14 逐字一致; 新增 `biquad_t`/`biquad_init_lpf`/`biquad_tick`, fc=0.40625×sr_out≈6.5k@16k 输出）
+  - 修改: `src/calibrate_feedback.c` — R-50 峰位物理 sanity 门禁: `FB_MAX_PEAK_MS=11.0f`（spk→ref 反馈环路上限, 依据: 全 ANC 环路实测 12.4ms, spk→ref 为其子集必更短; calibrate_secondary 聚类法实测 4.9-7.9ms）; 峰位超限打 ⚠ WARN（**不拒收**, 运行时已加载同类文件, 硬拒会清空反馈抵消）; 输出打印加 PNR
+  - 修改: `docs/GFANC_综合审查报告_合并版.md` — ① 按"待办/归档"重排: 设计权衡（原三）移到行动路线图后、归档区开始, 物理层四→三、路线图五→四; ② R-18/R-50 状态更新
+  - 删除: `src/calibrate_secondary.c` — 移除 c==0 参考麦反馈路径辨识 + `feedback_path_s*.bin` 死输出（运行时只加载 `feedback_path_{0,1}.bin`=calibrate_feedback 产物, 该文件从未被读; NLMS 循环改从 c=1 起只测误差麦次级路径）
+- **变更原因**: R-18"简易 2 点移动平均"抗混叠截止仅 ~fs/4、折叠镜像压制不足, 且与实时抗混叠链（R-14 biquad fc=6.5k）不一致 → 离线 NR 不能完全反映实时行为。R-50"spk0 峰@tap224=14ms 疑似噪声伪峰"缺物理 sanity 检查。
+- **造成影响**:
+  - 行为: 离线 main.exe 44.1k/48k→16k 重采样抗混叠从 2 点平均改 biquad（与实时版同款）; calibrate_feedback.exe 峰位 >11ms 打印 ⚠ 提示、并打印 PNR; calibrate_secondary.exe 不再测/存反馈路径（输出文件集变为只含 secondary_path + sec_bulk_delay）
+  - 配置: 无新增 env
+  - 测试/回归: 离线 road_noise-15（44.1kHz→16k, 实际走新 biquad 路径）平均 NR_true=9.3dB 与基线一致; main.exe / calibrate_feedback.exe 编译零新警告（-Wall 仅既有 unused 警告）
+  - 性能/内存: 离线重采样每样本多 ~5 MAC, 一次性处理, 可忽略; calibrate_feedback 仅标定工具, 无运行时影响
+  - 未验证项: R-50 WARN 门禁需实机重跑校准才能观测（现有 feedback_path_0/1.bin 峰位 13.6/14.4ms 会触发新 ⚠ — 预期行为, 提示流对齐残留）
+- **验证方式**: 离线 NR 回归（road_noise-15 = 9.3dB 基线一致）; -Wall 零新警告; 对现有反馈 FIR 峰位/PNR 数据分析确认门限合理
+- **回退方式**: git revert 本提交
+
+### [2026-08-12] R-27 批次指纹落地（防 cnn/sub_filters/bandpass 跨批混配）+ 审查报告第七节补记 v1.6 DW 架构切换
+- **状态**: 已提交 34f94a6
 - **基线**: 3248221
 - **变更代码**:
   - 新增: `src/binary_loader.c` — `bin_crc32_chain`（链式 crc32, 匹配 Python `zlib.crc32(data, prev)` 续算语义）+ `bin_batch_crc()`（对排序后 `data/cnn_*.bin` + `sub_filters.bin` + `bandpass_fir.bin` + `bandpass_anc.bin` 原始字节折入链式 crc, 用 `_findfirst`/`qsort` 枚举排序）+ `bin_check_batch()`（读 `data/batch_id.bin` hex 比对, 不一致打 `[WARN] 批次混配检测`, 缺文件跳过）

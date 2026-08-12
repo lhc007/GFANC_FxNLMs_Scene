@@ -1,9 +1,10 @@
-/** calibrate_secondary — 实测次级路径 Ŝ(e,s) + 反馈路径 (v4)
+/** calibrate_secondary — 实测次级路径 Ŝ(e,s) (v4)
  *
  * 编译: gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
  * 输出: data/secondary_path_measured.bin  [E*S][SEC_TAPS], 已对齐 (peak≈GUARD)
  *       data/sec_bulk_delay.bin           1×float32 = 流启动时 bulk 延迟 @16k
- *       data/feedback_path_s0.bin / _s1.bin
+ *       注: 不再输出反馈路径 (旧 feedback_path_s*.bin) — 运行时只认
+ *       calibrate_feedback.exe 的 feedback_path_{0,1}.bin (R-50/2026-08-12).
  *
  * v4 要点 (针对 WASAPI 双设备流滑移 ~1000-2000ppm):
  *   - 探测: 17 个 0.25s 子窗各自找峰 → 聚类投票 (真峰在 ±150 内反复复现,
@@ -365,40 +366,39 @@ int main(void) {
 
     /* ── R-16-③: Ŝ 质量门禁 — ERLE 低于阈值的次级路径拒绝写入 (置零).
        弱辨识路径多为噪声拟合, 写入 Ŝ 会拖累 FxLMS 收敛 (bench 实测 S(e2,s1)=5.8dB 即此例).
-       反馈路径 (c==0) 本身耦合弱 (ERLE 2-3dB 正常), 不门禁. env: GFANC_SEC_MIN_ERLE */
+       注 (2026-08-12): 不再辨识 c==0 参考麦反馈路径 — 输出文件 feedback_path_s*.bin
+       运行时从未加载 (只认 calibrate_feedback.exe 的 feedback_path_{0,1}.bin), 死产物已删.
+       env: GFANC_SEC_MIN_ERLE */
     float sec_min_erle = 8.0f;
     {   const char *se = getenv("GFANC_SEC_MIN_ERLE");
         if (se && atof(se) > 0) sec_min_erle = (float)atof(se); }
     int sec_rejected = 0;
 
-    /* ── 逐块对齐 + NLMS ── */
+    /* ── 逐块对齐 + NLMS (仅误差麦 c=1..NMIC-1) ── */
     float *sec = (float *)calloc((size_t)E * S * SEC_TAPS, sizeof(float));
-    float *fb  = (float *)calloc((size_t)S * SEC_TAPS, sizeof(float));
 
     for (int s = 0; s < S; s++) {
         printf("\n── Speaker %d 逐块对齐 + NLMS 辨识 ──\n", s);
-        for (int c = 0; c < NMIC; c++) {
+        for (int c = 1; c < NMIC; c++) {
             float *xa, *ya;
             int n_al = build_aligned(noise_16k, MIC16(s, c), n_16k, anchor[s], &xa, &ya);
             if (n_al < CHUNK * 4) { free(xa); free(ya);
                 printf("  ch%d 有效数据不足, 跳过\n", c); continue; }
 
-            float *dst = (c == 0) ? fb + (size_t)s * SEC_TAPS
-                                  : sec + (size_t)((c-1) * S + s) * SEC_TAPS;
+            float *dst = sec + (size_t)((c-1) * S + s) * SEC_TAPS;
             float erle = nlms_identify(xa, ya, n_al, dst, SEC_TAPS);
             free(xa); free(ya);
 
             /* R-16-③: ERLE 门禁 — 弱次级路径置零 (运行时该通道耦合被忽略) */
             int rejected = 0;
-            if (c >= 1 && erle < sec_min_erle) {
+            if (erle < sec_min_erle) {
                 memset(dst, 0, SEC_TAPS * sizeof(float));
                 rejected = 1;
                 sec_rejected++;
             }
 
             char tag[32];
-            if (c == 0) snprintf(tag, sizeof(tag), "FB (s%d)", s);
-            else        snprintf(tag, sizeof(tag), "S(e%d,s%d)", c-1, s);
+            snprintf(tag, sizeof(tag), "S(e%d,s%d)", c-1, s);
             /* 注意: 对齐后 IR peak 恒在 GUARD 附近, 总延迟 = anchor±声学差 */
             print_ir_info(tag, dst, SEC_TAPS, erle, anchor[s] - GUARD);
             if (rejected)
@@ -412,7 +412,7 @@ int main(void) {
         fprintf(stderr, "ERROR: 全部 %d 条次级路径 ERLE 低于 %.1fdB, 放弃保存.\n"
                 "      检查: 扬声器音量 / 误差麦信号 / 距离; 或调低 GFANC_SEC_MIN_ERLE.\n",
                 E * S, sec_min_erle);
-        free(noise_16k); free(noise_hw); free(mic_hw); free(mic16); free(sec); free(fb);
+        free(noise_16k); free(noise_hw); free(mic_hw); free(mic16); free(sec);
         return 1;
     }
 
@@ -430,14 +430,6 @@ int main(void) {
              printf("  Saved: %s (loop_delay=%d = %.2fms @16k)\n",
                     DLY_OUT_FILE, bulk + GUARD, (float)(bulk + GUARD) * 1000.0f / FS_CAL); }
 
-    for (int s = 0; s < S; s++) {
-        char path[64];
-        snprintf(path, sizeof(path), "data/feedback_path_s%d.bin", s);
-        f = fopen(path, "wb");
-        if (f) { fwrite(fb + (size_t)s * SEC_TAPS, sizeof(float), SEC_TAPS, f); fclose(f);
-                 printf("  Saved: %s\n", path); }
-    }
-
     printf("\n  !! 注意: 环路延迟 %.1fms (GFANC_BUFFER 可调, 默认 128 样本).\n"
            "     宽带随机噪声的实时前馈抵消受预览时间限制:\n"
            "     预览 = 参考→误差声学延迟(当前几何 ~1.9ms) − 环路延迟 − 带通(8ms).\n"
@@ -446,7 +438,7 @@ int main(void) {
            (float)(bulk + GUARD) * 1000.0f / FS_CAL);
 
     free(noise_16k); free(noise_hw); free(mic_hw); free(mic16);
-    free(sec); free(fb);
+    free(sec);
     p_Pa_Terminate();
     printf("\nDone. 运行 gfanc_realtime.exe 验证 (应显示 MEASURED + bulk).\n\n");
     return 0;

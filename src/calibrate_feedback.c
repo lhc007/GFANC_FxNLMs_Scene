@@ -52,6 +52,15 @@ static float biquad_tick(biquad_t *f, float x)
 #define NLMS_MU     0.2f        /* NLMS 步长 */
 #define FB_FILE     "data/feedback_path.bin"
 
+/* R-50: 反馈环路 spk→ref 峰位物理上限.
+   依据: 全 ANC 环路 (ref→处理→spk→err) 实测 12.4ms; spk→ref 反馈不含处理延迟,
+   必更短. calibrate_secondary 聚类法实测 4.9-7.9ms (该工具做逐块对齐), 而
+   calibrate_feedback 不做对齐 → 旧数据峰位 13.6/14.4ms 即流对齐残留/噪声伪峰
+   (R-50: spk0@tap224=14ms 案例). >11ms(176tap@16k) 超物理范围.
+   仅 WARN 不拒收: 反馈耦合 -40dB, FB est 0.001-0.010 影响极小, 且运行时已
+   加载同类文件 — 硬拒绝会清空现有反馈抵消 (R-57 弱路径门禁已管"无值", 此处管"错位"). */
+#define FB_MAX_PEAK_MS 11.0f
+
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
     float *noise_16k;   /* 预生成白噪声 (16kHz, 用于ZOH×3播放+NLMS辨识) */
@@ -160,8 +169,16 @@ static int nlms_identify(const float *noise_16k, const float *ref_16k,
         }
     }
     rms = sqrtf(rms / n_taps);
-    printf("  FIR: peak=%.4f @ tap %d (%.2fms), RMS=%.4f\n",
-           peak, peak_idx, (float)peak_idx / FS_CAL * 1000.0f, rms);
+    float peak_ms = (float)peak_idx / FS_CAL * 1000.0f;
+    float pnr = (rms > 0.0f) ? peak / rms : 0.0f;
+    printf("  FIR: peak=%.4f @ tap %d (%.2fms), RMS=%.4f, PNR=%.1f\n",
+           peak, peak_idx, peak_ms, rms, pnr);
+    /* R-50: 峰位物理 sanity — 反馈环路 spk→ref 不应超全环路 (见 FB_MAX_PEAK_MS).
+       超出 → 疑似噪声伪峰/流对齐残留, 提示重测. 仅告警不拒收 (影响小, 见上). */
+    if (peak_ms > FB_MAX_PEAK_MS)
+        printf("  ⚠ 峰位 %.2fms > 物理上限 %.0fms (spk→ref 反馈环路) — 疑似噪声伪峰或流对齐残留.\n"
+               "     请检查扬声器音量/参考麦 SNR, 或重跑后确认 (R-50).\n",
+               peak_ms, FB_MAX_PEAK_MS);
     /* R-57: 弱路径质量门禁 — RMS<0.0005 时 FIR 基本是噪声, 反馈抵消形同虚设.
        此时不保存文件, 避免运行时加载无效 FIR 产生虚假 fb_est.
        实测 RMS=0.0001 的 FIR 装载后 fb_est≈0, 扬声器满幅反馈直进参考麦. */

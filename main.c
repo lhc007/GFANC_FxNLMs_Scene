@@ -110,15 +110,44 @@ static void wav_write(const char *path, const float *data, int n, int ch, int sr
     fclose(f);
 }
 
+/* R-18: 2阶 Butterworth 低通 biquad — 与实时版 (main_realtime.c R-14) 逐字一致,
+   fc=0.40625×sr_out≈6.5kHz@16k 输出. 替换旧"2样本移动平均"(截止仅~fs_in/4,
+   折叠镜像压制不足, 且与实时抗混叠链不一致). */
+typedef struct { float b0,b1,b2,a1,a2,z1,z2; } biquad_t;
+
+static void biquad_init_lpf(biquad_t *f, float fc, float fs)
+{
+    float w0 = 2.0f * 3.14159265f * fc / fs;
+    float c = cosf(w0), s = sinf(w0);
+    float alpha = s / (2.0f * 0.70710678f);  /* Q=1/√2 Butterworth */
+    float a0 = 1.0f + alpha;
+    f->b0 = (1.0f - c) / (2.0f * a0);
+    f->b1 = (1.0f - c) / a0;
+    f->b2 = f->b0;
+    f->a1 = -2.0f * c / a0;
+    f->a2 = (1.0f - alpha) / a0;
+    f->z1 = f->z2 = 0.0f;
+}
+
+static float biquad_tick(biquad_t *f, float x)
+{
+    float y = f->b0 * x + f->z1;
+    f->z1 = f->b1 * x - f->a1 * y + f->z2;
+    f->z2 = f->b2 * x - f->a2 * y;
+    return y;
+}
+
 static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, int *n_out)
 {
-    /* R-18: 下采样前简易抗混叠 (2样本移动平均, 截止 ~fs/4) */
+    /* R-18: 下采样前抗混叠低通 — 同实时版 R-14 (biquad fc≈6.5kHz@16k),
+       替代旧 2样本移动平均. 折叠镜像压制 ~25dB+ (移动平均 @fs_in/4 仅 ~6dB). */
     float *filt = NULL;
     if (sr_in > sr_out) {
         filt = (float *)malloc(n_in * sizeof(float));
-        filt[0] = in[0] * 0.5f;
-        for (int i = 1; i < n_in; i++)
-            filt[i] = (in[i-1] + in[i]) * 0.5f;
+        biquad_t aa;
+        biquad_init_lpf(&aa, 0.40625f * sr_out, (float)sr_in);
+        for (int i = 0; i < n_in; i++)
+            filt[i] = biquad_tick(&aa, in[i]);
     }
     const float *src = filt ? filt : in;
 
