@@ -32,7 +32,7 @@
 ## 记录列表（最新在上）
 
 ### [2026-08-12] R-18 离线抗混叠升级 biquad + R-50 反馈标定峰位 sanity 门禁 + 审查报告按"待办/归档"重排
-- **状态**: 工作区未提交
+- **状态**: 已提交 6c72e4b
 - **基线**: 34f94a6
 - **变更代码**:
   - 修改: `main.c` — `resample_mono` 下采样抗混叠从"2 样本移动平均"升级为 2 阶 Butterworth biquad（与实时版 `main_realtime.c` R-14 逐字一致; 新增 `biquad_t`/`biquad_init_lpf`/`biquad_tick`, fc=0.40625×sr_out≈6.5k@16k 输出）
