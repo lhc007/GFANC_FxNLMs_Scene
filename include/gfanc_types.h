@@ -132,6 +132,14 @@ typedef struct {
     float quiet_exit;          /* ref 重回安静基准×此值 → 退出安静重建 (env: GFANC_QUIET_EXIT, 默认 1.5) */
     float quiet_ref_max;       /* 参考麦残差低于此才算"无噪声进入" (env: GFANC_QUIET_REF,
                                   默认 0.045): 深对消/1000Hz 时 ref=0.048 仍高, 被此门挡住 */
+    float quiet_err_ref;       /* 进入安静需 err/ref 高于此 (env: GFANC_QUIET_ERR_REF, 默认 1.5):
+                                  阶段④修正 (2026-08-13) — ref 门槛只有 7% 余量 (音 ref 0.048
+                                  vs 门槛 0.045, 底噪 0.040), 污染 FIR 把 ref 压低即误触发.
+                                  err_ref 门提供 ~2× 余量: 深对消纯音 err 被压到 ref 量级以下
+                                  (err_ref≈0.7-1.1) → 挡住误判; 噪声真停时 anti 失去对消对象,
+                                  err 被自身输出主导 (err≈anti×G≈0.095 vs ref 塌底 0.040 →
+                                  err_ref≈2.4) → 通过. 与 ref 塌底 + anti 大 + "曾有噪声" 组合,
+                                  "深对消纯音" 与 "噪声真停" 才可分离. */
     float quiet_err_max;       /* [弃用, 仅 env 兼容] 原 err 门 (阶段③ 实测反噪声过渡期 err
                                   先冲高打断计数, 已移出判据) */
     float quiet_err_exit;      /* 安静中 err 重回 err 基准×此值 → 退出重建 (env: GFANC_QUIET_ERR_EXIT,
@@ -178,11 +186,13 @@ typedef struct {
                            翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
     0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
                            帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
-    0.02f, 8.0f, 3, 1.5f, 0.045f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
-                           quiet_hold, quiet_exit, quiet_ref_max, quiet_err_max(弃用),
-                           quiet_err_exit, quiet_ref_memory.
-                           P0-5 阶段④: anti>0.02 且 ref<0.045 且"ref 曾于 quiet_ref_memory
-                           秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
+    0.02f, 8.0f, 3, 1.5f, 0.045f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
+                           quiet_hold, quiet_exit, quiet_ref_max, quiet_err_ref,
+                           quiet_err_max(弃用), quiet_err_exit, quiet_ref_memory.
+                           P0-5 阶段④: anti>0.02 且 ref<0.045 且 err_ref>1.5 且"ref 曾于
+                           quiet_ref_memory 秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
+                           quiet_err_ref (阶段⑤修正): 深对消纯音 err_ref≈0.7-1.1 被挡, 只有
+                           噪声真停 (err 被 anti 自身输出主导, err_ref≈2.4) 才通过.
                            NR/err 门已移出判据 (实测 NR 噪声停后不塌 8-12dB、err 过渡期
                            先冲高). quiet_ref_memory 守卫治阶段④ 实测: 宽带弱噪声
                            (ref≈0.038 < 门槛) 被绝对阈值误判"噪声消失" → 反相被砍 → 0dB.
@@ -229,6 +239,7 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_QUIET_REF")))  cfg->quiet_ref_max  = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_ERR")))  cfg->quiet_err_max  = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_ERR_EXIT"))) cfg->quiet_err_exit = (float)atof(s);
+    if ((s = getenv("GFANC_QUIET_ERR_REF"))) cfg->quiet_err_ref  = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_MEMORY"))) cfg->quiet_ref_memory = atoi(s);
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */

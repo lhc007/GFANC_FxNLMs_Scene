@@ -46,20 +46,24 @@ static float biquad_tick(biquad_t *f, float x)
 /* ══════════════════════════════════════════════════════════ */
 #define FS_HW       48000
 #define FS_CAL      16000
-#define FB_TAPS     256
+#define FB_TAPS     512         /* 512样本 = 32ms @16k: 覆盖 USB 设备往返(~238样本/14.9ms)
+                                    + 声学响应尾. 旧 256 只给响应留 18 样本 → 截断,
+                                    NLMS 不收敛 (max|err| 平 0.42), FIR 全坏. */
 #define CAL_SEC     4           /* 校准时长 (秒) */
 #define NOISE_AMP   0.9f        /* 白噪声幅度 (env: GFANC_CAL_NOISE 可覆盖) */
 #define NLMS_MU     0.2f        /* NLMS 步长 */
 #define FB_FILE     "data/feedback_path.bin"
 
-/* R-50: 反馈环路 spk→ref 峰位物理上限.
-   依据: 全 ANC 环路 (ref→处理→spk→err) 实测 12.4ms; spk→ref 反馈不含处理延迟,
-   必更短. calibrate_secondary 聚类法实测 4.9-7.9ms (该工具做逐块对齐), 而
-   calibrate_feedback 不做对齐 → 旧数据峰位 13.6/14.4ms 即流对齐残留/噪声伪峰
-   (R-50: spk0@tap224=14ms 案例). >11ms(176tap@16k) 超物理范围.
-   仅 WARN 不拒收: 反馈耦合 -40dB, FB est 0.001-0.010 影响极小, 且运行时已
-   加载同类文件 — 硬拒绝会清空现有反馈抵消 (R-57 弱路径门禁已管"无值", 此处管"错位"). */
-#define FB_MAX_PEAK_MS 11.0f
+/* R-50(修订, 2026-08-13): 峰位物理 sanity 由"11ms 硬上限"改为"聚类可复现 + 窗口边沿"双检.
+   旧假设"spk→ref 不含设备延迟, 必 <11ms"对 USB-ASIO 不成立: 反相经 DAC→喇叭→参考麦→ADC,
+   设备往返 (~12ms) 就在反馈路径里 — 4 次实测定峰位恒 ~238样本 (14.9ms) 且可复现, 是真实
+   延迟, 不是噪声伪峰. 真正的坏 FIR 是响应被窗口截断 (峰贴尾) → NLMS 无法收敛. 判定:
+   1) 聚类投票验证延迟在多个子窗反复复现 (真响应) — 与 calibrate_secondary v4 同法;
+   2) 峰距窗口尾 <10% → 截断 → 拒收. */
+#define PROBE_MAXLAG  8000      /* 探测范围 0.5s (实测环路 ~14ms) */
+#define SKIP_HEAD     16000     /* 跳过前 1s 流启动瞬态 */
+#define SUBWIN        4000      /* 探测子窗 0.25s */
+#define CLUSTER_TOL   150       /* 聚类半径 (样本) */
 
 /* ══════════════════════════════════════════════════════════ */
 typedef struct {
@@ -97,6 +101,84 @@ static int cal_cb(const void *input, void *output, unsigned long fcount,
         cal->idx++;
     }
     return 0; /* paContinue */
+}
+
+/* ══════════════════════════════════════════════════════════
+   R-50(修订): 聚类投票探测 — 与 calibrate_secondary v4 同法.
+   nsub 个子窗各自找全程峰, 最大 ±TOL 聚类 ≥ 1/3 → 延迟可复现 (真实响应);
+   噪声伪峰散布全程, 聚不成团. 返回聚类中最早子窗的 lag, -1=失败.
+   ══════════════════════════════════════════════════════════ */
+static double xcorr_at(const float *x, const float *y, int n, int lag)
+{
+    double c = 0;
+    for (int i = 0; i < n; i++) c += (double)x[i] * y[i + lag];
+    return c;
+}
+
+static int argmax_lag(const float *x, const float *y, int n,
+                      int lag_lo, int lag_hi)
+{
+    /* R-50(修订): 用带符号相关峰 (正相关) 而非 fabs — 反馈路径是正耦合,
+       noise→speaker→声学→mic 同相, 真实延迟处 xcorr>0. fabs 会把负相关
+       伪峰 (反相噪声/反相串扰) 也当候选, 锁错 lag. */
+    double best = -1e300; int bl = lag_lo;
+    for (int lag = lag_lo; lag <= lag_hi; lag++) {
+        double c = xcorr_at(x, y, n, lag);
+        if (c > best) { best = c; bl = lag; }
+    }
+    return bl;
+}
+
+static float rms_of(const float *x, int n)
+{
+    double s = 0;
+    for (int i = 0; i < n; i++) s += (double)x[i] * x[i];
+    return (float)sqrt(s / n);
+}
+
+static int probe_vote(const float *noise, const float *mic, int n16,
+                      double *slip_out)
+{
+    int lags[64], offs[64], nsub = 0;
+    for (int j = 0; j < 64; j++) {
+        long o = SKIP_HEAD + (long)j * SUBWIN;
+        if (o + SUBWIN + PROBE_MAXLAG >= n16) break;
+        lags[nsub] = argmax_lag(noise + o, mic + o, SUBWIN, 0, PROBE_MAXLAG - 1);
+        offs[nsub] = (int)o;
+        nsub++;
+    }
+
+    /* 最大聚类 */
+    int best_cnt = 0, best_i = -1;
+    for (int i = 0; i < nsub; i++) {
+        int cnt = 0;
+        for (int j = 0; j < nsub; j++)
+            if (abs(lags[j] - lags[i]) <= CLUSTER_TOL) cnt++;
+        if (cnt > best_cnt) { best_cnt = cnt; best_i = i; }
+    }
+
+    printf("    子窗峰: ");
+    for (int j = 0; j < nsub; j++) {
+        int in_c = abs(lags[j] - lags[best_i]) <= CLUSTER_TOL;
+        printf("%s%d%s ", in_c ? "[" : "", lags[j], in_c ? "]" : "");
+    }
+    printf("\n    聚类: %d/%d 子窗聚在 %d±%d\n",
+           best_cnt, nsub, lags[best_i], CLUSTER_TOL);
+
+    if (best_cnt * 3 < nsub) return -1;   /* 未达 1/3 法定数 */
+
+    /* 聚类内: 最早子窗的 lag = 流启动延迟; 首尾差 → 滑移率 */
+    int first_lag = -1, last_lag = 0;
+    long first_off = 0, last_off = 0;
+    for (int j = 0; j < nsub; j++) {
+        if (abs(lags[j] - lags[best_i]) <= CLUSTER_TOL) {
+            if (first_lag < 0) { first_lag = lags[j]; first_off = offs[j]; }
+            last_lag = lags[j]; last_off = offs[j];
+        }
+    }
+    *slip_out = (last_off > first_off)
+        ? (double)(last_lag - first_lag) / (double)(last_off - first_off) * 1e6 : 0;
+    return first_lag;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -173,12 +255,16 @@ static int nlms_identify(const float *noise_16k, const float *ref_16k,
     float pnr = (rms > 0.0f) ? peak / rms : 0.0f;
     printf("  FIR: peak=%.4f @ tap %d (%.2fms), RMS=%.4f, PNR=%.1f\n",
            peak, peak_idx, peak_ms, rms, pnr);
-    /* R-50: 峰位物理 sanity — 反馈环路 spk→ref 不应超全环路 (见 FB_MAX_PEAK_MS).
-       超出 → 疑似噪声伪峰/流对齐残留, 提示重测. 仅告警不拒收 (影响小, 见上). */
-    if (peak_ms > FB_MAX_PEAK_MS)
-        printf("  ⚠ 峰位 %.2fms > 物理上限 %.0fms (spk→ref 反馈环路) — 疑似噪声伪峰或流对齐残留.\n"
-               "     请检查扬声器音量/参考麦 SNR, 或重跑后确认 (R-50).\n",
-               peak_ms, FB_MAX_PEAK_MS);
+    /* R-50(修订): 窗口边沿截断检查 — 峰贴窗口尾 = 真实响应超出 FIR 长度, NLMS 截断拟合,
+       FIR 不可信 (旧 256 样本: 峰@238 仅留 18 样本给响应尾 → max|err| 平 0.42).
+       注意: 峰位 ~238样本/14.9ms 属正常 — USB 设备往返 (~12ms) 就在反馈路径里.
+       距尾 <10% → 拒收 (不保存), 避免坏 FIR 进运行时制造虚假 fb_est. */
+    if (peak_idx > n_taps - (n_taps / 10)) {
+        printf("  ❌ 峰位 @tap %d (%.2fms) 距窗口尾 <10%% — 响应被截断, NLMS 未收敛.\n"
+               "     增大 FB_TAPS 或检查流对齐后重标定 (R-50).\n",
+               peak_idx, peak_ms);
+        return -1;
+    }
     /* R-57: 弱路径质量门禁 — RMS<0.0005 时 FIR 基本是噪声, 反馈抵消形同虚设.
        此时不保存文件, 避免运行时加载无效 FIR 产生虚假 fb_est.
        实测 RMS=0.0001 的 FIR 装载后 fb_est≈0, 扬声器满幅反馈直进参考麦. */
@@ -288,12 +374,24 @@ int main(void) {
                    sqrtf(nrms / n_16k), sqrtf(rrms / n_16k));
         }
 
+        /* R-50(修订): 聚类投票验证反馈延迟可复现 — 真响应在多子窗反复出现, 噪声伪峰散布.
+           峰位 ~238样本/14.9ms 属正常 (USB 设备往返就在反馈路径里), 但必须可复现才可信. */
+        double slip = 0;
+        int anchor = probe_vote(noise_16k, ref_16k, n_16k, &slip);
+        if (anchor < 0) {
+            printf("  ❌ 聚类未达法定数 — 参考麦未捕获可复现的扬声器响应.\n"
+                   "     检查扬声器音量 / 参考麦拾音 / 距离后重标定 (R-50).\n");
+            continue;  /* 不保存 */
+        }
+        printf("  反馈延迟: 峰≈%d样本 (%.2fms), 滑移 %.0fppm — 可复现, 通过聚类验证\n",
+               anchor, (float)anchor * 1000.0f / FS_CAL, slip);
+
         /* NLMS 辨识 */
         float fb_coeffs[FB_TAPS];
         int nlms_ret = nlms_identify(noise_16k, ref_16k, n_16k, fb_coeffs, FB_TAPS);
         if (nlms_ret != 0) {
             printf("  ⚠ Speaker %d calibration failed, skipping file save.\n", spk);
-            continue;  /* R-57: 标定质量不达标, 不保存无效 FIR */
+            continue;  /* R-57/R-50: 标定质量不达标, 不保存无效 FIR */
         }
 
         /* 保存 (feedback_path_0.bin / feedback_path_1.bin) */

@@ -477,7 +477,7 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ 
 │                                                               │
 ├─ 辅助 ───────────────────────────────────────────────────────┤
 │                                                               │
-│  反馈抵消: fb_fir[2] FIR(256tap) 逐扬声器校准                  │
+│  反馈抵消: fb_fir[2] FIR(512tap) 逐扬声器校准                  │
 │  啸叫检测: DFT 256pt + IIR notch ×2, 可配阈值 (默认12)        │
 │  在线Ŝ辨识: sec_online NLMS, μ=5e-6, 零探测噪声                │
 │  冷启动保护: soft-release 前1s cap0.12(梯度冻结) 后1s cap→1.0  │
@@ -495,11 +495,13 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ 
 
 校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
 ```
-Feedback spk0: 256 taps, RMS=0.0012
-Feedback spk1: 256 taps, RMS=0.0011
+Feedback spk0: 512 taps, RMS=0.0012
+Feedback spk1: 512 taps, RMS=0.0011
 ```
 
 文件缺失时反馈抵消自动禁用，日志显示 `Feedback cancel: disabled`，不影响降噪但可能引发啸叫。
+
+> ⚠️ **当前 PC 测试台暂弃反馈对消（2026-08-13, R-50）**：重标定的 512tap FIR 经 FFT 复核在 250Hz 增益 0.38/0.71、125Hz 0.86/0.99，比实测真实反馈增益 ~0.17 超估 ~4×（白噪声 NLMS 无逐块对齐/ERLE 门，把低频/直流烤进系数）→ 反馈开启实机发散。反馈文件已改名 `feedback_path_{0,1}.bin.disabled`，运行时自动跳过（= 当前稳定配置）。恢复：`mv data/feedback_path_0.bin.disabled data/feedback_path_0.bin`（0/1 各一次）。嵌入式样机反馈仍为刚需，待逐块对齐 NLMS + ERLE 门 + 窄带/白化激励 + 参考麦高通后重做。
 
 ## 次级路径测量（Python，Farina 扫频法）
 
@@ -587,10 +589,10 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 在线 Ŝ 辨识 | μ=5e-6 (env: GFANC_SEC_MU) | NLMS, 零探测噪声 |
 | 音频缓冲 | 128 样本 (env: GFANC_BUFFER, 32-1024) | ASIO buffer; 越小延迟越低但易爆音 (128 稳定甜点, 实测环路 ~12.4ms) |
 | Ŝ 环路延迟补偿 | 自动 (sec_bulk_delay.bin / GFANC_DSP_DELAY) | FxLMS 对齐, bench 实测 ~12.4ms (原 0.01s suggestedLatency 顶回 512 致 30ms, 已修复) |
-| 反馈 FIR | 256 tap ×2 扬声器 | 逐扬声器独立校准 |
+| 反馈 FIR | 512 tap ×2 扬声器 | 逐扬声器独立校准 (PC 测试台暂弃, R-50) |
 | 啸叫陷波 | DFT 256pt, IIR ×2 | 可配阈值 (env: GFANC_HW_THRESH, 默认 12) |
 | NR 指标 | 分散采样 250 点 + ±30dB 限幅 | 防噪声基底虚高 (v1.2 BUG-1) |
-| 环境安静检测 (进入) | anti>0.02 && ref<0.045 && 曾有大噪声(20s 内), 持续 3s (env: GFANC_QUIET_ANTI/REF/HOLD/MEMORY) | v1.9 (P0-5): 噪声停后冻结梯度+衰减 Wc, 治"扬声器继续输出残余反相声/嗡嗡声"; **哨兵守卫**防宽带弱噪声 (ref≈0.038) 被绝对阈值误判"噪声消失"而砍掉反相 |
+| 环境安静检测 (进入) | anti>0.02 && ref<0.045 && err/ref>1.5 && 曾有大噪声(20s 内), 持续 3s (env: GFANC_QUIET_ANTI/REF/ERR_REF/HOLD/MEMORY) | v1.9 (P0-5): 噪声停后冻结梯度+衰减 Wc, 治"扬声器继续输出残余反相声/嗡嗡声"; **哨兵守卫**防宽带弱噪声 (ref≈0.038) 被绝对阈值误判"噪声消失"而砍掉反相 |
 | 环境安静检测 (退出) | ref 重回 1.5× 或 err 重回 2.0× 安静基准 (env: GFANC_QUIET_EXIT/ERR_EXIT) | 噪声回归 → 重建 INIT; 纯音回归 ref 只高 20% 靠 err 通道兜底 |
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
 | 回调预算 | ~30-45% (SIMD ~5-10%) | 已优化: 双段循环零取模, 含安全边际 |

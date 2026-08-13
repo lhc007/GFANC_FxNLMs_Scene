@@ -92,7 +92,8 @@ static float biquad_tick(biquad_t *f, float x)
 /* R-9: 以下参数统一由 cfg (gfanc_config_t) 管理, env 变量可直接生效
    GFANC_RAMP_MS / GFANC_MUTE_MS / GFANC_FADE_LEN / GFANC_MIC_GAIN */
 #define MIC_CLIP_MAX  1.0f    /* 输入软限幅 (防止吹气/大声压冲爆 FIR) */
-#define FB_LEN       256     /* 反馈路径 FIR 长度 */
+#define FB_LEN       512     /* 反馈路径 FIR 长度 (R-50修订: 256 装不下 USB 设备往返
+                                ~238样本 + 响应尾 → 截断 → NLMS 不收敛, FIR 全坏) */
 #define FB_ENABLED   1       /* 反馈抵消开关 (需先运行 calibrate_feedback.exe) */
 #define HOWLING_ENABLED 1    /* 啸叫检测 + 陷波 (DFT 频谱峰值检测) */
 
@@ -1098,8 +1099,8 @@ int main(void) {
                 int n = fb_len < FB_LEN ? fb_len : FB_LEN;
                 memcpy(ctx->fb_coeffs_buf[spk], fb_raw, n * sizeof(float));
                 float fb_rms = 0;
-                for (int i = 0; i < FB_LEN; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
-                fb_rms = sqrtf(fb_rms / FB_LEN);
+                for (int i = 0; i < n; i++) fb_rms += ctx->fb_coeffs_buf[spk][i] * ctx->fb_coeffs_buf[spk][i];
+                fb_rms = sqrtf(fb_rms / n);
                 /* R-57: FIR RMS < 0.00005 时反馈抵消形同虚设, 加载无效 FIR
                    会在高增益下产生虚假 fb_est, 干扰 ref 信号. */
                 if (fb_rms < 0.00005f) {
@@ -1107,9 +1108,25 @@ int main(void) {
                     bin_free(fb_raw);
                     continue;
                 }
+                /* R-50(修订): 峰位边沿门禁 — 峰贴窗口尾 = 响应被截断, NLMS 未收敛,
+                   FIR 不可信 (加载会制造虚假 fb_est 干扰 ref). 实测 USB-ASIO 真实反馈峰
+                   ~238/512 (46%, 正常); 旧 256 截断文件峰 238/256 (93%, 拒收). */
+                {   float fb_peak = 0; int peak_idx = 0;
+                    for (int i = 0; i < n; i++)
+                        if (fabsf(ctx->fb_coeffs_buf[spk][i]) > fb_peak) {
+                            fb_peak = fabsf(ctx->fb_coeffs_buf[spk][i]); peak_idx = i; }
+                    if (peak_idx > n - n / 10) {
+                        printf("  Feedback spk%d: peak@tap %d/%d (%.0f%%) near window edge — "
+                               "truncated response, skipping (re-run calibrate)\n",
+                               spk, peak_idx, n, 100.0f * peak_idx / n);
+                        bin_free(fb_raw);
+                        continue;
+                    }
+                }
                 ctx->fb_fir[spk].coeffs    = ctx->fb_coeffs_buf[spk];
-                ctx->fb_fir[spk].n_taps    = FB_LEN;
-                ctx->fb_fir[spk].delay_line = (gfanc_delay_t *)calloc(FB_LEN, sizeof(gfanc_delay_t));
+                ctx->fb_fir[spk].n_taps    = n;   /* 实际加载长度, 与 memcpy 一致 (R-50修订:
+                                                      短文件尾部不读, 防脏数据当系数) */
+                ctx->fb_fir[spk].delay_line = (gfanc_delay_t *)calloc(n, sizeof(gfanc_delay_t));
                 ctx->fb_fir[spk].ptr       = 0;
                 printf("  Feedback spk%d: %d taps, RMS=%.4f\n", spk, FB_LEN, fb_rms);
                 bin_free(fb_raw); loaded++;
@@ -1302,12 +1319,15 @@ int main(void) {
             check_convergence(ctx);
 
             /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
-               判据 (2026-08-11 阶段④ 修正): 唯一可靠信号是参考麦塌底
+               判据 (2026-08-11 阶段④ + 2026-08-13 阶段⑤修正): 参考麦塌底
                (ref < quiet_ref_max = 无真实噪声进入参考麦) 且"曾经有大噪声最近才停"
                (quiet_since_active <= quiet_ref_memory)。深对消/1000Hz 天花板时
                ref 都停在 0.048 (音仍进参考麦), 只有噪声真停才塌到 0.040.
-               anti 仍在输出 (anti > quiet_anti_rms = 有残留要消) → 持续 quiet_hold 秒
-               → 进入安静模式: 回调冻结梯度 + 逐样本衰减 Wc, 反噪声平滑消退.
+               阶段⑤加 err_ref>quiet_err_ref (默认 1.5): ref 门槛余量仅 7% (0.048 vs 0.045),
+               污染 FIR 把 ref 压低即误触发 (实机 cb≈12100 两次确定性误判). err_ref 分离
+               "深对消纯音" (0.7-1.1, err 被压) 与 "噪声真停" (≈2.4, err 被 anti 自身输出
+               主导) — 只有后者通过. anti 仍在输出 (anti > quiet_anti_rms = 有残留要消)
+               → 持续 quiet_hold 秒 → 进入安静模式: 回调冻结梯度 + 逐样本衰减 Wc, 反噪声平滑消退.
                不用 NR 判据 (阶段③ 实测证伪): 反噪声还开着时它声学上仍在"抵消"
                底噪, NR 保持 8-12dB 不塌, 用它当门槛 → 安静永远进不去, 残留不消.
                不用 err 判据 (同实测): 反噪声衰减过渡期 err 会先冲到 0.08 再塌,
@@ -1345,6 +1365,7 @@ int main(void) {
                 }
             } else if (ctx->anti_rms > cfg.quiet_anti_rms
                        && ctx->ref_rms < cfg.quiet_ref_max
+                       && (ctx->err_rms / (ctx->ref_rms + 1e-6f)) > cfg.quiet_err_ref
                        && ctx->quiet_since_active <= cfg.quiet_ref_memory
                        && ctx->ramp_cnt == 0 && ctx->cold_hold == 0
                        && !ctx->safety_mute && !ctx->peak_mute) {
