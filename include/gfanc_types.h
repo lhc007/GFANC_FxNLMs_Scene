@@ -156,9 +156,10 @@ typedef struct {
 #define GFANC_CONFIG_DEFAULT { \
     48000, 16000,      /* fs_hw, fs_anc */ \
     1.0f,               /* mic_pre_gain */ \
-    1e-7f, 5e-7f,       /* step_size, leak. 基准值, 运行时会根据 Ŝ RMS 自动缩放.
-                           leak 5e-6→5e-7 (2026-08-05): 弱信号下 leak 压死 Wc 生长
-                           (离线 1.4dB→13dB 的收敛杠杆), 降一档让 Wc 长起来 */ \
+    1e-7f, 5e-7f,       /* step_size, leak. step 运行时按 Ŝ RMS 自动缩放;
+                           leak 固定不缩放 (2026-08-13): leak 是泄漏因子, 与 Ŝ 幅度无关,
+                           曾随 s_scale×0.489 → 2.4e-7 不足以抑制梯度噪声 → Wc 无界膨胀.
+                           leak 5e-6→5e-7 (2026-08-05): 弱信号下 leak 压死 Wc 生长 */ \
     0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
                            Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
@@ -186,11 +187,11 @@ typedef struct {
                            翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
     0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
                            帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
-    0.02f, 8.0f, 3, 1.5f, 0.045f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
+    0.02f, 8.0f, 1, 1.5f, 0.045f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
                            quiet_hold, quiet_exit, quiet_ref_max, quiet_err_ref,
                            quiet_err_max(弃用), quiet_err_exit, quiet_ref_memory.
                            P0-5 阶段④: anti>0.02 且 ref<0.045 且 err_ref>1.5 且"ref 曾于
-                           quiet_ref_memory 秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
+                           quiet_ref_memory 秒内高于门槛" 持续 1s → 判定噪声消失 → 冻结+衰减 Wc.
                            quiet_err_ref (阶段⑤修正): 深对消纯音 err_ref≈0.7-1.1 被挡, 只有
                            噪声真停 (err 被 anti 自身输出主导, err_ref≈2.4) 才通过.
                            NR/err 门已移出判据 (实测 NR 噪声停后不塌 8-12dB、err 过渡期

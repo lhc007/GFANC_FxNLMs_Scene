@@ -31,6 +31,21 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-13] leak 固定不缩放 + quiet_hold 默认 1s（250/500Hz 发散根因 leak 不足的正式修复）
+- **状态**: 工作区未提交
+- **基线**: b750760
+- **变更代码**:
+  - 修改: `main_realtime.c` — 移除 Ŝ-RMS 自动缩放块中的 `cfg.leak *= s_scale`（leak 彻底不缩放）; `include/gfanc_types.h` — quiet_hold 默认 3→1
+- **变更原因**: 实机两次 A/B 复现定位 250Hz 发散+滋滋 / 500Hz 无净降噪的**共同根因 = leak 不足**: leak=2.4e-7（曾随 s_scale×0.489 缩放）太小 → 梯度噪声累积 → Wc 无界膨胀 → 250Hz anti 冲 0.71 饱和削波=滋滋、500Hz Wc 在错误位置振荡压不动。leak 固定 5e-7 后两频点均真降噪（250Hz err→0.0225、500Hz→0.027, 均 < 自然基线 0.046）、anti 锁 0.25 零 peak_mute 零 rescue
+- **造成影响**:
+  - 行为: leak 固定 5e-7 不再随 Ŝ RMS 缩放（原会 ×0.489 → 2.4e-7）
+  - 配置: quiet_hold 3→1s（噪声停后更快冻结衰减 Wc）
+  - 测试/回归: 编译通过（`mingw32-make realtime`）; 实机验证通过（250/500Hz 真降噪 + anti 稳定 0.25 + 零 peak_mute 零 rescue, Auto gain 1.0x 正常输入）
+  - 性能/内存: 无
+  - 未验证项: ① `GFANC_QUIET_HOLD=1` 缩短噪声停后反相声残留的体感未验; ② leak 最优值未扫（5e-7 未做 3e-7/8e-7 扫描）
+- **验证方式**: 实机验证 250/500Hz 真降噪 + anti 稳定 + 零 rescue（Auto gain 1.0x 正常输入）
+- **回退方式**: 恢复 `cfg.leak *= s_scale` 即恢复原缩放语义
+
 ### [2026-08-13] R-50 延迟探测 signed 峰 + fb n_taps 用实际加载长度 — 对抗性复核后两处防御性修正
 - **状态**: 已提交 <此提交>
 - **基线**: b38fe21

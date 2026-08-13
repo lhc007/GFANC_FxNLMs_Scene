@@ -1050,7 +1050,9 @@ int main(void) {
             if (s_scale > 4.0f) s_scale = 4.0f;    /* 上限防过冲 */
             if (s_scale < 0.1f) s_scale = 0.1f;    /* 下限保收敛 */
             cfg.step_size *= s_scale;
-            cfg.leak      *= s_scale;  /* leak 同步缩放, 保持正则化强度一致 */
+            /* leak 不再随 Ŝ RMS 缩放 (2026-08-13): leak 是泄漏因子(遗忘率), 与 Ŝ 幅度无关.
+               曾随 s_scale×0.489 → 2.4e-7, 不足以抑制梯度噪声 → Wc 无界膨胀
+               (250Hz 饱和削波=滋滋 + 500Hz 压不动). leak 固定 5e-7 后两症状同时消失. */
         }
     }
     if (getenv("GFANC_STEP")) cfg.step_size = (float)atof(getenv("GFANC_STEP"));
