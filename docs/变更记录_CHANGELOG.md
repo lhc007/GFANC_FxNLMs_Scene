@@ -31,6 +31,83 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-14] calibrate_secondary 砍掉次级路径辨识 — C 端只测环路延迟
+- **状态**: 工作区未提交
+- **基线**: 51d090b
+- **变更代码**:
+  - 修改: `src/calibrate_secondary.c` — 删除 NLMS 次级路径辨识（`build_aligned`/`nlms_identify`/`print_ir_info` 三函数 + ERLE 门禁 + `secondary_path_measured.bin` 输出 + `sec` 缓冲 + `free(sec)`），只保留聚类投票探测 + `sec_bulk_delay.bin` 输出；同步删除常量 `E`/`SEC_TAPS`/`NLMS_MU`/`NLMS_PASSES`/`CHUNK`/`TRACK_SPAN`/`SEC_OUT_FILE`，更新头注释（v4→v5）、横幅、结尾提示
+- **变更原因**: 次级路径 Ŝ 已由 Python 扫频产出 `secondary_path.bin`（正确默认）；C 端产出的 `secondary_path_measured.bin` 是死产物（S(e0,s1) 死路径 bug，2026-08-14 实测坐实后已弃用）。C 端唯一还需的输出是环路延迟（`sec_bulk_delay.bin`）。砍掉辨识后程序更快、测量管线职责清晰（Python=Ŝ，C=环路延迟，C=反馈路径）。
+- **造成影响**:
+  - 行为: `calibrate_secondary.exe` 不再产出 `data/secondary_path_measured.bin`；运行更快（去掉每只喇叭 2 遍 ×1024 抽头 NLMS）。环路延迟探测/保存逻辑不变
+  - 配置: 删除 `GFANC_SEC_MIN_ERLE` 环境变量（仅用于被删的 ERLE 门禁）
+  - 测试/回归: gcc 编译通过（零警告零错误）
+  - 性能/内存: 更少（去掉 `sec` 缓冲 3×2×1024 float + NLMS 计算）
+  - 未验证项: 实机未重跑 `calibrate_secondary.exe` 确认只出 `sec_bulk_delay.bin` 且值合理（≈195 样本）
+- **验证方式**: 编译通过；实机跑一遍确认输出仅 `sec_bulk_delay.bin` 且 loop_delay≈195 样本
+- **回退方式**: `git checkout src/calibrate_secondary.c`
+
+### [2026-08-14] bandpass_anc 低截止 20→100Hz — 治低频扬声器失真滋滋声
+- **状态**: 工作区未提交
+- **基线**: 51d090b
+- **变更代码**:
+  - 修改: `export/export_bin.py` — `bp_anc_coeff = firwin(64, [20,1500])` 改 `[100,1500]`（P0-7）；重新生成 `data/bandpass_anc.bin`（备份 `bandpass_anc.bin.bak_20hz`/`.bak_50hz`）
+- **变更原因**: 残留"滋滋声"随扬声器音量增减、噪声停后 1-2s 消失 → 低频 anti 内容驱动扬声器失真。实测 Ŝ 在 100Hz 以下滚降 25dB，20~100Hz 的 anti 既消不动（50Hz 发散 -29dB）又推扬声器低频失真。低截止 20→50Hz 后滋滋变小，再 50→100Hz 进一步收窄。
+- **造成影响**:
+  - 行为: anti 路径带通收窄到 [100,1500]；<100Hz 不再输出反相（该频段本就消不动，还省得驱动失真）
+  - 配置: 无新增环境变量；需重跑 `export_bin.py` 重新生成 `bandpass_anc.bin`
+  - 测试/回归: gcc 编译通过（gfanc_realtime.exe 零警告零错误）
+  - 性能/内存: 无（带通系数同长度 64 tap）
+  - 未验证项: ① [100,1500] 实机滋滋是否进一步减小尚未复验；② 100Hz 以下纯音（50Hz）放弃对消后 NR 归零属预期（本来 -29dB 发散）
+- **验证方式**: 实机放噪声观察滋滋声随低截止抬升而减小（20→50Hz 已确认变小）
+- **回退方式**: `export_bin.py` 改回 `[20,1500]` 并重跑导出，或恢复备份 `bandpass_anc.bin.bak_20hz`
+
+### [2026-08-14] 场景切换软重锚定（去 cold_hold/mute）+ 阈值 0.7 + 迟滞 1s（治切换失效几秒）
+- **状态**: 工作区未提交
+- **基线**: 51d090b
+- **变更代码**:
+  - 修改: `main_realtime.c` — `apply_reset` 去掉 `cold_hold=2*FS_ANC` 与 `mute_hold` 两行（场景切换只 crossfade + 重锚定 + freeze_lms=0）；INIT 路径仍设自己的 cold_hold/mute（冷启动保护不变）
+  - 修改: `include/gfanc_types.h` — `switch_threshold` 0.6→0.7、`reset_hyst` 2→1（含字段/注释同步）
+- **变更原因**: 问题1 = 噪声切换后降噪失效几秒。根因: ① 实测 Ŝ 下 500Hz 切换 cos=0.63~0.67，旧阈值 0.6 永不触发 RESET → CNN 算好的 `wc_cur` 从不提交，只能靠 FxLMS 小步长(4.89e-8)硬爬 2~3s；② 即便触发 RESET，附带 2s `cold_hold` + 1.5s `mute_hold` 打断反相输出，比硬爬还慢。选方案 B（软重锚定）去根：场景切换直接提交 CNN 新滤波器，FxLMS 从正确起点微调。
+- **造成影响**:
+  - 行为: 场景切换从「硬爬 2~3s」变「1s CNN 检测 + 1s 迟滞 + crossfade ≈ 2s 内提交新滤波器」；RESET 不再附带 cold_hold/mute
+  - 配置: `switch_threshold` 0.6→0.7（env `GFANC_RESET_THRESH` 可覆盖）、`reset_hyst` 2→1（env `GFANC_RESET_HYST` 可覆盖）
+  - 测试/回归: gcc 编译通过（gfanc_realtime.exe 零警告零错误）
+  - 性能/内存: 无
+  - 未验证项: ① 实机未复验（需重跑 250↔500 切换确认切换延迟下降、无冷启动期误触发/发散）; ② 阈值 0.7 对 250Hz 深对消期 cos 自然滑落是否误触未回归
+- **验证方式**: 待实机复验（跑 250↔500 切换，观察切换后 err_rms 收敛到位的秒数是否从 2~3s 降到 ~2s 内）
+- **回退方式**: 恢复 `apply_reset` 两行 cold_hold/mute + `switch_threshold=0.6`/`reset_hyst=2`
+
+### [2026-08-14] 新增 RESET 迟滞（cos 连续 2 秒 < τ 才触发）— 治 500Hz 簇 6/14 抖动误触发
+- **状态**: 工作区未提交
+- **基线**: 51d090b
+- **变更代码**:
+  - 修改: `include/gfanc_types.h` — 新增 `reset_hyst` 字段（默认 2, env `GFANC_RESET_HYST`），插入 switch_threshold 之后
+  - 修改: `main_realtime.c` — `rt_ctx_t` 新增 `reset_pending` 连续秒数计数器；reset 派发逻辑改为「旧 cos 闸门 + 迟滞」：cos 连续 `reset_hyst` 秒 < τ 才 `apply_reset`，单帧跌破即回零；OCG 路径不变（已有 ocg_hold 持续性判据）；INIT 重建锚点时清零计数
+- **变更原因**: 连续 5 次实机运行（同二进制、同命令、实测 Ŝ）翻车方式各不相同（RESET 循环 / Wc 发散 / 500Hz 对消失败），收敛出共同根因 = **增益方向抖动**：500Hz 场景簇 6/14、250Hz 场景簇 16/17 的 tanh 增益份额始终并列（差 1~2%），argmax 反复横跳 → cos(anchor,cur) 逐秒滑落跌破 0.60。旧逻辑 `cos<τ` 单帧即 RESET，而每次 RESET 附带 2s `cold_hold`（anti 硬限幅）+ 1.5s `mute_hold` + CrossFader 过渡，直接打断深对消收敛（NR 从 21dB 掉 0dB 再重建）。加迟滞后：单秒抖动（cos 掉一下又回）被过滤，真正场景切换（cos 连续 2s 以上低于 τ）仍能触发，代价仅是切换延迟 ~1s（期间 FxLMS 自主自适应，无副作用）
+- **造成影响**:
+  - 行为: 非 OCG reset 模式下，RESET 触发从「单帧 cos<0.6」改为「连续 2 秒 cos<0.6」；250Hz↔500Hz 合法切换仍会 RESET（延迟 ~1s），单帧抖动不再误触发
+  - 配置: 新增 `GFANC_RESET_HYST`（默认 2 秒，`GFANC_RESET_HYST=1` 回退旧行为）
+  - 测试/回归: gcc 编译通过（gfanc_realtime.exe 零警告零错误）
+  - 性能/内存: 无（仅一个 int 计数器）
+  - 未验证项: ① 实机未复验（需重跑 250→500→250 切换，确认 RESET 次数下降 + 深对消不被单帧抖动打断）; ② 迟滞值 2s 未扫最优（1s/3s 未对比）
+- **验证方式**: 待实机复验（跑 250↔500 切换，观察 `-> RESET` 次数是否下降、NR 是否更稳）
+- **回退方式**: `GFANC_RESET_HYST=1` 或恢复 `cos_sim < switch_threshold` 单帧判据
+
+### [2026-08-14] quiet_hold 1→3 + quiet_ref_max 0.045→0.042（修实测 Ŝ 下 500→250Hz 切换 QUIET 误触发）
+- **状态**: 工作区未提交
+- **基线**: 51d090b
+- **变更代码**:
+  - 修改: `include/gfanc_types.h` — quiet_hold 默认 1→3, quiet_ref_max 默认 0.045→0.042（含字段/注释同步）
+- **变更原因**: 换实测 Ŝ（`GFANC_SEC_FILE=secondary_path_measured.bin`）复验时，500→250Hz 切换瞬间 anti（仍是 500Hz 那套）失配 → refFilt 从 0.0464 瞬态 dip 到 0.0445，跌破 `quiet_ref_max=0.045` 门槛（正常工作 refFilt 0.046~0.048，余量仅 2~7%）→ 叠加 `quiet_hold=1`（上次 3→1）一秒即触发 → 误判"噪声消失"清空反噪声，之后噪声实际仍在（ch 0.09~0.10 甚至更大）却全程 ~2.4s 0dB 无对消
+- **造成影响**:
+  - 行为: 安静检测更保守——需 ref 更低（<0.042）且持续 3s 才判定噪声消失，场景切换瞬态 dip 不再误触发；代价是噪声真停后反相声残留消退体感稍慢（3s vs 1s）
+  - 配置: quiet_hold 1→3, quiet_ref_max 0.045→0.042（env `GFANC_QUIET_HOLD`/`GFANC_QUIET_REF` 仍可覆盖）
+  - 测试/回归: gcc 编译通过（gfanc_realtime.exe + main.exe 零警告零错误）
+  - 性能/内存: 无
+  - 未验证项: ① 实机未复验（需重跑 500→250 切换确认不再误触发 + 噪声真停后仍能正常进安静）; ② 0.042 门槛对"宽带弱噪声 ref≈0.038"是否仍被 quiet_ref_memory 守卫挡住未回归
+- **验证方式**: 待实机复验（重跑 500→250 切换 + 噪声真停两种场景）
+- **回退方式**: 恢复 quiet_hold=1 / quiet_ref_max=0.045 即恢复旧行为
+
 ### [2026-08-13] leak 固定不缩放 + quiet_hold 默认 1s（250/500Hz 发散根因 leak 不足的正式修复）
 - **状态**: 工作区未提交
 - **基线**: b750760

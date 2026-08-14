@@ -207,8 +207,7 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 # 1-④ 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
 ./calibrate_secondary.exe
 #    → data/sec_bulk_delay.bin（运行时自动换算 dsp_delay 补偿 FxLMS 对齐）
-#    该工具顺带测 NLMS 版 Ŝ 到 secondary_path_measured.bin, 但运行时默认不用;
-#    想用它需 export GFANC_SEC_FILE=data/secondary_path_measured.bin
+#    注 (v5): 本工具只测环路延迟, 不再产出次级路径 — Ŝ 由 1-② 扫频法提供
 
 # 1-⑤ 测反馈路径（扬声器→参考麦，防啸叫）
 ./calibrate_feedback.exe
@@ -294,7 +293,8 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 ```bash
 # 4-① 运行实时版 + 纯音验证
-./gfanc_realtime.exe
+$env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
+
 #    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
 
 # 4-② 运行离线评估版（可选 — 处理一段噪声录音，见"运行示例"）
@@ -516,11 +516,11 @@ Feedback spk1: 512 taps, RMS=0.0011
 
 **三个校准工具的分工**（换位置/几何/声卡时按需重测，不重复）：
 - **Ŝ 内容 → 扫频法**（`measure_secondary.py` + `export_bin.py` → `secondary_path.bin`）：每次换位置/几何/扬声器必测，运行时**默认加载**它。
-- **环路延迟 → `calibrate_secondary.exe`**（→ `sec_bulk_delay.bin`）：首次 / 换声卡或 `GFANC_BUFFER` 后必测，运行时自动补偿。它顺带产出的 NLMS 版 Ŝ（`secondary_path_measured.bin`）默认不用，需 `GFANC_SEC_FILE` 指定。
+- **环路延迟 → `calibrate_secondary.exe`**（→ `sec_bulk_delay.bin`）：首次 / 换声卡或 `GFANC_BUFFER` 后必测，运行时自动补偿。v5 起只测环路延迟，不产出 Ŝ。
 - **反馈路径 → `calibrate_feedback.exe`**（→ `feedback_path_0/1.bin`）：防啸叫；换摆放后出现啸叫时重测。
 
 **Ŝ 文件选择 + 环路延迟补偿（v1.4）**：
-- 运行时**默认加载 `data/secondary_path.bin`**（扫频法产物）；`GFANC_SEC_FILE` 环境变量可强制指定其它文件（如 C 校准 `data/secondary_path_measured.bin`）。启动日志打印 `Ŝ file: ...`。
+- 运行时**默认加载 `data/secondary_path.bin`**（扫频法产物）；`GFANC_SEC_FILE` 环境变量可强制指定其它文件。启动日志打印 `Ŝ file: ...`。
 - **环路延迟只由 `calibrate_secondary.exe` 测**：生成 `sec_bulk_delay.bin`（总环路延迟 @16k），运行时自动换算 `dsp_delay` 补偿 FxLMS 对齐（启动日志 `Loop delay auto-loaded` / `Ŝ model delay`）。缓冲大小用 `GFANC_BUFFER` 调（默认 128 样本），实测 UMC ASIO + 128 帧环路 ≈ **12.4ms**（该值为 I/O+声学环路；控制路径另有 ANC 带通群延迟 2ms。旧 0.01s suggestedLatency 会把驱动顶到 512 样本 → 30ms，已修复）。
 - ⚠️ **每次换安装位置/几何后必须重测**（管道/桌面/窗户声学不同），否则实时 NR 会下降。
 
@@ -648,7 +648,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `src/sec_online.c` | 在线 Ŝ NLMS 辨识 (零探测噪声, 原地更新 sec_coeffs) |
 | `src/pa_loader.c` | PortAudio ASIO DLL 运行时加载 |
 | `src/calibrate_feedback.c` | 反馈路径 NLMS 校准 (逐扬声器, 16k ZOH×3 激励) |
-| `src/calibrate_secondary.c` | 环路延迟/滑移测量（→ `sec_bulk_delay.bin`）+ 顺带 NLMS 版 Ŝ（默认不用） |
+| `src/calibrate_secondary.c` | 环路延迟/滑移测量（→ `sec_bulk_delay.bin`），v5 只测延迟不再产出 Ŝ |
 | `src/binary_loader.c` | .bin 二进制权重文件加载 (v2 格式, GFNC 头+CRC32) |
 | `include/gfanc_types.h` | 集中参数 + 分级日志 + 维度宏 |
 | `include/scene_manager.h` | 共享纯函数 (main.c + main_realtime.c 共用); `sm_cos_sim`(reset 判定)/`sm_wc_max_abs`/`sm_check_divergence`/`sm_check_convergence`; v1.6 已删 `sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`/`sm_wc_rms` 死代码 |
