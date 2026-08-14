@@ -1,16 +1,17 @@
-/** calibrate_secondary — 实测次级路径 Ŝ(e,s) (v4)
+/** calibrate_secondary — 只测环路延迟 (v5)
  *
  * 编译: gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
- * 输出: data/secondary_path_measured.bin  [E*S][SEC_TAPS], 已对齐 (peak≈GUARD)
- *       data/sec_bulk_delay.bin           1×float32 = 流启动时 bulk 延迟 @16k
- *       注: 不再输出反馈路径 (旧 feedback_path_s*.bin) — 运行时只认
- *       calibrate_feedback.exe 的 feedback_path_{0,1}.bin (R-50/2026-08-12).
+ * 输出: data/sec_bulk_delay.bin  1×float32 = 环路延迟 @16k (样本)
+ *       注: 不再辨识/输出次级路径 — 次级路径 Ŝ 由 Python 扫频
+ *       measure_secondary.py 产出 secondary_path.bin (v5/2026-08-14 起
+ *       C 端只负责环路延迟, 与 Python Ŝ 分工).
  *
- * v4 要点 (针对 WASAPI 双设备流滑移 ~1000-2000ppm):
+ * 原理: 扬声器逐只播放白噪声, 误差麦录制, 聚类投票探测峰值 lag (=流启动
+ *       延迟 = 环路延迟). 不做 NLMS 辨识.
+ * v4 要点保留 (针对 WASAPI 双设备流滑移 ~1000-2000ppm):
  *   - 探测: 17 个 0.25s 子窗各自找峰 → 聚类投票 (真峰在 ±150 内反复复现,
- *     随机噪声峰散布全程). 不再依赖单窗 PNR (滑移涂抹会压低单窗峰).
- *   - 辨识: 每 0.125s 块单独跟踪 lag 并整数对齐 → NLMS 输入涂抹从 ±70 → ±3 样本
- *   - 流参数与运行时一致 (960 帧 + 0.2s), bulk 取流启动时刻的 lag
+ *     随机噪声峰散布全程).
+ *   - 流参数与运行时一致 (960 帧 + 0.2s), bulk 取流启动时刻的 lag.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +22,8 @@
 /* ══════════════════════════════════════════════════════════ */
 #define FS_HW       48000
 #define FS_CAL      16000
-#define SEC_TAPS    1024        /* 与 main_realtime 的 SEC_LEN 一致 */
 #define CAL_SEC     6           /* 每只扬声器校准时长 (秒) */
 #define NOISE_AMP   0.9f        /* 白噪声幅度 (响, 保证 SNR) */
-#define NLMS_MU     0.2f
-#define NLMS_PASSES 2
-#define E           3
 #define S           2
 #define NMIC        4           /* ch0=ref, ch1-3=err */
 #define MAXLAG      8000        /* 探测范围 0.5s (实测环路延迟 ~80ms) */
@@ -34,9 +31,6 @@
 #define SKIP_HEAD   16000       /* 跳过前 1s 流启动瞬态 */
 #define SUBWIN      4000        /* 探测子窗 0.25s */
 #define CLUSTER_TOL 150         /* 聚类半径 (样本) */
-#define CHUNK       2000        /* 辨识重对齐块 0.125s */
-#define TRACK_SPAN  400         /* 逐块跟踪搜索半径 */
-#define SEC_OUT_FILE "data/secondary_path_measured.bin"
 #define DLY_OUT_FILE "data/sec_bulk_delay.bin"
 
 /* PortAudio 最小绑定 */
@@ -180,96 +174,10 @@ static int probe_vote(const float *noise, const float *mic, int n16,
     return first_lag;
 }
 
-/* ══════════════════════════════════════════════════════════
-   逐块跟踪 + 整数对齐 NLMS 辨识
-   每 CHUNK 样本在 anchor±TRACK_SPAN 内跟踪 lag, 按 (lag−GUARD) 平移
-   mic 后拼接, NLMS 输入的响应恒定出现在 GUARD 处.
-   ══════════════════════════════════════════════════════════ */
-static int build_aligned(const float *noise, const float *mic, int n16,
-                         int anchor, float **x_out, float **y_out)
-{
-    int max_chunks = (n16 - SKIP_HEAD) / CHUNK;
-    float *xa = (float *)malloc((size_t)max_chunks * CHUNK * sizeof(float));
-    float *ya = (float *)malloc((size_t)max_chunks * CHUNK * sizeof(float));
-    int n_out = 0, lag = anchor;
-    int lag_min = anchor, lag_max = anchor;
-
-    for (int j = 0; j < max_chunks; j++) {
-        long o = SKIP_HEAD + (long)j * CHUNK;
-        int lo = lag - TRACK_SPAN; if (lo < 0) lo = 0;
-        int hi = lag + TRACK_SPAN; if (hi > MAXLAG - 1) hi = MAXLAG - 1;
-        if (o + CHUNK + hi >= n16) break;
-
-        lag = argmax_lag(noise + o, mic + o, CHUNK, lo, hi);  /* 跟踪 (逐块连续) */
-        if (lag < lag_min) lag_min = lag;
-        if (lag > lag_max) lag_max = lag;
-
-        int shift = lag - GUARD;             /* 对齐: 响应移到 GUARD 处 */
-        if (o + CHUNK + shift + GUARD >= n16 || shift < 0) break;
-        memcpy(xa + (size_t)n_out, noise + o, CHUNK * sizeof(float));
-        memcpy(ya + (size_t)n_out, mic + o + shift, CHUNK * sizeof(float));
-        n_out += CHUNK;
-    }
-    printf("    逐块跟踪: lag %d→[%d,%d] (走差 %d 样本), 有效数据 %.1fs\n",
-           anchor, lag_min, lag_max, lag_max - lag_min, (float)n_out / FS_CAL);
-    *x_out = xa; *y_out = ya;
-    return n_out;
-}
-
-static float nlms_identify(const float *x_in, const float *y_ref,
-                           int n_samples, float *coeffs, int n_taps)
-{
-    float *x = (float *)calloc(n_taps, sizeof(float));
-    memset(coeffs, 0, n_taps * sizeof(float));
-    double acc_y = 0, acc_e = 0;
-
-    for (int pass = 0; pass < NLMS_PASSES; pass++) {
-        memset(x, 0, n_taps * sizeof(float));
-        int ptr = 0;
-        for (int n = 0; n < n_samples; n++) {
-            x[ptr] = x_in[n];
-            float y = 0;
-            for (int k = 0; k < n_taps; k++)
-                y += coeffs[k] * x[(ptr - k + n_taps) % n_taps];
-            float e = y_ref[n] - y;
-            float power = 1e-6f;
-            for (int k = 0; k < n_taps; k++) {
-                float v = x[(ptr - k + n_taps) % n_taps];
-                power += v * v;
-            }
-            float mu = NLMS_MU / power;
-            for (int k = 0; k < n_taps; k++)
-                coeffs[k] += mu * e * x[(ptr - k + n_taps) % n_taps];
-            if (pass == NLMS_PASSES - 1) {
-                acc_y += (double)y_ref[n] * y_ref[n];
-                acc_e += (double)e * e;
-            }
-            ptr = (ptr + 1) % n_taps;
-        }
-    }
-    free(x);
-    return 10.0f * (float)log10(acc_y / (acc_e + 1e-20));
-}
-
-static void print_ir_info(const char *tag, const float *c, int n_taps,
-                          float erle, int bulk)
-{
-    float rms = 0, peak = 0; int peak_idx = 0;
-    for (int k = 0; k < n_taps; k++) {
-        rms += c[k] * c[k];
-        if (fabsf(c[k]) > peak) { peak = fabsf(c[k]); peak_idx = k; }
-    }
-    printf("  %-10s peak=%+.4f @ tap %4d (总延迟 %6.2fms)  RMS=%.5f  辨识ERLE=%.1fdB%s\n",
-           tag, c[peak_idx], peak_idx,
-           (float)(bulk + peak_idx) / FS_CAL * 1000.0f,
-           sqrtf(rms / n_taps), erle,
-           erle < 6.0f ? "  (滑移残余所限)" : "");
-}
-
 /* ══════════════════════════════════════════════════════════ */
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
-    printf("\n=== Secondary Path Calibration v4 (F-B) ===\n\n");
+    printf("\n=== Loop Delay Calibration v5 (loop delay only) ===\n\n");
 
     if (pa_init() != 0) return 1;
     p_Pa_Initialize();
@@ -364,66 +272,8 @@ int main(void) {
     if (bulk < 0) bulk = 0;
     printf("\n  bulk 延迟 = %d 样本 (%.2fms)\n", bulk, bulk * 1000.0f / FS_CAL);
 
-    /* ── R-16-③: Ŝ 质量门禁 — ERLE 低于阈值的次级路径拒绝写入 (置零).
-       弱辨识路径多为噪声拟合, 写入 Ŝ 会拖累 FxLMS 收敛 (bench 实测 S(e2,s1)=5.8dB 即此例).
-       注 (2026-08-12): 不再辨识 c==0 参考麦反馈路径 — 输出文件 feedback_path_s*.bin
-       运行时从未加载 (只认 calibrate_feedback.exe 的 feedback_path_{0,1}.bin), 死产物已删.
-       env: GFANC_SEC_MIN_ERLE */
-    float sec_min_erle = 8.0f;
-    {   const char *se = getenv("GFANC_SEC_MIN_ERLE");
-        if (se && atof(se) > 0) sec_min_erle = (float)atof(se); }
-    int sec_rejected = 0;
-
-    /* ── 逐块对齐 + NLMS (仅误差麦 c=1..NMIC-1) ── */
-    float *sec = (float *)calloc((size_t)E * S * SEC_TAPS, sizeof(float));
-
-    for (int s = 0; s < S; s++) {
-        printf("\n── Speaker %d 逐块对齐 + NLMS 辨识 ──\n", s);
-        for (int c = 1; c < NMIC; c++) {
-            float *xa, *ya;
-            int n_al = build_aligned(noise_16k, MIC16(s, c), n_16k, anchor[s], &xa, &ya);
-            if (n_al < CHUNK * 4) { free(xa); free(ya);
-                printf("  ch%d 有效数据不足, 跳过\n", c); continue; }
-
-            float *dst = sec + (size_t)((c-1) * S + s) * SEC_TAPS;
-            float erle = nlms_identify(xa, ya, n_al, dst, SEC_TAPS);
-            free(xa); free(ya);
-
-            /* R-16-③: ERLE 门禁 — 弱次级路径置零 (运行时该通道耦合被忽略) */
-            int rejected = 0;
-            if (erle < sec_min_erle) {
-                memset(dst, 0, SEC_TAPS * sizeof(float));
-                rejected = 1;
-                sec_rejected++;
-            }
-
-            char tag[32];
-            snprintf(tag, sizeof(tag), "S(e%d,s%d)", c-1, s);
-            /* 注意: 对齐后 IR peak 恒在 GUARD 附近, 总延迟 = anchor±声学差 */
-            print_ir_info(tag, dst, SEC_TAPS, erle, anchor[s] - GUARD);
-            if (rejected)
-                printf("       ⚠ ERLE %.1fdB < %.1fdB — 路径置零, 运行时忽略该扬声器→误差麦耦合\n",
-                       erle, sec_min_erle);
-        }
-    }
-
-    /* R-16-③: 全部次级路径被拒 → Ŝ 无有效内容, 放弃保存 */
-    if (sec_rejected >= E * S) {
-        fprintf(stderr, "ERROR: 全部 %d 条次级路径 ERLE 低于 %.1fdB, 放弃保存.\n"
-                "      检查: 扬声器音量 / 误差麦信号 / 距离; 或调低 GFANC_SEC_MIN_ERLE.\n",
-                E * S, sec_min_erle);
-        free(noise_16k); free(noise_hw); free(mic_hw); free(mic16); free(sec);
-        return 1;
-    }
-
-    /* ── 保存 ── */
-    FILE *f = fopen(SEC_OUT_FILE, "wb");
-    if (!f) { fprintf(stderr, "ERROR: cannot write %s\n", SEC_OUT_FILE); return 1; }
-    fwrite(sec, sizeof(float), (size_t)E * S * SEC_TAPS, f);
-    fclose(f);
-    printf("\n  Saved: %s\n", SEC_OUT_FILE);
-
-    f = fopen(DLY_OUT_FILE, "wb");
+    /* ── 保存环路延迟 (v5: 不再辨识/保存次级路径) ── */
+    FILE *f = fopen(DLY_OUT_FILE, "wb");
     if (f) { /* BUG-2: 存总环路延迟 (anchor = bulk + GUARD), 运行时按 Ŝ 峰位补偿 */
              float d = (float)(bulk + GUARD);
              fwrite(&d, sizeof(float), 1, f); fclose(f);
@@ -438,8 +288,7 @@ int main(void) {
            (float)(bulk + GUARD) * 1000.0f / FS_CAL);
 
     free(noise_16k); free(noise_hw); free(mic_hw); free(mic16);
-    free(sec);
     p_Pa_Terminate();
-    printf("\nDone. 运行 gfanc_realtime.exe 验证 (应显示 MEASURED + bulk).\n\n");
+    printf("\nDone. 运行 gfanc_realtime.exe 验证 (应显示 Loop delay auto-loaded).\n\n");
     return 0;
 }
