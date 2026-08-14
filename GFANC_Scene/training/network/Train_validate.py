@@ -190,7 +190,7 @@ def validate_single_epoch(model, data_loader, loss_fn, device):
     avg_loss = eval_loss / len(data_loader.dataset)
     avg_cos = eval_cos / n
     avg_cos_spk = [c / n for c in eval_cos_spk]
-    print(f"验证损失: {avg_loss:.4f}  cos: {avg_cos:.4f}  "
+    print(f"验证损失: {avg_loss:.4f}  cos: {avg_cos:.6f}  "
           f"逐扬声器 cos: {[f'{c:.4f}' for c in avg_cos_spk]}")
     return avg_cos, avg_loss, avg_cos_spk
 
@@ -233,13 +233,13 @@ def train(model, train_loader, valid_loader, epochs, device, model_path=None, us
             if model_path:
                 torch.save(model.state_dict(), model_path)
                 print(bcolors.OKCYAN + f"最佳模型已保存至 {model_path} "
-                      f"(valid cos={cos_max:.4f})" + bcolors.ENDC)
+                      f"(valid cos={cos_max:.6f})" + bcolors.ENDC)
         else:
-            print(f"  最佳 cos 仍为 {cos_max:.4f}{marker}")
+            print(f"  最佳 cos 仍为 {cos_max:.6f}{marker}")
         print(f"  本轮用时 {time.time()-t0:.0f}s")
         print("-" * 40)
 
-    print(f"\n训练完成, 最佳验证 cos={cos_max:.4f}")
+    print(f"\n训练完成, 最佳验证 cos={cos_max:.6f}")
     return cos_train, cos_max, train_loss_epochs, validate_loss_epochs
 
 
