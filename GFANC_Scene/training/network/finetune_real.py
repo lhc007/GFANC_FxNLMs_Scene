@@ -6,7 +6,7 @@
 纯合成训练 (Train_validate.py) 用多样谱形逼 CNN 学「输入谱→增益」映射, 微调阶段用
 低学习率 (LR_FT=0.003) 在真实数据适配真实统计量, 防止把多样映射又坍缩回去.
 
-与 Train_validate.py 同机制: m5_scene(K=30) + 带通(20-1500Hz) + minmax + MSE(tanh vs
+与 Train_validate.py 同机制: m5_scene(K=30) + 带通(50-1500Hz) + minmax + MSE(tanh vs
 归一化增益) + Adam + StepLR. 选模指标 = 验证集整向量余弦相似度. 训练集带 GAIN_RANGE
 幅度不变性增强 (与 Train_validate.py 一致, 治部署端实机抖动); cos_max 从 -inf 起
 (回归首轮 valid_cos 可为负, 从 0 起则一个检查点都不存 → 重载崩溃).
@@ -77,7 +77,7 @@ DEFAULT_PRETRAIN = str(_PROJECT_ROOT / 'models' / 'MIMO_M5_DirectWeight_Real.pth
 OUTPUT_PTH       = str(_PROJECT_ROOT / 'models' / 'MIMO_M5_DirectWeight_Real.pth')
 
 # 带通 FIR (与 C 端部署的 CNN 输入严格对齐)
-_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_filter_20_1500Hz.mat'
+_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 # ═══════════════════════════════════════════════════════════════
 
 # 带通权重 (init 后设定)

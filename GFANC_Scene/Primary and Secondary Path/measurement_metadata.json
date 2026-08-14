@@ -6,61 +6,61 @@
       2,
       1024
     ],
-    "timestamp": "2026-08-07 14:07:16",
+    "timestamp": "2026-08-14 14:27:28",
     "config": {
       "fs": 44100,
       "f1": 20.0,
       "f2": 7500.0,
       "sweep_duration": 5.0,
-      "sweep_amplitude": 0.9,
+      "sweep_amplitude": 0.8,
       "ir_length": 1024,
-      "repetitions": 3,
+      "repetitions": 2,
       "input_device": 23,
       "output_device": 23,
       "latency_calibration_samples": 0
     },
     "quality": {
-      "_repeatability_SPK_0": 0.9987266423852671,
+      "_repeatability_SPK_0": 0.9998857587778094,
       "SPK_0->MIC1": {
-        "snr_db": 27.8,
-        "peak_db": 60.7,
-        "noise_floor_db": 21.4,
+        "snr_db": 28.8,
+        "peak_db": 62.8,
+        "noise_floor_db": 21.5,
         "clipping": false
       },
       "SPK_0->MIC2": {
-        "snr_db": 34.3,
-        "peak_db": 67.3,
-        "noise_floor_db": 19.4,
+        "snr_db": 34.6,
+        "peak_db": 70.4,
+        "noise_floor_db": 22.2,
         "clipping": false
       },
       "SPK_0->MIC3": {
-        "snr_db": 30.9,
-        "peak_db": 64.3,
-        "noise_floor_db": 20.3,
+        "snr_db": 30.8,
+        "peak_db": 65.4,
+        "noise_floor_db": 20.9,
         "clipping": false
       },
-      "_repeatability_SPK_1": 0.9968663127106696,
+      "_repeatability_SPK_1": 0.9999497874010653,
       "SPK_1->MIC1": {
-        "snr_db": 35.6,
-        "peak_db": 72.9,
-        "noise_floor_db": 23.1,
+        "snr_db": 36.4,
+        "peak_db": 75.2,
+        "noise_floor_db": 25.4,
         "clipping": false
       },
       "SPK_1->MIC2": {
-        "snr_db": 30.7,
-        "peak_db": 62.9,
-        "noise_floor_db": 19.7,
+        "snr_db": 29.7,
+        "peak_db": 64.9,
+        "noise_floor_db": 22.0,
         "clipping": false
       },
       "SPK_1->MIC3": {
-        "snr_db": 32.4,
-        "peak_db": 67.8,
-        "noise_floor_db": 21.5,
+        "snr_db": 33.5,
+        "peak_db": 68.1,
+        "noise_floor_db": 21.6,
         "clipping": false
       }
     },
     "normalization": {
-      "sec_rms": 126.4007,
+      "sec_rms": 167.444,
       "method": "global_scalar (\u00f7 RMS \u2192 RMS\u22481)",
       "note": "\u7b49\u4ef7\u4e8e lab \u786c\u4ef6\u589e\u76ca\u6821\u51c6, \u9891\u54cd/\u76f8\u4f4d/\u5ef6\u8fdf\u5168\u90e8\u4fdd\u7559"
     }
@@ -72,49 +72,49 @@
       2,
       1024
     ],
-    "timestamp": "2026-07-24 16:25:02",
+    "timestamp": "2026-08-14 14:50:30",
     "config": {
       "fs": 44100,
       "f1": 20.0,
       "f2": 7500.0,
       "sweep_duration": 5.0,
-      "sweep_amplitude": 0.9,
+      "sweep_amplitude": 0.8,
       "ir_length": 1024,
-      "repetitions": 3,
+      "repetitions": 4,
       "input_device": 23,
       "output_device": 23,
       "latency_calibration_samples": 0
     },
     "quality": {
       "Source->MIC1": {
-        "snr_db": 22.4,
-        "peak_db": 36.9,
-        "noise_floor_db": 3.4,
+        "snr_db": 20.9,
+        "peak_db": 57.8,
+        "noise_floor_db": 28.0,
         "clipping": false
       },
       "Source->MIC2": {
-        "snr_db": 20.3,
-        "peak_db": 29.5,
-        "noise_floor_db": 0.4,
+        "snr_db": 21.8,
+        "peak_db": 60.8,
+        "noise_floor_db": 26.8,
         "clipping": false
       },
       "Source->MIC3": {
-        "snr_db": 25.5,
-        "peak_db": 44.7,
-        "noise_floor_db": 6.7,
+        "snr_db": 20.8,
+        "peak_db": 61.3,
+        "noise_floor_db": 26.7,
         "clipping": false
       },
       "Source->REF0": {
-        "snr_db": 32.6,
-        "peak_db": 47.6,
-        "noise_floor_db": 2.8,
+        "snr_db": 25.2,
+        "peak_db": 67.2,
+        "noise_floor_db": 31.0,
         "clipping": false
       }
     },
     "source_distance_m": 3.0,
     "source_label": "noise_source",
     "normalization": {
-      "pri_rms": 11.6673,
+      "pri_rms": 130.4996,
       "method": "global_scalar (\u00f7 RMS \u2192 RMS\u22481)",
       "note": "\u4e0e\u6b21\u7ea7\u8def\u5f84\u5f52\u4e00\u5316\u4e00\u81f4, \u9891\u54cd/\u76f8\u4f4d/\u5ef6\u8fdf\u5168\u90e8\u4fdd\u7559"
     }

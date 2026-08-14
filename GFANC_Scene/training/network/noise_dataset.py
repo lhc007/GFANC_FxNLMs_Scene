@@ -4,7 +4,7 @@ PyTorch 噪声数据集 — 直接权重回归 (MIMO_GFANC noise_dataset.py 适�
 MyNoiseDataset: 从 CSV(File_path + gain_*) + WAV 目录加载 (signal, target).
 - 标签 = LMS 子带增益 gain_0..gain_{SC-1} (带符号, 与直接权重 Wc 构造语义一致)
 - 归一化 = 每样本 max-abs → [-1,1] (与推理端 tanh 输出对齐)
-- 输入 = 原始 1s 16kHz 波形; 带通(20-1500Hz)+minmax 在训练循环 prepare_batch
+- 输入 = 原始 1s 16kHz 波形; 带通(50-1500Hz)+minmax 在训练循环 prepare_batch
   整批 GPU 卷积做 (快 5-10 倍, 数学等价, 与 C 端 fir_tick 严格一致)
 """
 import os
@@ -27,13 +27,13 @@ def minmaxscaler(data):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 带通 (20-1500Hz) — 与 C 端 CNN 输入严格对齐
-# (LMS 增益只编码 20-1500Hz 频谱模式; 全带训练会引入与标签无因果关系的高频
+# 带通 (50-1500Hz) — 与 C 端 CNN 输入严格对齐
+# (LMS 增益只编码 50-1500Hz 频谱模式; 全带训练会引入与标签无因果关系的高频
 #  特征, 且部署端输入本就是带通后的信号)
 # ═══════════════════════════════════════════════════════════════
 
 def _load_bandpass_coeff(bp_path):
-    """加载 20-1500Hz 带通 FIR 系数 [L]."""
+    """加载 50-1500Hz 带通 FIR 系数 [L]."""
     import scipy.io as sio
     mat = sio.loadmat(str(bp_path))
     return mat['fir_bandpass_coeff'].squeeze().astype(np.float32)

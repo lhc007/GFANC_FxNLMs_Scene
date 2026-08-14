@@ -5,7 +5,7 @@
   窗口集   = 7 个基准录音的逐秒窗口, 两个 road 合并为一类 → 6 类
               (road_noise-15 / road_noise_0-34 / Helicopter / Street /
                Trolley / Furniture / mixed_7types_56s)
-  特征     = CNN 输出 (30 维 tanh 增益, 输入管道与 C 端一致: 带通20-1500 → minmax)
+  特征     = CNN 输出 (30 维 tanh 增益, 输入管道与 C 端一致: 带通50-1500 → minmax)
              输入谱   (15 子带能量, 带通后投影子滤波器)
              真实标签 (真实训练集 CSV gain_*, 4 类 — 训练不改变它, 是固定天花板)
   指标     = 最近均值分类准确率 (逐窗口 → 最近类型质心, 余弦) + 区分度间隙
@@ -43,7 +43,7 @@ from gfanc.Network import m5_scene
 
 N_SPEAKERS, N_BANDS, SC = 2, 15, 30
 SAMPLE_LEN = 16000
-_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_filter_20_1500Hz.mat'
+_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 _SUB_FILTER = MODELS_DIR / 'MIMO_Pretrained_Control_filters_broadband.mat'
 _NOISE_DIR = _PROJECT_ROOT.parent / 'Noise Examples'   # 基准录音在仓库根, 不在 GFANC_Scene/
 
@@ -106,7 +106,7 @@ def per_second_windows(sig_16k):
 def feature_input_spectrum(win, subs, bp_w, bp_pad):
     """窗口 → 带通 → 15 子带能量 (归1). 与 generate_synthetic.py probe 同口径."""
     x = torch.from_numpy(win).float().unsqueeze(0).unsqueeze(0).to(bp_w.device)
-    x = _pbatch(x, bp_w, bp_pad).squeeze().cpu().numpy()   # 带通 20-1500 (与 CNN 输入一致)
+    x = _pbatch(x, bp_w, bp_pad).squeeze().cpu().numpy()   # 带通 50-1500 (与 CNN 输入一致)
     e = []
     for k in range(subs.shape[0]):
         y = signal.fftconvolve(x, subs[k], mode='valid')

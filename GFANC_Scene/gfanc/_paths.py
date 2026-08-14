@@ -8,7 +8,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # _PROJECT_ROOT = Path('D:/')
 # 各类数据文件夹
 MODELS_DIR        = _PROJECT_ROOT / 'models'
-BANDPASS_FILTER_MAT = MODELS_DIR / 'bandpass_filter_20_1500Hz.mat'
+BANDPASS_FILTER_MAT = MODELS_DIR / 'bandpass_fir.mat'
 NOISE_EXAMPLES_DIR = _PROJECT_ROOT / 'Noise Examples'
 FIGURES_DIR       = _PROJECT_ROOT / 'figures'
 SYNTHESIZED_DATASET_DIR = Path('D:/') / 'Dataset' / 'Synthetic_Noise_Dataset'

@@ -39,10 +39,10 @@ def minmaxscaler(data):
     return data / denom
 
 
-# 带通 FIR (20-1500Hz) — 与 C 端部署的 CNN 输入严格对齐
-# (场景标签由 LMS 增益决定, 只编码 20-1500Hz 频谱模式; 全带训练会引入
+# 带通 FIR (50-1500Hz) — 与 C 端部署的 CNN 输入严格对齐
+# (场景标签由 LMS 增益决定, 只编码 50-1500Hz 频谱模式; 全带训练会引入
 #  与标签无因果关系的高频特征, 且部署端输入本就是带通后的信号)
-_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_filter_20_1500Hz.mat'
+_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 
 
 def _load_bandpass():
@@ -184,7 +184,7 @@ model = model.to(DEVICE)
 total_params = sum(p.numel() for p in model.parameters())
 print(f'\n  m5_scene: {total_params:,} params (K={K})')
 
-# GPU 整批带通 (20-1500Hz) + minmax — 与 C 端 fir_tick 因果 FIR 数学等价:
+# GPU 整批带通 (50-1500Hz) + minmax — 与 C 端 fir_tick 因果 FIR 数学等价:
 # F.conv1d 是互相关, 权重 flip + padding=L-1 + 截前 16000 点 = 因果卷积
 _bp = torch.from_numpy(_load_bandpass()).to(DEVICE)
 _bp_w = _bp.flip(0).view(1, 1, -1)

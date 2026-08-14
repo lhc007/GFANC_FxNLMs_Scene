@@ -19,7 +19,7 @@
 #   新方案: 1 个宽带主滤波器训练 → 快速收敛 → DFT 分解为 15 个子滤波器
 #
 # 流程:
-#   Step 1: 创建宽带滤波器 (20-1500 Hz)
+#   Step 1: 创建宽带滤波器 (50-1500 Hz)
 #   Step 2: MIMO FxNLMS 在宽带噪声上训练主滤波器 → Wc_main (S=4, Len=Len_control)
 #   Step 3: 对每个扬声器的主滤波器做 sqrt-Hann DFT 分解 → sub_filters (C=15, S=4, Len=Len_control)
 #   Step 4: 保存
@@ -52,7 +52,7 @@ except ImportError:
 # 非均匀 sqrt-Hann 加窗 DFT 滤波器分解
 #
 # 与均匀分解的区别:
-#   均匀: 0~fs/2 等分 15 段 → 20-1500 Hz 只覆盖 3 段, 其余浪费
+#   均匀: 0~fs/2 等分 15 段 → 50-1500 Hz 只覆盖 3 段, 其余浪费
 #   非均匀: 只对 [f_low, f_high] 均分 15 段 → 全在有效区, ~100 Hz/子带
 #
 # 原理: 零填充 FFT (4x) → 频域精细加窗 → IFFT → 截断回原长度
@@ -351,7 +351,7 @@ def main():
     # ── 配置参数 ──────────────────────────────────────────────
     # ================== 全局开关：改这里即可切换 ==================
     # R-13-②: False (均匀间距) — export_bin.py 读 broadband.mat; 保持与现 sub_filters.bin 同间距方案
-    USE_LOG_SPACING = False   # True: 对数间距 (23~1299Hz), False: 均匀间距 (20~1500Hz)
+    USE_LOG_SPACING = False   # True: 对数间距 (23~1299Hz), False: 均匀间距 (50~1500Hz)
     # =============================================================
 
     # 路径全部锚定到 GFANC_Scene 项目根 (CWD 无关, 从任意目录可运行)
@@ -373,7 +373,7 @@ def main():
     Len_control = 1024          # 滤波器长度
     num_subfilters = 15         # 子滤波器数量
     mu = 0.05                   # sum 归一化 + float64, μ 可放大
-    f_low = 20.0                # 训练宽带噪声低频截止
+    f_low = 50.0               # 训练宽带噪声低频截止 (P0-7: 对齐 bandpass_anc 低截止 20→50 折中)
     f_high = 1500.0             # 训练宽带噪声高频截止
     BP_ANC_TAPS = 64            # R-13-②: 运行时 ANC 带通长度 (data/bandpass_anc.bin, 64tap)
 
@@ -386,7 +386,7 @@ def main():
     # R-13-②: 训练参考域对齐运行时 ANC 带通 (64tap = bandpass_anc.bin).
     #   运行时: ref → bp_anc(64tap) → Wc ⊗ ref; 训练须在同一带通域下生成参考,
     #   否则 1024tap firwin 的群延迟/过渡带与 64tap 不同 → CNN 预设 Wc 与信号域失配
-    #   (自适应可纠正, 但初始收敛慢). 已验证 firwin(64,[20,1500]) ≡ bandpass_anc.bin.
+    #   (自适应可纠正, 但初始收敛慢). P0-7 后 bandpass_anc=[50,1500], 训练 [f_low,f_high] 须与其一致.
     print(f'\n[Step 1/4] 创建宽带训练滤波器 ({f_low}-{f_high} Hz, {BP_ANC_TAPS}tap = 运行时 ANC 带通)...')
     broadband_filter = signal.firwin(
         BP_ANC_TAPS, [f_low, f_high],

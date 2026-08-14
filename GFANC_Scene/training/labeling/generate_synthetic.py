@@ -2,11 +2,11 @@ r"""
 合成噪声数据集构造 — 只生成谱形 WAV（打标签交给 label_wavs.py）.
 
 背景 (2026-08-09 实测):
-  输入谱(20-1500Hz 带通子带能量)跨噪声类型可分 75.0%, 真实训练标签(gain_*)可分
+  输入谱(50-1500Hz 带通子带能量)跨噪声类型可分 75.0%, 真实训练标签(gain_*)可分
   76.7%, 但 CNN 增益输出仅可分 35.8% → CNN 欠拟合, 没学会提取输入光谱信息.
   当前 4 类真实噪声(道路/儿童/施工/铁路)全是低频主导、光谱接近, 模型输出同一
   低频处方即可低损失 → 不学光谱→增益映射.
-  合成数据用多样谱形(窄带/宽带/谱倾斜/谐波)覆盖 20-1500Hz 全子带空间, 逼 CNN
+  合成数据用多样谱形(窄带/宽带/谱倾斜/谐波)覆盖 50-1500Hz 全子带空间, 逼 CNN
   必须用输入 → 修复欠拟合.
 
 用法:
@@ -52,7 +52,7 @@ from gfanc._paths import MODELS_DIR
 FS          = 16000
 CHUNK_SEC   = 1.0
 CHUNK       = int(CHUNK_SEC * FS)          # 16000
-BAND_LO, BAND_HI = 20, 1500                # 与部署带通严格一致 (bandpass_fir.bin)
+BAND_LO, BAND_HI = 50, 1500                # 与部署带通严格一致 (bandpass_fir.bin)
 DEFAULT_OUT = r'D:\Dataset\Synthetic_Dataset'
 
 # 生成谱形族比例 (权重 → 多样性与真实感平衡)
@@ -70,16 +70,16 @@ _SUB_FILTER_FILE = MODELS_DIR / 'MIMO_Pretrained_Control_filters_broadband.mat'
 # ═══════════════════════════════════════════════════════════════
 
 _rng = None
-_bp20_1500 = None   # 20-1500Hz 带通 FIR (缓存)
+_bp50_1500 = None   # 50-1500Hz 带通 FIR (缓存)
 
 
-def _bandpass20_1500():
-    """20-1500Hz FIR (1024tap, hamming) — 与部署 bandpass_fir.bin 同 passband."""
-    global _bp20_1500
-    if _bp20_1500 is None:
-        _bp20_1500 = signal.firwin(1024, [BAND_LO, BAND_HI], pass_zero='bandpass',
+def _bandpass50_1500():
+    """50-1500Hz FIR (1024tap, hamming) — 与部署 bandpass_fir.bin 同 passband."""
+    global _bp50_1500
+    if _bp50_1500 is None:
+        _bp50_1500 = signal.firwin(1024, [BAND_LO, BAND_HI], pass_zero='bandpass',
                                    window='hamming', fs=FS)
-    return _bp20_1500
+    return _bp50_1500
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -100,7 +100,7 @@ def _bandlimited(f_star, f_end, n=CHUNK):
 
 
 def gen_narrowband():
-    """窄带: 中心频率 ∈U[40,1480] (覆盖全部署带, 含 1.3-1.5kHz), 带宽 ∈U[20,300]."""
+    """窄带: 中心频率 ∈U[BAND_LO+20,1480] (覆盖全部署带, 含 1.3-1.5kHz), 带宽 ∈U[20,300]."""
     f_star = _rng.uniform(BAND_LO + 20, BAND_HI - 20)
     bw = _rng.uniform(20, min(300, BAND_HI - f_star - 1))
     return _bandlimited(f_star, f_star + bw)
@@ -114,7 +114,7 @@ def gen_broadband():
 
 
 def gen_tilt():
-    """1/f^α 谱倾斜 (α∈[0,2]) → 20-1500Hz 带通. 贴近真实噪声平滑谱."""
+    """1/f^α 谱倾斜 (α∈[0,2]) → 50-1500Hz 带通. 贴近真实噪声平滑谱."""
     alpha = _rng.uniform(0.0, 2.0)
     x = _rng.randn(CHUNK)
     X = np.fft.rfft(x)
@@ -124,25 +124,25 @@ def gen_tilt():
     shape[mask] = freq[mask] ** (-alpha / 2.0)                 # 幅值 1/f^(α/2)
     X *= shape
     y = np.fft.irfft(X, CHUNK)
-    y = signal.lfilter(_bandpass20_1500(), 1, y)
+    y = signal.lfilter(_bandpass50_1500(), 1, y)
     std = np.std(y)
     return y / (std + 1e-12)
 
 
 def gen_tonal():
-    """1-3 个基频 f0∈U[40,600] + 2-4 次谐波 + 窄带噪声底 (-20dB)."""
+    """1-3 个基频 f0∈U[BAND_LO,600] + 2-4 次谐波 + 窄带噪声底 (-20dB)."""
     n_f0 = _rng.randint(1, 4)
     t = np.arange(CHUNK) / FS
     y = np.zeros(CHUNK)
     for _ in range(n_f0):
-        f0 = _rng.uniform(40, 600)
+        f0 = _rng.uniform(BAND_LO, 600)
         for h in range(1, 5):
             amp = (1.0 / h) * _rng.uniform(0.7, 1.3)
             phase = _rng.uniform(0, 2 * np.pi)
             y += amp * np.sin(2 * np.pi * f0 * h * t + phase)
     y = y / (np.std(y) + 1e-12)
-    nb = _bandlimited(40, BAND_HI - 40) * 10 ** (-1.0)          # 噪声底 -20dB
-    y = signal.lfilter(_bandpass20_1500(), 1, y + nb)
+    nb = _bandlimited(BAND_LO, BAND_HI - BAND_LO) * 10 ** (-1.0)          # 噪声底 -20dB
+    y = signal.lfilter(_bandpass50_1500(), 1, y + nb)
     std = np.std(y)
     return y / (std + 1e-12)
 
@@ -254,7 +254,7 @@ def probe(n_probe=300):
     for k in range(15):
         bar = '#' * int(active[k] * 50)
         print(f'    band {k:2d}: {active[k]*100:4.0f}% {bar}')
-    # band 14 质心 3.9kHz, 20-1500 内能量仅 2% — 部署死带 (输入带通 20-1500), 不参与覆盖率
+    # band 14 质心 3.9kHz, 50-1500 内能量仅 2% — 部署死带 (输入带通 50-1500), 不参与覆盖率
     n_active = (active[:14] > 0.20).sum()
     print(f'  覆盖率 = {100*n_active/14:.0f}% (band 0-13 活跃>20% 的 {n_active}/14; '
           f'band 14 为部署死带 3.9kHz, 预期 0)')

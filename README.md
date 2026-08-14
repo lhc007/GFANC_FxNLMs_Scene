@@ -221,6 +221,11 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 > **当前部署模型 = 纯合成训练**（2-② 生成合成数据 → 2-③ `Train_validate.py` 纯合成训练，**没有真实数据微调**）。真实微调（2-④/2-⑤）是**可选**路径，当前流程没用。
 
 ```bash
+# 2-⓪ 生成 CNN 输入带通 bandpass_fir.mat —— 固定部署常量，仓库已自带（50-1500Hz），从零训练无需重跑
+#     仅当降噪范围变更时重新生成（改 f_low/f_high 只重跑本步；脚本路径已用频率无关名，不用再改）：
+python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
+#    → models/bandpass_fir.mat（训练 CNN 输入 + 导出 bandpass_fir.bin 共用同一份系数）
+
 # 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
 #    输入: Primary and Secondary Path/{primary,secondary}_path.npy（Pri 扰动 + Ŝ 滤波参考, MIMO FxNLMS 训练必需）
 cd GFANC_Scene
@@ -229,7 +234,7 @@ python training/control_filters/Pre_training_broadband_and_decompose.py
 #      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
 
 # 2-② 生成合成训练数据 + LMS 打标签 —— 当前训练数据**全部来自这里**（从零生成，独立数据集）
-#    ① 生成 4 类谱形 1s WAV：窄带 / 宽带 / 1-f^α 谱倾斜 / 谐波，覆盖 20-1500Hz 全子带空间
+#    ① 生成 4 类谱形 1s WAV：窄带 / 宽带 / 1-f^α 谱倾斜 / 谐波，覆盖 50-1500Hz 全子带空间
 #       → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\synth_*.wav（60000/7500/7500）
 python training/labeling/generate_synthetic.py
 #       --n-train/--n-val/--n-test 自定义规模；--probe-only --n-probe 300 只跑谱形覆盖检查
@@ -317,7 +322,7 @@ $env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
 - 数据源（可选）：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）—— 仅走 2-④/2-⑤ 真实微调时用
 - 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
 - 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]）—— 合成/真实走**同一套 LMS 管线**（`label_wavs.py --tag {synth,real}`，唯一实现），用**实测声学路径 + 子滤波器基**拟合，正是直接权重 CNN 的回归目标
-- **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，20-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**
+- **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，50-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**
 - **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
 
 ### 命令顺序
@@ -326,6 +331,7 @@ $env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
 
 ### 说明
 
+- **何时重跑 CNN 输入带通（2-⓪）**：降噪范围变更时。`python export/gen_bandpass_fir.py --f-low 50 --f-high 1500` 重生成 `models/bandpass_fir.mat`（文件名与频率无关，改范围不连带改脚本路径）。**降噪范围四处必须一致**：`bandpass_fir.mat`（CNN 输入）＝ `Pre_training` 的 `f_low` ＝ `export_bin.py` 的 `bandpass_anc` ＝ `generate_synthetic.py` 的 `BAND_LO`。
 - **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
 - **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-④ 打标签自动加载 broadband.mat，无需另改）。
 - **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
@@ -384,7 +390,7 @@ GFANC_FxNLMs_Scene/
 CNN 神经网络每秒分析一次 1 秒窗口的噪声，回归 **30 维子带增益**（2 扬声器 × 15 子带，`tanh` → [-1,1] 带符号），并直接构造控制滤波器 Wc = Σ 增益 × 子滤波器（v1.6 直接权重，替换旧 K=3 场景 CNN + centroid blend）。双缓冲机制确保零样本丢失。
 
 ```
-噪声 → 带通(20-1500Hz) → CNN(M5, 30维回归) → tanh 增益 → Wc=Σ gain×sub → Wc(1024tap)
+噪声 → 带通(50-1500Hz) → CNN(M5, 30维回归) → tanh 增益 → Wc=Σ gain×sub → Wc(1024tap)
                                                     ↑ 1Hz, 双缓冲+原子交接
 ```
 
@@ -565,7 +571,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | CNN 输出维 (K) | 30 (=S×C, 运行时从 linear_weight 推导) | 直接权重回归: 2 扬声器 × 15 子带增益 (v1.6; 旧场景分类 K=3 已移除) |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | CNN 带通 / ANC 带通 | 1024 / 64 tap | 直接权重用 1024(分辨率), FxLMS 用 64(群延迟 2ms) |
-| 带通频率 | 20-1500 Hz | ANC 有效频率范围 |
+| 带通频率 | 50-1500 Hz | ANC 有效频率范围 |
 | 输入预增益 | 自适应 (env: GFANC_MIC_GAIN) | 自动标定到 TARGET_REF_RMS=0.03 |
 | 步长 (μ) | 1e-7 (基准, Ŝ RMS 自动缩放; env: GFANC_STEP) | LMS 自适应步长 |
 | 变步长 (VS-LMS) | 双 EMA 尖峰检测, 突发降步至 5% | 误差相对自身基线跳变→降步防反馈过冲; 平滑收敛全速 (2026-08-05) |
@@ -691,7 +697,7 @@ A: R-58-10 修复后三个标准场景用同一套默认参数，NR_true 收敛�
 | 默认参数 + µ=0（固定 Wc）, road_0-34 | +7.1 dB（CNN 初值健康度） |
 
 **Q: 为什么 error_out.wav 听起来比原噪声还大？**
-A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 20-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看表格里的 NR_true（离线真值）或实时 NR 数字，不要用耳朵直接听 error_out.wav。
+A: error_out.wav 是 3 声道文件（对应 3 个麦克风位置），播放器同时播 3 个声道叠加后音量更大。另外，ANC 只在 50-1500Hz 有效，高频部分反而增加了少量能量。降噪效果要看表格里的 NR_true（离线真值）或实时 NR 数字，不要用耳朵直接听 error_out.wav。
 
 **Q: 实时模式怎么验证效果？**
 A: 终端每秒输出 NR(dB)、err/anti RMS、啸叫状态。NR > 3dB 表示有效降噪。

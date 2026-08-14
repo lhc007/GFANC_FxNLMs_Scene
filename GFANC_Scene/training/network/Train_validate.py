@@ -5,7 +5,7 @@ CNN 直接权重回归训练入口 (MIMO_GFANC Train_validate.py 适配版).
 三个不匹配点全部按当前代码来:
   1) CNN 架构   → m5_scene (C 运行时已实现, 输出 30 维权重)
   2) 损失/标签  → 带符号 Gains_real + tanh 输出 + MSE (软混合 Wc 构造语义)
-  3) 数据管道   → CSV(gain_*) + WAV 目录 + 带通(20-1500Hz)+minmax (与 C 端一致)
+  3) 数据管道   → CSV(gain_*) + WAV 目录 + 带通(50-1500Hz)+minmax (与 C 端一致)
 
 运行:
     python training/network/Train_validate.py          # 用下方默认路径
@@ -63,7 +63,7 @@ VALID_WAV_DIR = os.path.join(DATA_DIR, 'Validate_data')
 OUTPUT_PTH    = str(_PROJECT_ROOT / 'models' / 'MIMO_M5_DirectWeight_Real.pth')
 
 # 带通 FIR (与 C 端部署的 CNN 输入严格对齐)
-_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_filter_20_1500Hz.mat'
+_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 # ═══════════════════════════════════════════════════════════════
 
 # 带通权重 (init 后设定)

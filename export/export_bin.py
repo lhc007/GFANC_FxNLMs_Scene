@@ -47,7 +47,7 @@ PRI_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'primary_path.npy'
 SEC_PATH   = PY_PROJ / 'Primary and Secondary Path' / 'secondary_path.npy'
 
 # 带通 FIR
-BP_FIR     = PY_PROJ / 'models' / 'bandpass_filter_20_1500Hz.mat'
+BP_FIR     = PY_PROJ / 'models' / 'bandpass_fir.mat'
 
 # 输出目录
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -219,9 +219,9 @@ print(f'  bandpass_fir.bin: {len(bp_coeff)} taps')
 # ── 5b. ANC 专用短带通 FIR (R-13: 64tap, 群延迟 2ms vs 8ms — 砍环路延迟) ──
 print('Exporting ANC bandpass FIR (64tap)...')
 from scipy.signal import firwin
-# P0-7 (2026-08-14): 低截止 20→100Hz — S 在 100Hz 以下滚降 25dB(实测), 20~100Hz
-# 的 anti 既消不动(50Hz 发散 -29dB)又驱动扬声器低频失真(滋滋声). 高截止 1500 不变.
-bp_anc_coeff = firwin(64, [100, 1500], fs=16000, pass_zero='bandpass',
+# P0-7 (2026-08-14): 低截止 20→50Hz(折中) — S 在 100Hz 以下滚降 25dB(实测), <50Hz
+# 的 anti 既消不动又驱动扬声器低频失真(滋滋声). 高截止 1500 不变.
+bp_anc_coeff = firwin(64, [50, 1500], fs=16000, pass_zero='bandpass',
                        window='hamming').astype(np.float32)
 write_bin('bandpass_anc', bp_anc_coeff)
 print(f'  bandpass_anc.bin: {len(bp_anc_coeff)} taps, '

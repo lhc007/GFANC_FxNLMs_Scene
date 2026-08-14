@@ -2,7 +2,7 @@
 CNN 模型评估 — 直接权重回归 (MIMO_GFANC evaluate.py 适配版).
 
 在测试集上计算: 整向量(SC=30)余弦相似度 / 逐扬声器余弦 / MSE.
-输入管道与训练/部署一致: 带通(20-1500Hz) + minmax.
+输入管道与训练/部署一致: 带通(50-1500Hz) + minmax.
 """
 import sys, os
 from pathlib import Path
@@ -23,7 +23,7 @@ N_SPEAKERS = 2
 N_BANDS = 15
 SC = N_SPEAKERS * N_BANDS
 
-_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_filter_20_1500Hz.mat'
+_BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 _bp_w = _bp_pad = None
 
 
