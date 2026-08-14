@@ -151,6 +151,7 @@ typedef struct {
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
     float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
+    int    reset_pending;         /* cos<τ 连续秒数 (RESET 迟滞, 达 reset_hyst 才触发) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
     int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
@@ -795,13 +796,15 @@ static void check_convergence(rt_ctx_t *ctx) {
 }
 
 /* 去场景层 (gfanc-direct-weight): Reset 模式触发 — 无场景记忆, 直接过渡到
-   scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用. */
+   scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用.
+   P0-6 (2026-08-14) 软重锚定: 场景切换只做 crossfade(wc_old→wc_cur) + 重锚定,
+   去掉 cold_hold/mute — 那 3.5s 打断本是冷启动保护, 场景切换用 peak_mute 兜底即可.
+   否则切换 latency = 2s cold_hold + 1.5s mute, 比 FxLMS 小步长硬爬还慢 (问题1). */
 static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains, int by_ocg) {
     memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float)); /* 过渡起点 */
     /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
-    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);
-    InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);
-    InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
+    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);            /* crossfade 平滑过渡 */
+    /* 软重锚定: 不设 cold_hold/mute (冷启动保护仅 INIT 用, 场景切换不需要) */
     InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
@@ -1262,6 +1265,7 @@ int main(void) {
             InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_gains, gains, K * sizeof(float));
+            ctx->reset_pending = 0;  /* RESET 迟滞计数清零 (重建锚点) */
             ocg_reset(&ctx->ocg, gains);  /* OCG: 首个增益建立簇 0 */
             /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
                RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
@@ -1395,9 +1399,23 @@ int main(void) {
                27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
                cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
             if (!ctx->quiet_active && cfg.gfanc_mode == 1) {   /* reset (安静期不派发) */
-                int do_reset = cfg.ocg_enable ? ocg_step(&ctx->ocg, gains)
-                                              : (cos_sim < cfg.switch_threshold);
-                if (do_reset) apply_reset(ctx, cos_sim, gains, cfg.ocg_enable);
+                if (cfg.ocg_enable) {
+                    /* OCG 已有 ocg_hold 持续性判据, 簇索引变化才切换 */
+                    if (ocg_step(&ctx->ocg, gains))
+                        apply_reset(ctx, cos_sim, gains, 1);
+                } else {
+                    /* cos 闸门 + RESET 迟滞: cos 连续 reset_hyst 秒 < τ 才触发软重锚定.
+                       场景切换提交 wc_cur (CNN 已算好的新滤波器), FxLMS 从正确起点微调.
+                       迟滞挡 1 秒瞬态; 软重锚定无 cold_hold/mute 打断. */
+                    if (cos_sim < cfg.switch_threshold) {
+                        if (++ctx->reset_pending >= cfg.reset_hyst) {
+                            apply_reset(ctx, cos_sim, gains, 0);
+                            ctx->reset_pending = 0;
+                        }
+                    } else {
+                        ctx->reset_pending = 0;
+                    }
+                }
             }                                   /* continuous: 不动作 */
         }
         memcpy(ctx->sc.prev_gains, gains, K * sizeof(float));
