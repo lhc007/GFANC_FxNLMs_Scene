@@ -219,6 +219,8 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 > 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（子滤波器、合成数据生成/打标签、导出全都要）。只跑现成模型（跳过本阶段）时用仓库自带的那两份 .npy，但那是别人环境的测量值——**从头训练务必在阶段 1 实测**。
 >
 > **当前部署模型 = 纯合成训练**（2-② 生成合成数据 → 2-③ `Train_validate.py` 纯合成训练，**没有真实数据微调**）。真实微调（2-④/2-⑤）是**可选**路径，当前流程没用。
+>
+> ⚠️ **判别力未达标（2026-08-14 实测）**：纯合成 valid cos=0.9754，但真实判别力 **35.1%**（排 mixed 55.4%），未到 ≥70%、与基线 35.8% 持平。根因：合成 4 族谱形在**倍频程位置**上变化，真实噪声全低频主导、差别在**低频内部滚降/峰位/谐波**，两条判别轴正交、映射不迁移。**下一步 = 低频写实化重造合成数据（能量集中 50-400Hz）**，待验证。
 
 ```bash
 # 2-⓪ 生成 CNN 输入带通 bandpass_fir.mat —— 固定部署常量，仓库已自带（50-1500Hz），从零训练无需重跑
@@ -322,7 +324,7 @@ $env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
 - 数据源（可选）：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）—— 仅走 2-④/2-⑤ 真实微调时用
 - 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
 - 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]）—— 合成/真实走**同一套 LMS 管线**（`label_wavs.py --tag {synth,real}`，唯一实现），用**实测声学路径 + 子滤波器基**拟合，正是直接权重 CNN 的回归目标
-- **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，50-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**
+- **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，50-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**。⚠️ 但这版 4 族谱形在**倍频程位置**上变化，与真实噪声「低频内部结构」的判别轴正交，实测判别力仍 35.1% 未达标——需改「低频写实化」谱形（能量集中 50-400Hz、变滚降/峰位/谐波），见上方阶段 2 ⚠️ 注
 - **不需要场景聚类**：`recluster_real.py`（旧场景架构的 K-means → scene_id / SoftLabels / band_）直接跳过
 
 ### 命令顺序
@@ -336,7 +338,7 @@ $env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
 - **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-④ 打标签自动加载 broadband.mat，无需另改）。
 - **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
 - **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
-- **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线 = 2-⑤ `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入，目标从 35.8% 提到 ≥70%
+- **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线 = 2-⑤ `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入；实测 **35.1% 未达标 ≥70%**（根因/下一步见上方阶段 2 ⚠️ 注）
 
 ## 项目结构
 
