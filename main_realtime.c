@@ -407,8 +407,15 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         int nan_anti = 0;
         for (int s = 0; s < S; s++) {
             if (!isfinite(anti_spk[s])) { anti_spk[s] = 0.0f; nan_anti = 1; }
-            if (anti_spk[s] > 1.0f) anti_spk[s] = 1.0f;
-            if (anti_spk[s] < -1.0f) anti_spk[s] = -1.0f;
+            /* 输出软限幅(soft-knee)替代硬钳位 ±1.0 — 鲁棒性提升.
+               硬钳位把峰值削平 → 3/5/7 次谐波失真.
+               软膝: |x|≤0.9 线性不变, |x|>0.9 用 tanh 圆滑过渡到 ±1.0,
+               只去掉尖角高次谐波, 保留基波幅度 (膝点 C¹ 连续, 不引入新谐波).
+               (2026-08-17 实测 250Hz 滋滋并非削波所致, 此改动不治滋滋但更稳.) */
+            else if (anti_spk[s] > 0.9f)
+                anti_spk[s] = 0.9f + 0.1f * tanhf((anti_spk[s] - 0.9f) * 10.0f);
+            else if (anti_spk[s] < -0.9f)
+                anti_spk[s] = -0.9f - 0.1f * tanhf((-anti_spk[s] - 0.9f) * 10.0f);
         }
         if (nan_anti) {
             ctx->nan_out_hold++;
@@ -1045,11 +1052,14 @@ int main(void) {
         printf("  Ŝ: peak=%.4f RMS=%.4f → norm peak=1.00 RMS=%.4f\n", s_peak,
                s_peak > 0.001f ? s_rms * s_peak : s_rms, s_rms);
         /* ── 自适应 step: Ŝ RMS 越大 → Xd 越大 → power 越大 → μ_eff 越小.
-           补偿: step ∝ 1/s_rms², 使得 μ_eff 在不同 Ŝ 间保持一致.
+           补偿: step ∝ s_rms², 使得 μ_eff 在不同 Ŝ 间保持一致.
+           (2026-08-17 修正: 原式 s_target²/s_rms² 方向反了 — power∝s_rms², μ_eff=step/power,
+            要保持 μ_eff 一致应 step∝s_rms². 旧式在 s_rms>s_target 时反而缩步,
+            是 500Hz 压不动的根因之一.)
            设计目标 s_rms≈0.02 (根据 C 实测 Ŝ 标定). GFANC_STEP 可覆盖. */
         if (!getenv("GFANC_STEP")) {
             float s_target = 0.02f;  /* 设计参考 Ŝ_RMS */
-            float s_scale = (s_target * s_target) / (s_rms * s_rms + 1e-10f);
+            float s_scale = (s_rms * s_rms) / (s_target * s_target + 1e-10f);
             if (s_scale > 4.0f) s_scale = 4.0f;    /* 上限防过冲 */
             if (s_scale < 0.1f) s_scale = 0.1f;    /* 下限保收敛 */
             cfg.step_size *= s_scale;
