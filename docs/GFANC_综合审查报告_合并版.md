@@ -100,6 +100,13 @@
 【R-16-①③ / R-50 / R-51 / BUG-2 的窗户安装态验证】
 - **修复状态**：⏳ 见第一部分（部分修复）对应项。
 
+【W-4~W-7 代码通读 → 待实机验证 · 一般[决策]】（2026-08-17 全量通读新增，代码均已就绪，非缺陷）
+- **修复状态**：⏳ 四项均待窗户态实测：
+  - **W-4 continuous 模式**（`GFANC_MODE=continuous`，`gfanc_mode=0`）：验证 250→500→250 全程 FxLMS 自爬、无 RESET spike；通过后考虑翻转默认或简化砍 RESET（交接根治方向）。
+  - **W-5 OCG 重开**（`GFANC_OCG=1`+`GFANC_OCG_HOLD=1`）：P0-3 证伪后已加 hold 持续性判据，待验证后翻转默认开。
+  - **W-6 P0-5 安静检测**（quiet_* 判据，main_realtime.c:1346）：编译过 + 离线无回归，实机验证噪声消失/回归进出误判。
+  - **W-7 步长默认值**（step auto≈2.1e-7 vs `GFANC_STEP=1e-6`）：未定案，待多轮瞬态/切换稳定验证后决定是否抬默认。
+
 ### Phase-2/3 迁移
 
 【R-21 无音频 I/O HAL · 严重 · [P2/3]】
@@ -148,6 +155,32 @@
 
 【ADV-F1 嵌入式算力 · 低 · [P3]】
 - **修复状态**：🔵 芯片选型后评估。
+
+### 低优先级一致性项（2026-08-17 通读，待决定，均不阻塞）
+
+【N-1 wc_init_max RESET 后未重标定 · 低】
+- **位置**：`apply_reset`（main_realtime.c:810）vs INIT（main_realtime.c:1278）
+- **问题描述**：INIT 用 `max|wc_cur|` 重标定 freeze 基准，`apply_reset` 只清 `converged_frames`/`freeze_timer`，不动 `wc_init_max` → RESET 后 freeze 基准沿用旧场景的收敛 max|Wc|。
+- **造成的影响**：实际风险低——两场景 Wc 同 RMS target、幅度量级接近，难碰 30× freeze 阈值，且 3s 内 `check_convergence` 重标定。
+- **修复方案**：`apply_reset` 补一行 `wc_init_max = max|wc_cur|`（与 INIT 对齐）。
+- **修复状态**：⏳ 未改，待决定。
+
+【N-2 实时缓冲按 FS_HW=48000 超配 · 建议 · [Phase-2/3]】
+- **位置**：main_realtime.c:1196-1198
+- **问题描述**：`ref_buf/err_buf/anti_buf` 按 48000 分配，实际每回调最多写 `c16k≈c48k/3≈341` 样本 → 多占 ~1MB。
+- **造成的影响**：PC 无害；RK3568 嵌入式移植必须改小（改 `max-c16k≈GFANC_BUFFER/3`），否则白占 RAM。
+- **修复状态**：⏳ 未改（PC 版无需处理，移植时再改）。
+
+【N-3 OCG LRU 可能淘汰 active 簇 · 低】
+- **位置**：ocg.c:60-79
+- **问题描述**：活动簇仅被命中时才刷新 `last_used`；长期处于新簇候选期时，旧 active 簇可能被当「最久未用」淘汰。
+- **造成的影响**：边缘情况；OCG 默认关，暂不处理。
+- **修复状态**：⏳ 未改。
+
+【N-4 print_diagnostics new_scene 死参数 · 信息】
+- **位置**：main_realtime.c:645-649
+- **问题描述**：`(void)new_scene`，形参未用。
+- **修复状态**：⏳ 未改（无影响）。
 
 ## 三、物理层瓶颈（🔴 非代码，决定最终目标）
 
