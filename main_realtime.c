@@ -809,7 +809,16 @@ static void check_convergence(rt_ctx_t *ctx) {
    否则切换 latency = 2s cold_hold + 1.5s mute, 比 FxLMS 小步长硬爬还慢 (问题1). */
 static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains, int by_ocg) {
     memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float)); /* 过渡起点 */
-    /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
+    /* wc_cur 已是 scene_ctrl_process 算出的新候选.
+       RESET 与 INIT 一致: 对 CNN 直接权重候选施加 wc_cold_start 衰减, 再 crossfade.
+       (2026-08-17 修 250→500 转换差): 500Hz 的 CNN 估计相位失配, 若满幅交接,
+       FxLMS 被锁死在错误方向 (err 0.040, anti 0.21 比 500Hz 单独 0.15 更大却对消更差);
+       INIT 从 30% 起步 FxLMS 才能长到正确方向 (err 0.024). 满幅 vs 30% 的不一致
+       即 250→500 差 / 500→250 好的根因 — 两个方向的 CNN 估计质量不对称
+       (250Hz 对齐好、500Hz 失配), 统一 30% 起步让两者都走 FxLMS 重长路径. */
+    if (cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
+        for (int i = 0; i < S * L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
+    }
     InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);            /* crossfade 平滑过渡 */
     /* 软重锚定: 不设 cold_hold/mute (冷启动保护仅 INIT 用, 场景切换不需要) */
     InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);

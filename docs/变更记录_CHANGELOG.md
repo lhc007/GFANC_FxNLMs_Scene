@@ -31,6 +31,22 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-17] RESET 交接施加 wc_cold_start 衰减 — 治 250→500 转换对消差
+- **状态**: 工作区未提交
+- **基线**: 0a571fe
+- **变更代码**:
+  - 修改: `main_realtime.c` — `apply_reset` 在 crossfade 前对 `wc_cur` 施加 `wc_cold_start` 衰减（与 INIT 首帧一致）
+- **变更原因**: 实机 250→500→250 序列测出**方向不对称**：250→500 切换后 500Hz 对消差（err 0.037~0.053、anti 0.21，比 500Hz 单独 err 0.024 更差），而 500→250 切换后 250Hz 仍深对消（err 0.023）。根因 = INIT 首帧对 CNN 直接权重候选乘 `wc_cold_start=0.3`（从 30% 起步，FxLMS 长到正确方向），而 RESET 的 crossfade 却满幅（100%）交接。500Hz 的 CNN 估计相位失配（500Hz 是历史"难消"频点，[[gfanc-sec-model-500hz-pumping]]），满幅交接把 FxLMS 锁死在错误方向（anti 更大 0.21 却对消更差 = 相位错）；250Hz 的 CNN 估计对齐好，满幅交接不受影响 → 不对称。统一 30% 起步让两个方向都走 FxLMS 重长路径。
+- **造成影响**:
+  - 行为: RESET 交接后 Wc 从 `wc_cold_start×wc_cur` 起步（默认 30%），FxLMS 从正确方向重长；250→500 切换不再锁死，代价是 500→250（原已好）切换也走重长、收敛稍慢 ~1s
+  - 配置: 复用 `GFANC_WC_COLD`（默认 0.3）；`GFANC_WC_COLD=1` 回退旧满幅交接行为
+  - 测试/回归: gcc 编译通过（gfanc_realtime.exe 零警告零错误）
+  - 性能/内存: 无（RESET 路径多一次 S×L 标量乘）
+  - 未验证项: ① 实机已复验 — 250→500 段 err 降到 0.025~0.031（接近 500Hz 单独 0.024，修复前 0.037~0.053）、500→250 段 0.017~0.021 不劣化；② 但日志揭示 30% 是「减震」非「根治」：RESET 前 FxLMS 已自收敛 0.024、RESET 反而 spike 0.035 → 步长 1e-6 下 RESET 交接可能整个不需要，根治方向=continuous 模式（`GFANC_MODE=continuous`，待验证）; ③ wc_cold_start=0.3 对 warm 交接是否过激进（0.5/0.7 未对比）
+- **验证方式**: 编译通过；实机重跑 250→500→250 序列对比切换后 err_rms 收敛水平（已做，结果见「未验证项①」）
+- **详见**: [场景切换交接_CNN权重vs_FxLMS自适应.md](场景切换交接_CNN权重vs_FxLMS自适应.md) — 完整根因分析（CNN vs FxLMS、收敛时间澄清、continuous 方向）
+- **回退方式**: `git checkout main_realtime.c` 或删除 `apply_reset` 里新增的 `wc_cold_start` 循环
+
 ### [2026-08-14] calibrate_secondary 砍掉次级路径辨识 — C 端只测环路延迟
 - **状态**: 工作区未提交
 - **基线**: 51d090b
