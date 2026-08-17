@@ -300,9 +300,22 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 
 ```bash
 # 4-① 运行实时版 + 纯音验证
-$env:GFANC_SEC_FILE="data/secondary_path.bin"; .\gfanc_realtime.exe
+#   ↓ 下面是【备忘】：按需复制单行，不是一次性脚本 ↓
 
-#    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB、零 RESET
+# 最简：默认直接跑（step 自动缩放 ~2.1e-7，cos 闸门切场景）
+.\gfanc_realtime.exe
+#    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB
+
+# 常用参数（每行独立，按需设；撤销 = Remove-Item Env:XXX）
+$env:GFANC_SEC_FILE="data/secondary_path.bin"   # 次级路径（默认已是它）
+$env:GFANC_SEC_MU='0'                            # 关在线 Ŝ（推荐）
+$env:GFANC_STEP='1e-6'                            # 步长：1e-6 降噪更深（日常推荐）；不设=自动缩放
+# 场景切换二选一（别同时设）：
+$env:GFANC_MODE='continuous'   # A. 关 RESET，FxLMS 自己爬（~1s 收敛，待验证）
+$env:GFANC_OCG='1'              # B. OCG 簇闸门（仅 reset 模式生效）
+$env:GFANC_OCG_HOLD='1'         #    HOLD：1=立即切 / 3=防抖（默认 3）
+$env:GFANC_WC_COLD='0.3'        # 交接衰减 30% 起步（=1 回满幅）
+Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction SilentlyContinue   # 一键回默认
 
 # 4-② 运行离线评估版（可选 — 处理一段噪声录音，见"运行示例"）
 ./main.exe "Noise Examples/road_noise_0-34.wav"
