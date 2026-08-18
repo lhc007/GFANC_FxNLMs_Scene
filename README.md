@@ -106,7 +106,7 @@
 ## 运行示例
 
 ```
-PS D:\VSCodeRepository\GFANC_FxNLMs_Scene> ./main.exe "Noise Examples/road_noise_0-34.wav"
+PS D:\VSCodeRepository\SceneZone-ANC> ./main.exe "Noise Examples/road_noise_0-34.wav"
 Loading weights...
   BP ANC: bandpass_anc.bin (64tap, gd=2.0ms)
   OK: sec=6144 pri=3072 sub=30720 bp=1024 L=1024
@@ -171,8 +171,8 @@ Done.
 ### 🎯 准备（阶段 0 — 必做，只做一次）
 
 ```bash
-git clone https://github.com/lhc007/GFANC_FxNLMs_Scene.git
-cd GFANC_FxNLMs_Scene
+git clone https://github.com/lhc007/SceneZone-ANC.git
+cd SceneZone-ANC
 
 pip install numpy scipy pandas torch torchaudio
 ```
@@ -356,7 +356,7 @@ Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction Silent
 ## 项目结构
 
 ```
-GFANC_FxNLMs_Scene/
+SceneZone-ANC/
 │
 ├── README.md              你正在看的文件
 ├── Makefile               编译脚本
