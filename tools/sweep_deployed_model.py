@@ -12,7 +12,7 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR.parent / 'GFANC_Scene'))
+sys.path.insert(0, str(SCRIPT_DIR.parent / 'SceneZone_Scene'))
 from layercam_diagnose import load_model, prep_1s, bandpass, freq_occlusion, top_fft_freqs
 
 FS = 16000

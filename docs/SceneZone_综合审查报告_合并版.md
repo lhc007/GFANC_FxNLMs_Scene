@@ -1,4 +1,4 @@
-# GFANC FxNLMs — 综合审查报告（合并版）
+# SceneZone ANC — 综合审查报告（合并版）
 
 > **合并日期**: 2026-08-03
 > **合并来源**: COMPREHENSIVE_REVIEW.md · code_review_report.md · ADVERSARIAL_REVIEW.md · WINDOW_ANC_SUPPLEMENT.md · UPGRADE_ROADMAP.md · 2026-08-03_深层审查报告.md（**6 份均已合并删除，2026-08-03**）
@@ -299,7 +299,7 @@
 | R-51 定性 | 125Hz 已定性为**延迟自激**（非外部声源） | 见 [窗户ANC可行性](窗户ANC可行性-因果限制_实测_方案.md) §3.3；处理=硬件调整 |
 
 **2026-08-05 本次会话修复**：
-- **ADV-D4 / R-28 `##__VA_ARGS__`**：LOG 宏改 C 标准兼容写法（`gfanc_types.h`，仅 main_realtime.c:735 一处调用，无行为变化）。
+- **ADV-D4 / R-28 `##__VA_ARGS__`**：LOG 宏改 C 标准兼容写法（`scenezone_types.h`，仅 main_realtime.c:735 一处调用，无行为变化）。
 - **ADV-F3 回调 WCET 监控**：新增 `GFANC_WCET` 门控的 rdtsc 计时（`main_realtime.c`），默认关零开销。
 
 **未变更（仍待 Phase-2/3）**：R-27（每文件 manifest/sha256 清单；**批次指纹 2026-08-12 已做**，见下）、R-30（梯度 E 归一化）、R-25/R-24（CNN 激活缓冲静态化/int8）、R-21（HAL）、ADV-E 系列（量产）。
@@ -505,7 +505,7 @@
 ### 中等 / 一般
 
 【R-9 配置集中化半途而废（cfg 死字段 / env 无效）· 一般 · [Phase-1]】
-- **位置**：gfanc_types.h:30,36-37,71-73；main_realtime.c:29-35
+- **位置**：scenezone_types.h:30,36-37,71-73；main_realtime.c:29-35
 - **问题描述**：5 个 cfg 字段为死字段；FADE_LEN/RAMP 等宏与 env 不一致 → 日志撒谎（设 800 显示 800 实际 400）。
 - **造成的影响**：调参工作流被隐性破坏。
 - **修复方案**：删死字段，时长参数改用 cfg 运行时值。
@@ -578,7 +578,7 @@
 - **修复状态**：✅ 已修复 (2026-07-28)；**复核：当前设备列表仅 ASIO 22/23**。
 
 【R-39 默认 mic_pre_gain=10x 过激 · 一般 · [Phase-1]】
-- **位置**：gfanc_types.h:54
+- **位置**：scenezone_types.h:54
 - **问题描述**：反馈抵消缺失时 gain 10x 触发声学正反馈啸叫。
 - **修复方案**：默认 1.0 + 自动增益（目标 ref≈0.03）。
 - **修复状态**：✅ 已修复 (2026-07-28)；**复核：默认 1.0 + auto-gain**。
@@ -602,7 +602,7 @@
 - **修复状态**：✅ 已修复 (2026-07-28)；**复核：sm_check_scene_switch(confirm=3)**。
 
 【R-46 标定抽取无抗混叠 + 默认参数过激 · 一般 · [Phase-1]】
-- **位置**：calibrate_feedback.c + gfanc_types.h
+- **位置**：calibrate_feedback.c + scenezone_types.h
 - **问题描述**：标定抽取无抗混叠；gain 3/step 1e-6/leak 1e-6 过激。
 - **修复方案**：biquad 抗混叠 + 默认 gain 1/step 5e-7/leak 5e-6。
 - **修复状态**：✅ 已修复 (2026-07-28)；**复核：calibrate_feedback biquad + 默认参数**。
@@ -620,7 +620,7 @@
 - **修复状态**：✅ 已修复 (2026-07-29, `79b9afc`)；**复核：单一救援块**。
 
 【R-54 diverge_anti_rms 阈值过高 · 一般 · [Phase-1]】
-- **位置**：gfanc_types.h:65；main_realtime.c:537
+- **位置**：scenezone_types.h:65；main_realtime.c:537
 - **问题描述**：gain=5-8× 下 anti_rms 被 out_gain 压低，0.25 阈值永不触发。
 - **修复方案**：阈值 `÷mic_pre_gain` 自适应。
 - **修复状态**：✅ 已修复 (2026-07-29, `79b9afc`)；**复核：`diverge_anti_rms / mic_pre_gain`**。
@@ -638,7 +638,7 @@
 - **修复状态**：✅ 已修复 (2026-07-29, `79b9afc`)；**复核：fb 加载门禁存在**。
 
 【R-58 关键参数未经系统性标定 · 一般 · [Phase-1]】
-- **位置**：main_realtime.c:851；gfanc_types.h:61
+- **位置**：main_realtime.c:851；scenezone_types.h:61
 - **问题描述**：wc_rms_target=0.03、leak=5e-6 为经验值。
 - **修复方案**：`GFANC_WC_TARGET`/`GFANC_LEAK` env 化 + 网格搜索流程。
 - **修复状态**：✅ 已修复 (2026-07-31，env 化)；参数标定进行中（用户已用 0.03/3e-7/0.5/10 组合）。
@@ -657,7 +657,7 @@
 
 【C3 magic number 散布 · 低 · [Phase-1]】
 - **位置**：main_realtime.c（wc_target/anti_est 窗口/WC_MUTE_DECAY/OUT_GAIN_SLEW）
-- **修复方案**：集中 `#define` + `TARGET_REF_RMS` 入 gfanc_types.h。
+- **修复方案**：集中 `#define` + `TARGET_REF_RMS` 入 scenezone_types.h。
 - **修复状态**：✅ 已修复 (2026-07-31, `a3ed34b`)；**复核：宏定义存在**。
 
 【R-19 Interlocked* 跨平台 · 一般 · [Phase-2]】
@@ -672,7 +672,7 @@
 - **修复状态**：✅ 已修复 (`a3ed34b`)；**复核：定长数组**。
 
 【R-23 FIR 延迟线 double · 严重[P3]】
-- **位置**：gfanc_types.h:13
+- **位置**：scenezone_types.h:13
 - **修复方案**：`gfanc_delay_t` + `GFANC_FLOAT_DELAY` 开关。
 - **修复状态**：✅ 已修复 (`a3ed34b`)；**复核：typedef + 开关**。
 
@@ -766,7 +766,7 @@
 
 
 【R-13-② 子滤波器重训 · 严重 · [训练侧] → ✅ 已重训 (2026-08-06)，收益待硬件验证】
-- **位置**：sub_filters.bin（原 1024tap bp 下训练）；GFANC_Scene/training/control_filters/Pre_training_broadband_and_decompose.py
+- **位置**：sub_filters.bin（原 1024tap bp 下训练）；SceneZone_Scene/training/control_filters/Pre_training_broadband_and_decompose.py
 - **问题描述**：ANC 通路换 64tap 后，CNN 预设 Wc 与信号域失配（自适应可纠正，初始收敛稍慢）。
 - **修复方案**：训练宽带滤波器 1024→64tap（已验证 `firwin(64,[20,1500])` ≡ `bandpass_anc.bin`）+ `USE_LOG_SPACING=False`（对齐 export）+ 重训导出 `sub_filters.bin`。顺带修复训练脚本相对路径 bug（CWD 无关）。
 - **验证方法**：离线实测新旧 sub_filters 内容差 10.7%，但**逐秒 NR 曲线完全一致**（默认/大步长均同）——收益仅体现在实时 CNN 暖启动（开机/切场景初始收敛），离线无法观测，⏳ 待窗户态实时验证。

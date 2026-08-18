@@ -2,7 +2,7 @@
 
 用法: python export/export_bin.py
 
-输出: data/*.bin + data/cnn_info.json + data/gfanc_config.json
+输出: data/*.bin + data/cnn_info.json + data/scenezone_config.json
 
 R-16-②: v2 格式添加 16B 头 {magic"GFNC", version, n_floats, crc32}.
 C 端 bin_load_float 自动检测 magic — 新格式校验, 旧格式直接加载.
@@ -25,8 +25,8 @@ _env_proj = os.environ.get('GFANC_PYTHON_PROJ', '')
 if _env_proj:
     PY_PROJ = Path(_env_proj)
 else:
-    # 默认: 项目根目录下的 GFANC_Scene
-    PY_PROJ = Path(os.path.dirname(os.path.abspath(__file__))).parent / 'GFANC_Scene'
+    # 默认: 项目根目录下的 SceneZone_Scene
+    PY_PROJ = Path(os.path.dirname(os.path.abspath(__file__))).parent / 'SceneZone_Scene'
 
 # CNN 模型 — 直接权重回归版优先, 否则回退到场景分类器 (backward compat)
 CNN_CKPT_DW  = PY_PROJ / 'models' / 'MIMO_M5_DirectWeight_Real.pth'
@@ -269,6 +269,6 @@ config = {
     'cnn_activation': 'tanh' if IS_DW else 'softmax',
     'n_cnn_out': K,
 }
-write_json('gfanc_config.json', config)
+write_json('scenezone_config.json', config)
 
 print(f'\nDone. All .bin files in {OUT_DIR}/')

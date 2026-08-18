@@ -1,7 +1,7 @@
 #ifndef FIR_FILTER_H
 #define FIR_FILTER_H
 
-#include "gfanc_types.h"
+#include "scenezone_types.h"
 
 /* ── 初始化 ── */
 void fir_init(fir_filter_t *f, const gfanc_float_t *coeffs, int n_taps);

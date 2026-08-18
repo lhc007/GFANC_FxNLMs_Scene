@@ -289,6 +289,6 @@ int main(void) {
 
     free(noise_16k); free(noise_hw); free(mic_hw); free(mic16);
     p_Pa_Terminate();
-    printf("\nDone. 运行 gfanc_realtime.exe 验证 (应显示 Loop delay auto-loaded).\n\n");
+    printf("\nDone. 运行 scenezone_realtime.exe 验证 (应显示 Loop delay auto-loaded).\n\n");
     return 0;
 }

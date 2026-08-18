@@ -45,7 +45,7 @@ N_SPEAKERS, N_BANDS, SC = 2, 15, 30
 SAMPLE_LEN = 16000
 _BP_PATH = _PROJECT_ROOT / 'models' / 'bandpass_fir.mat'
 _SUB_FILTER = MODELS_DIR / 'MIMO_Pretrained_Control_filters_broadband.mat'
-_NOISE_DIR = _PROJECT_ROOT.parent / 'Noise Examples'   # 基准录音在仓库根, 不在 GFANC_Scene/
+_NOISE_DIR = _PROJECT_ROOT.parent / 'Noise Examples'   # 基准录音在仓库根, 不在 SceneZone_Scene/
 
 # 基准录音 → 类型 tag (road 两文件合并为同一类, 与原始分析一致)
 TYPE_FILES = {

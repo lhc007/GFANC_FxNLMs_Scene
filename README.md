@@ -1,10 +1,10 @@
-# GFANC FxNLMS — 主动降噪系统 (ANC)
+# SceneZone ANC — 主动降噪系统 (ANC)
 
 > **版本**: v1.9 (2026-08-11) | **分支**: gfanc-direct-weight | 完整变更史见 [变更记录](docs/变更记录_CHANGELOG.md)
 
 ## 这是什么？
 
-一个**主动降噪（ANC）引擎**的纯 C 语言实现（Python 项目 [GFANC_Scene](GFANC_Scene) 的 C 移植）。原理和降噪耳机一样：
+一个**主动降噪（ANC）引擎**的纯 C 语言实现（Python 项目 [SceneZone_Scene](SceneZone_Scene) 的 C 移植）。原理和降噪耳机一样：
 
 > **"听"到噪声 → 算出与噪声波形相反的声音（反噪声）→ 用扬声器播放 → 噪声和反噪声在空中抵消**，就像噪声没来过一样。
 
@@ -60,8 +60,8 @@
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）；编译也可用 `make` / `make realtime`（Makefile 已含全部模块）。换硬件或换摆放后从零到实时运行的完整清单见 [换硬件检查单](#换硬件检查单)。
 
 > **想试场景切换（OCG 聚类闸门）？** 默认**关闭**（`GFANC_OCG=0`，稳定性最佳，日常开窗降噪用默认即可）。想验证"换噪声类型自动切换反相"时再开：
-> - **PowerShell**：`$env:GFANC_OCG="1"; ./gfanc_realtime.exe`（关掉：重开终端即可，或 `Remove-Item Env:GFANC_OCG`）
-> - **Git Bash / WSL**：`GFANC_OCG=1 ./gfanc_realtime.exe`
+> - **PowerShell**：`$env:GFANC_OCG="1"; ./scenezone_realtime.exe`（关掉：重开终端即可，或 `Remove-Item Env:GFANC_OCG`）
+> - **Git Bash / WSL**：`GFANC_OCG=1 ./scenezone_realtime.exe`
 > ⚠️ OCG 会在检测到新噪声类型时重置 Wc 以跟随，纯音深对消下可能引入抖动（实测证伪后默认关，见 [CHANGELOG](docs/变更记录_CHANGELOG.md)）——验证用，不是默认稳定配置。
 
 #### 怎么验证真的有效
@@ -184,20 +184,20 @@ pip install numpy scipy pandas torch torchaudio
 ```bash
 # 1-② 测次级路径 Ŝ（扬声器→误差麦，Farina 指数扫频法，SNR 最高、免疫时钟滑移）
 #     训练 + 运行共用输入，必须先测、先于任何训练
-#     脚本用相对路径找 Primary and Secondary Path/，需从 GFANC_Scene 目录运行
-cd GFANC_Scene
+#     脚本用相对路径找 Primary and Secondary Path/，需从 SceneZone_Scene 目录运行
+cd SceneZone_Scene
 python ../export/measure_secondary.py --interactive   # 首次：配置声卡设备
 python ../export/measure_secondary.py                 # 日常测量（--duration/--repetitions/--amplitude 见"次级路径测量"章节）
 cd ..
-#    → 覆盖 GFANC_Scene/Primary and Secondary Path/secondary_path.npy
+#    → 覆盖 SceneZone_Scene/Primary and Secondary Path/secondary_path.npy
 
 # 1-③ 测主路径 Pri（参考麦→误差麦）— 仅重训/离线评估需要
 #     [重要] 把扬声器从窗框拆下、搬到室外噪声源位置再接 (source-channel 对应其声卡输出通道)
 #     训练打标签/子滤波器用它; 运行时不用; 跳过训练可省 (离线评估 NR_true 也要它)
-cd GFANC_Scene
+cd SceneZone_Scene
 python ../export/measure_primary.py --source-channel 0 --duration 8 --repetitions 4
 cd ..
-#    → 覆盖 GFANC_Scene/Primary and Secondary Path/primary_path.npy
+#    → 覆盖 SceneZone_Scene/Primary and Secondary Path/primary_path.npy
 
 # 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
@@ -230,7 +230,7 @@ python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
 
 # 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
 #    输入: Primary and Secondary Path/{primary,secondary}_path.npy（Pri 扰动 + Ŝ 滤波参考, MIMO FxNLMS 训练必需）
-cd GFANC_Scene
+cd SceneZone_Scene
 python training/control_filters/Pre_training_broadband_and_decompose.py
 #    → models/MIMO_Pretrained_Control_filters_broadband.mat
 #      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
@@ -283,14 +283,14 @@ python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWe
 cd ..
 python export/export_bin.py
 #    → data/*.bin；检测到 DW 模型则直接权重模式（30 维 + tanh，跳过 scene_defs.bin）
-#    默认自动查找同级目录的 GFANC_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\GFANC_Scene
+#    默认自动查找同级目录的 SceneZone_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\SceneZone_Scene
 ```
 
 ### 🎯 编译（阶段 3 — 必做）
 
 ```bash
 # 3-① 编译实时版
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o gfanc_realtime.exe
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o scenezone_realtime.exe
 
 # 3-② 编译离线评估版（可选 — 处理 WAV 算 NR_true，见"离线验证"）
 gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
@@ -303,7 +303,7 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 #   ↓ 下面是【备忘】：按需复制单行，不是一次性脚本 ↓
 
 # 最简：默认直接跑（step 自动缩放 ~2.1e-7，cos 闸门切场景）
-.\gfanc_realtime.exe
+.\scenezone_realtime.exe
 #    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB
 
 # 常用参数（每行独立，按需设；撤销 = Remove-Item Env:XXX）
@@ -329,7 +329,7 @@ Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction Silent
 
 > 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 2（训练数据）** 的 2-⑦ 步，导出为 C 二进制。
 
-直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [GFANC_Scene](../GFANC_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
+直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [SceneZone_Scene](../SceneZone_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
 
 ### 数据与标签
 
@@ -349,7 +349,7 @@ Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction Silent
 - **何时重跑 CNN 输入带通（2-⓪）**：降噪范围变更时。`python export/gen_bandpass_fir.py --f-low 50 --f-high 1500` 重生成 `models/bandpass_fir.mat`（文件名与频率无关，改范围不连带改脚本路径）。**降噪范围四处必须一致**：`bandpass_fir.mat`（CNN 输入）＝ `Pre_training` 的 `f_low` ＝ `export_bin.py` 的 `bandpass_anc` ＝ `generate_synthetic.py` 的 `BAND_LO`。
 - **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
 - **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-④ 打标签自动加载 broadband.mat，无需另改）。
-- **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`gfanc_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
+- **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`scenezone_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
 - **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
 - **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线 = 2-⑤ `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入；实测 **35.1% 未达标 ≥70%**（根因/下一步见上方阶段 2 ⚠️ 注）
 
@@ -365,7 +365,7 @@ GFANC_FxNLMs_Scene/
 ├── main_realtime.c        【实时降噪】主程序 — 麦克风输入/扬声器输出
 │
 ├── include/               头文件（API 定义）
-│   ├── gfanc_types.h      基础类型（FIR 滤波器）
+│   ├── scenezone_types.h      基础类型（FIR 滤波器）
 │   ├── fir_filter.h       FIR 滤波器
 │   ├── scene_controller.h CNN 直接权重 Wc 生产者
 │   ├── fxnlms_mimo.h      自适应降噪算法（离线+实时双路径）
@@ -388,7 +388,7 @@ GFANC_FxNLMs_Scene/
 │   └── ...
 │
 ├── docs/                  文档
-│   ├── GFANC_综合审查报告_合并版.md  综合审查（唯一审查文档，七段式）
+│   ├── SceneZone_综合审查报告_合并版.md  综合审查（唯一审查文档，七段式）
 │   ├── micphone.md        麦克风数据手册
 │   └── 2026-07-28_硬件调试记录.md  UMC404HD 面板操作指引 + 调试记录
 │
@@ -514,7 +514,7 @@ ref → bp_anc(64tap) → Ŝ ⊗ ref → bp_anc(64tap) → Fx → anti = Wc ⊗ 
 
 反馈抵消功能需逐扬声器校准声学路径。校准命令见上文 **完整命令流 · 阶段 1-⑤**（`calibrate_feedback.exe` → `feedback_path_0/1.bin`）。
 
-校准完成后运行 `./gfanc_realtime.exe`，启动日志显示：
+校准完成后运行 `./scenezone_realtime.exe`，启动日志显示：
 ```
 Feedback spk0: 512 taps, RMS=0.0012
 Feedback spk1: 512 taps, RMS=0.0011
@@ -526,7 +526,7 @@ Feedback spk1: 512 taps, RMS=0.0011
 
 ## 次级路径测量（Python，Farina 扫频法）
 
-提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦。**测量命令见上文 完整命令流 · 阶段 1-②**（需从 `GFANC_Scene` 目录运行，脚本用相对路径找 `Primary and Secondary Path/`）。工具额外支持：
+提供 Python 指数正弦扫频测量工具，与 C 实时系统解耦。**测量命令见上文 完整命令流 · 阶段 1-②**（需从 `SceneZone_Scene` 目录运行，脚本用相对路径找 `Primary and Secondary Path/`）。工具额外支持：
 
 - `--interactive`：首次使用配置声卡设备
 - `--duration <秒>` / `--repetitions <次数>`：延长扫频 / 多次重复时域平均，提高 SNR
@@ -671,7 +671,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `src/calibrate_feedback.c` | 反馈路径 NLMS 校准 (逐扬声器, 16k ZOH×3 激励) |
 | `src/calibrate_secondary.c` | 环路延迟/滑移测量（→ `sec_bulk_delay.bin`），v5 只测延迟不再产出 Ŝ |
 | `src/binary_loader.c` | .bin 二进制权重文件加载 (v2 格式, GFNC 头+CRC32) |
-| `include/gfanc_types.h` | 集中参数 + 分级日志 + 维度宏 |
+| `include/scenezone_types.h` | 集中参数 + 分级日志 + 维度宏 |
 | `include/scene_manager.h` | 共享纯函数 (main.c + main_realtime.c 共用); `sm_cos_sim`(reset 判定)/`sm_wc_max_abs`/`sm_check_divergence`/`sm_check_convergence`; v1.6 已删 `sm_scene_switch_execute`/`sm_first_sec_init`/`sm_check_scene_switch`/`sm_wc_rms` 死代码 |
 | `include/sec_online.h` | 在线 Ŝ 辨识 API |
 | `include/cnn_m5_forward.h` | CNN 实例化 API |
@@ -679,7 +679,7 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 | `export/measure_secondary.py` | Python 次级路径测量 (Farina 扫频法) |
 | `export/measure_primary.py` | Python 初级路径测量 |
 | `export/measurement/` | 测量核心模块 (扫频生成/反卷积/质量检验) |
-| `GFANC_Scene/` | Python 项目 (训练代码 + 模型权重 + 声学路径测量数据) |
+| `SceneZone_Scene/` | Python 项目 (训练代码 + 模型权重 + 声学路径测量数据) |
 
 ## 离线验证
 

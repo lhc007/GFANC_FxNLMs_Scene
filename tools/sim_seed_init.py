@@ -15,13 +15,13 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR.parent / 'GFANC_Scene'))
+sys.path.insert(0, str(SCRIPT_DIR.parent / 'SceneZone_Scene'))
 from layercam_diagnose import load_model, prep_1s, bandpass
 import sim_step_sweep as sim
 
 FS = 16000
 S, C, L = 2, 15, 1024
-WC_TARGET = 0.01            # gfanc_types.h 默认 wc_rms_target (GFANC_WC_TARGET 未设)
+WC_TARGET = 0.01            # scenezone_types.h 默认 wc_rms_target (GFANC_WC_TARGET 未设)
 
 def load_sub_filters():
     import struct

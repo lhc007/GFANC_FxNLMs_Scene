@@ -25,7 +25,7 @@
 #ifndef OCG_H
 #define OCG_H
 
-#include "gfanc_types.h"
+#include "scenezone_types.h"
 
 #define OCG_MAX_CLUSTERS 8   /* 簇上限 (LRU 淘汰); 典型噪声模式 1-3 簇足够 */
 

@@ -409,6 +409,6 @@ int main(void) {
     /* 清理 */
     free(noise_16k); free(ref_hw); free(ref_16k);
 
-    printf("\nDone. Now run gfanc_realtime.exe with feedback cancellation.\n\n");
+    printf("\nDone. Now run scenezone_realtime.exe with feedback cancellation.\n\n");
     return 0;
 }

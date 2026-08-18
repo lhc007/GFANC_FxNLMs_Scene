@@ -1,7 +1,7 @@
-# GFANC FxNLMs — offline + realtime + calibration builds
+# SceneZone ANC — offline + realtime + calibration builds
 #
 #   make            → 编译离线版 main.exe
-#   make realtime   → 编译实时版 gfanc_realtime.exe
+#   make realtime   → 编译实时版 scenezone_realtime.exe
 #   make calibrate  → 编译反馈路径校准程序 calibrate_feedback.exe
 #   make all        → 全部编译
 #   make clean      → 清理编译产物
@@ -25,13 +25,13 @@ all: main.exe realtime calibrate
 main.exe: main.c $(MODULES)
 	$(CC) $(CFLAGS) main.c $(MODULES) $(LDFLAGS) -o $@
 
-gfanc_realtime.exe: main_realtime.c $(MODULES) $(RT_MODULES)
+scenezone_realtime.exe: main_realtime.c $(MODULES) $(RT_MODULES)
 	$(CC) $(CFLAGS_RT) main_realtime.c $(MODULES) $(RT_MODULES) $(LDFLAGS_RT) -o $@
-realtime: gfanc_realtime.exe
+realtime: scenezone_realtime.exe
 
 calibrate_feedback.exe: src/calibrate_feedback.c $(CAL_MODULES)
 	$(CC) $(CFLAGS_RT) src/calibrate_feedback.c $(CAL_MODULES) $(LDFLAGS_RT) -o $@
 calibrate: calibrate_feedback.exe
 
 clean:
-	rm -f main.exe gfanc_realtime.exe calibrate_feedback.exe anti_out.wav error_out.wav
+	rm -f main.exe scenezone_realtime.exe calibrate_feedback.exe anti_out.wav error_out.wav

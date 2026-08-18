@@ -31,6 +31,28 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-18] 项目重命名 — GFANC FxNLMS → SceneZone ANC（L2: 对外名 + 文件名）
+- **状态**: 已提交（随本提交落库）
+- **基线**: 2f29779
+- **变更代码**:
+  - 重命名: `include/gfanc_types.h` → `include/scenezone_types.h`（`fir_filter.h`/`ocg.h`/`scene_controller.c` 3 处 `#include` 同步）
+  - 重命名: `data/gfanc_config.json` → `data/scenezone_config.json`（`export/export_bin.py` 写出名同步）
+  - 重命名: `docs/GFANC_综合审查报告_合并版.md` → `docs/SceneZone_综合审查报告_合并版.md`（README/窗户可行性/论文知识 3 处链接同步）
+  - 重命名: `GFANC_Scene/` → `SceneZone_Scene/`（`export/*.py`、`tools/*.py`、README 命令路径同步；`gfanc/` Python 包名保留）
+  - 修改: 可执行名 `gfanc_realtime.exe` → `scenezone_realtime.exe`（Makefile 目标 + `main_realtime.c:5` 注释 + `calibrate_*.c` printf + README/docs 命令）
+  - 修改: 日志名 `gfanc_log.csv` → `scenezone_log.csv`（`main_realtime.c` fopen + `.gitignore`）
+  - 修改: README/审查报告标题与叙述、`main_realtime.c` 头注释（项目名 → SceneZone ANC）
+  - 重命名: 分支 `gfanc-direct-weight` → `scenezone-anc`
+- **变更原因**: 项目对外品牌从 GFANC FxNLMS 改为 SceneZone ANC（空间区域 + 场景自适应主动降噪）。
+- **造成影响**:
+  - 行为: 实时运行命令变为 `scenezone_realtime.exe`；代码内部标识符（`GFANC_*` 环境变量/宏、`gfanc_*` 类型/函数）**未改**，运行时 API 不变
+  - 配置: 所有环境变量保留（`GFANC_STEP`、`GFANC_OCG` 等）；`GFANC_PYTHON_PROJ` 指向的目录名随 `SceneZone_Scene` 调整
+  - 测试/回归: `make all` 编译零警告；离线冒烟通过
+  - 性能/内存: 无
+  - 未验证项: 实机 ASIO 运行未验证
+- **验证方式**: `make clean && make all` 零警告零错误；`./main.exe "Noise Examples/road_noise_0-34.wav"` 跑通；grep 残留扫描只剩代码标识符/CHANGELOG 历史/学术引用（`MIMO_GFANC`/论文知识 GFANC 谱系）
+- **回退方式**: 重命名均为 git rename（历史保留），内容引用可 git revert 恢复旧名
+
 ### [2026-08-17] RESET 交接施加 wc_cold_start 衰减 — 治 250→500 转换对消差
 - **状态**: 工作区未提交
 - **基线**: 0a571fe

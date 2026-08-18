@@ -93,7 +93,7 @@ typedef struct {
     float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
     float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */
 
-    /* 去场景层 (gfanc-direct-weight): 无场景切换, CNN 只产 Wc.
+    /* 去场景层 (scenezone-anc): 无场景切换, CNN 只产 Wc.
        模式: 0=continuous (CNN 仅首秒初始化, FxNLMS 永不重置),
              1=reset (多质心 OCG 簇索引闸门 → CrossFader 重置). */
     int   gfanc_mode;          /* env: GFANC_MODE=reset|continuous */

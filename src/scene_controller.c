@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "gfanc_types.h"
+#include "scenezone_types.h"
 #include "scene_controller.h"
 #include "cnn_m5_forward.h"
 

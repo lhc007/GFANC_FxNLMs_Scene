@@ -13,7 +13,7 @@ import os, sys, torch
 from pathlib import Path
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-PY_PROJ = SCRIPT_DIR.parent / 'GFANC_Scene'
+PY_PROJ = SCRIPT_DIR.parent / 'SceneZone_Scene'
 
 # 固定种子 → 可复现的合成权重 (不影响管道验证; 真实模型会覆盖)
 torch.manual_seed(20260807)

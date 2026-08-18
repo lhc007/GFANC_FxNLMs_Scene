@@ -34,7 +34,7 @@ FS = 16000
 E, S, L = 3, 2, 1024
 M = 64                      # 块长 (与收敛速率等价, 见头注)
 LOOP_DELAY = 195            # sec_bulk_delay.bin 实测环路 @16k
-STEP_BASE = 1e-7            # gfanc_types.h 默认 (GFANC_STEP 覆盖前)
+STEP_BASE = 1e-7            # scenezone_types.h 默认 (GFANC_STEP 覆盖前)
 LEAK_BASE = 5e-7
 S_TARGET = 0.02             # step 自动缩放设计目标 Ŝ_RMS
 

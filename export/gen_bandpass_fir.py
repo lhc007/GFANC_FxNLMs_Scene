@@ -1,7 +1,7 @@
 """生成 CNN 输入带通 FIR (.mat) — 与部署 bandpass_fir.bin 同源.
 
 背景:
-  `GFANC_Scene/models/bandpass_fir.mat` 是 CNN 输入带通的唯一来源 (过去是来路不明的
+  `SceneZone_Scene/models/bandpass_fir.mat` 是 CNN 输入带通的唯一来源 (过去是来路不明的
   静态 .mat, 2026-08-14 补上生成脚本). 训练/导出脚本只「读」它 (fir_bandpass_coeff),
   从不「写」它. 本脚本补上来源, 使其可复现. 2026-08-14 整套降噪范围折中为 50-1500Hz.
 
@@ -9,7 +9,7 @@
     python export/gen_bandpass_fir.py [--f-low 50 --f-high 1500 --taps 1024]
 
 输出:
-    GFANC_Scene/models/bandpass_fir.mat   (固定文件名, 与频率无关 — 改范围不连带改路径)
+    SceneZone_Scene/models/bandpass_fir.mat   (固定文件名, 与频率无关 — 改范围不连带改路径)
     键: fir_bandpass_coeff(1,taps,float64) + fs/f_low/f_high/n_taps(标量 int)
 
 与 C 端 / 训练端一致性:
@@ -23,7 +23,7 @@ from pathlib import Path
 from scipy import signal
 from scipy.io import savemat
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / 'GFANC_Scene' / 'models'
+MODELS_DIR = Path(__file__).resolve().parent.parent / 'SceneZone_Scene' / 'models'
 
 
 def main():

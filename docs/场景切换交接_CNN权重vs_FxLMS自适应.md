@@ -1,7 +1,7 @@
 # 场景切换交接：CNN 直接权重 vs FxLMS 自适应（结论）
 
 > 日期：2026-08-17 ｜ 状态：已修复（30% 交接）+ 待验证（continuous 模式）
-> 关联：变更记录 [[变更记录_CHANGELOG.md]] 2026-08-17 条目 ｜ 分支 `gfanc-direct-weight`
+> 关联：变更记录 [[变更记录_CHANGELOG.md]] 2026-08-17 条目 ｜ 分支 `scenezone-anc`
 
 **一句话结论**：RESET 交接「信 CNN 不信 FxLMS」的设计，在当前步长（1e-6）下已经不成立——FxLMS 自己 1 秒就能收敛到新场景，CNN 那份权重反而成了累赘。30% 起步只是"减震"，根治方向是关掉 RESET（continuous）。
 
@@ -73,7 +73,7 @@ A. **关掉 RESET 走 continuous**（最彻底，砍掉"信 CNN"这一步）：
 ```powershell
 $env:GFANC_STEP='1e-6'
 $env:GFANC_MODE='continuous'
-.\gfanc_realtime.exe
+.\scenezone_realtime.exe
 ```
 预期：250→500 全程靠 FxLMS 自己爬，~1 秒到位、无 spike。若 250→500→250 都稳，则「CNN 直接权重 + 切场景」可简化为「首帧 CNN 起跳 + FxLMS 永续自适应」。
 

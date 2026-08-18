@@ -354,7 +354,7 @@ def main():
     USE_LOG_SPACING = False   # True: 对数间距 (23~1299Hz), False: 均匀间距 (50~1500Hz)
     # =============================================================
 
-    # 路径全部锚定到 GFANC_Scene 项目根 (CWD 无关, 从任意目录可运行)
+    # 路径全部锚定到 SceneZone_Scene 项目根 (CWD 无关, 从任意目录可运行)
     _PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
     MODELS_DIR = os.path.join(_PROJ_ROOT, 'models')
 

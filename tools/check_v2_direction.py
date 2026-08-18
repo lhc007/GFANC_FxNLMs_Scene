@@ -12,7 +12,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
-sys.path.insert(0, str(ROOT / 'GFANC_Scene'))
+sys.path.insert(0, str(ROOT / 'SceneZone_Scene'))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import numpy as np
@@ -61,10 +61,10 @@ def probe_dir(model, x):
 
 def main():
     models = [
-        ('纯合成预训练', str(ROOT / 'GFANC_Scene/models/MIMO_M5_DirectWeight_Pretrain.pth')),
-        ('v2 (合成预训+微调)', str(ROOT / 'GFANC_Scene/models/MIMO_M5_DirectWeight_Real_v2.pth')),
-        ('当前部署 (从零真实)', str(ROOT / 'GFANC_Scene/models/MIMO_M5_DirectWeight_Real.pth')),
-        ('baseline_35pct', str(ROOT / 'GFANC_Scene/models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth')),
+        ('纯合成预训练', str(ROOT / 'SceneZone_Scene/models/MIMO_M5_DirectWeight_Pretrain.pth')),
+        ('v2 (合成预训+微调)', str(ROOT / 'SceneZone_Scene/models/MIMO_M5_DirectWeight_Real_v2.pth')),
+        ('当前部署 (从零真实)', str(ROOT / 'SceneZone_Scene/models/MIMO_M5_DirectWeight_Real.pth')),
+        ('baseline_35pct', str(ROOT / 'SceneZone_Scene/models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth')),
     ]
     freqs = [250, 500, 1000, 1500]
     print(f'{"模型":28s}  {"250↔500":>10s} {"250↔1000":>10s} {"250↔1500":>10s}  {"方向区分":>10s}')

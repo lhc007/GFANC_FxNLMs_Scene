@@ -2,7 +2,7 @@
 """P2 LayerCAM 离线诊断 — 部署 CNN (m5_scene 直接权重) 决策归因.
 
 纯离线诊断脚本, 不进实时链. 用途:
-  1. 复现 C 运行时 CNN 前向 — 从 data/*.bin 载权 (与 gfanc_realtime 逐位一致),
+  1. 复现 C 运行时 CNN 前向 — 从 data/*.bin 载权 (与 scenezone_realtime 逐位一致),
      输出 30 维 tanh 增益 + top 频带 (对齐实时日志 "top=2(21%) 17(15%)...").
   2. LayerCAM — 目标频带增益对最深层卷积特征图的梯度加权求和 → 时间热力图,
      定位 CNN "看" 的时域窗口.
@@ -30,7 +30,7 @@ from scipy import signal as sig
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR   = SCRIPT_DIR.parent / 'data'
-PY_PROJ    = SCRIPT_DIR.parent / 'GFANC_Scene'
+PY_PROJ    = SCRIPT_DIR.parent / 'SceneZone_Scene'
 sys.path.insert(0, str(PY_PROJ))
 
 FS   = 16000          # ANC 处理采样率 (与 C 运行时一致)

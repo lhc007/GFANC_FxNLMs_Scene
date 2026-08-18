@@ -4,7 +4,7 @@
  *  注意: 此模块仅包含纯函数 (无 I/O, 无线程同步, 无全局状态).
  *        线程同步 (Interlocked + wc_shadow) 和 I/O 仍由各自主程序处理.
  *
- *  gfanc-direct-weight (v1.6): 已删除场景记忆/切换/滞回死代码
+ *  scenezone-anc (v1.6): 已删除场景记忆/切换/滞回死代码
  *    (sm_scene_switch_execute / sm_first_sec_init / sm_check_scene_switch / sm_wc_rms),
  *    保留直接权重模式仍在用的纯函数.
  */

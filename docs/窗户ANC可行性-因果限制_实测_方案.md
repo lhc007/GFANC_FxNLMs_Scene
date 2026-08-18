@@ -399,4 +399,4 @@ MIMO FxLMS 算力 ∝ E×S×L,**与通道数平方级增长**(8spk/8mic = 64 条
 - Luo et al., "Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter Active Noise Control", *Mechanical Systems and Signal Processing*, 2024. 代码: https://github.com/lhc007/SFANC-Window (1 参考麦 + 4 扬声器 + 4 误差麦 + ShuffleNetV2 选 7 固定滤波器,开环前馈,误差麦仅训练用)
 - Ratering et al., "Wave-Domain Approach for Cancelling Noise Entering Open Windows", ICASSP 2022(误差麦无关的波域方法,模拟 <2kHz 全局 −10dB). https://ieeexplore.ieee.org/document/9746829
 - Zou et al., "Active sound radiation control with secondary sources at the edge of the opening", *Applied Acoustics*.
-- 相关: [GFANC_综合审查报告_合并版.md](GFANC_综合审查报告_合并版.md) §物理层瓶颈
+- 相关: [SceneZone_综合审查报告_合并版.md](SceneZone_综合审查报告_合并版.md) §物理层瓶颈

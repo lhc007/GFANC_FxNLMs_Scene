@@ -1,8 +1,8 @@
-/** GFANC FxNLMS — PortAudio callback realtime ANC.
+/** SceneZone ANC — PortAudio callback realtime ANC.
  *
  * 编译: gcc -O2 -Iinclude main_realtime.c src/scene_controller.c
  *       src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c
- *       src/cnn_m5_forward.c src/pa_loader.c -lm -o gfanc_realtime.exe
+ *       src/cnn_m5_forward.c src/pa_loader.c -lm -o scenezone_realtime.exe
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,7 +146,7 @@ typedef struct {
     volatile LONG cnn_buf_ready; /* -1=无就绪, 0/1=该块已满待主线程处理 */
     int    first_sec;
 
-    /* 去场景层 (gfanc-direct-weight): 无场景记忆/切换/OCG.
+    /* 去场景层 (scenezone-anc): 无场景记忆/切换/OCG.
        单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
@@ -802,7 +802,7 @@ static void check_convergence(rt_ctx_t *ctx) {
     }
 }
 
-/* 去场景层 (gfanc-direct-weight): Reset 模式触发 — 无场景记忆, 直接过渡到
+/* 去场景层 (scenezone-anc): Reset 模式触发 — 无场景记忆, 直接过渡到
    scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用.
    P0-6 (2026-08-14) 软重锚定: 场景切换只做 crossfade(wc_old→wc_cur) + 重锚定,
    去掉 cold_hold/mute — 那 3.5s 打断本是冷启动保护, 场景切换用 peak_mute 兜底即可.
@@ -1229,7 +1229,7 @@ int main(void) {
     printf("Running...\n");
 
     /* 运行时统计日志 (C1) */
-    ctx->log_file = fopen("gfanc_log.csv", "a");
+    ctx->log_file = fopen("scenezone_log.csv", "a");
     if (ctx->log_file) {
         gf_log_timestamp(ctx->log_file, "start");  /* R-28: 可移植时间戳 */
         fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event,k_cluster,n_clusters\n");
