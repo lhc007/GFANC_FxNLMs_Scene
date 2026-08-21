@@ -154,8 +154,14 @@ typedef struct {
        单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
-    int    snapshot_capable;      /* 方案C: adapt 曾收敛 (Ctrl+C 自动保存标定滤波器判据) */
+    int    snapshot_capable;      /* 方案C: adapt 曾收敛 (自动保存标定滤波器判据: NR 或 Wc 稳定) */
     int    fixed_wc_loaded;       /* 方案C: fixed 启动已加载 data/wc_fixed.bin (静态, CNN 不覆盖) */
+    /* 方案C 标定 (Wc 稳定性自动保存): FxLMS 把 Wc 从 CNN 初值长到工作振幅后,
+       每秒相对变化 <5%, 连续 3 秒即判收敛 → 运行中自动保存, 不用掐 Ctrl+C. */
+    float  wc_prev_sec[S*L];      /* 上一秒 Wc 快照 (稳定性对比) */
+    float  wc_init_rms;           /* 首秒捕获 CNN 初值 Wc RMS (~0.01 几乎无声) — 工作点判定基准 */
+    int    wc_stable_sec;         /* Wc 连续稳定秒数 */
+    int    wc_autosaved;          /* 已自动保存标定滤波器 (一次性) */
     float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
     int    reset_pending;         /* cos<τ 连续秒数 (RESET 迟滞, 达 reset_hyst 才触发) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
@@ -811,6 +817,78 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     }
 }
 
+/* ── 方案C 标定: Wc 稳定性收敛 → 运行中自动保存 data/wc_fixed.bin.
+   不用盯 NR / 掐 Ctrl+C 时机. FxLMS 把 Wc 从 CNN 初值 (~0.01, 几乎无声) 长到
+   工作振幅后, 每秒相对变化降到 < WC_STABLE_RATIO, 连续 WC_STABLE_SECS 秒即判
+   收敛 → 立即自动保存. 防误存静音滤波器的双重保护:
+   1) Wc RMS 必须长到初值 WC_GROW_FACTOR 倍以上 (初值~0.01 → 需 ≥ ~0.03);
+   2) 安静/冻结/发散/mute 期间跳过 (Wc 衰减或静止 ≠ 收敛).
+   注意: 标定信号要用稳态宽带噪声 (或真实噪声), 不要用扫频 — 扫频频率在动,
+   最优 Wc 跟着动永远稳不下来, 存出的只是窄带滤波器 (只能消一个频段). ── */
+/* 阈值说明: leak 随 anti 自适应放大 (max 10× = 5e-6/样本 ≈ 每秒 0.8% 相对衰减),
+   稳态 net≈0 (梯度抵消 leak) 但残差波动 ~3-5%/秒, 故阈值取 5% 而非 2% —
+   太紧 (如 2%) 会因 leak 波动永远判不到稳定. 生长期变化 >10%/秒, 3s 窗口不会误触发. */
+#define WC_STABLE_RATIO   0.05f   /* 每秒相对变化 <5% 视为稳定 */
+#define WC_STABLE_SECS    3       /* 连续稳定秒数 */
+#define WC_GROW_FACTOR    3.0f    /* Wc RMS ≥ 初值 3× 才算长到工作点 */
+
+static float wc_rms(const float *x, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += x[i] * x[i];
+    return sqrtf(s / (float)n);
+}
+
+static void check_wc_stable_autosave(rt_ctx_t *ctx) {
+    if (ctx->wc_autosaved) return;                    /* 已保存过 (一次性) */
+    if (ctx->safety_mute || ctx->diverged || ctx->quiet_active
+        || ctx->fx.freeze_lms) {                      /* 这些状态 Wc 不可信 */
+        ctx->wc_stable_sec = 0;
+        return;
+    }
+
+    float rms = wc_rms(ctx->wc_snapshot, S * L);
+    if (ctx->wc_init_rms <= 0.0f) {                   /* 首秒: 捕获初值基线 */
+        ctx->wc_init_rms = (rms > 1e-5f) ? rms : 0.01f;
+        memcpy(ctx->wc_prev_sec, ctx->wc_snapshot, S * L * sizeof(float));
+        return;
+    }
+    /* 工作点判据: Wc RMS ≥ 初值 3×. 初值取 max(捕获值, 0.01) — 冷启动 30%
+       软化使捕获值可能只有 ~0.003, 用它当基准会把"没长起来"误判成工作点.
+       0.01 是 CNN 生成式 RMS 目标 (代码注释"几乎无声"), 正是静音/工作的分界. */
+    float base = (ctx->wc_init_rms > 0.01f) ? ctx->wc_init_rms : 0.01f;
+    if (rms < WC_GROW_FACTOR * base) {                /* 还没长到工作点 */
+        ctx->wc_stable_sec = 0;
+        memcpy(ctx->wc_prev_sec, ctx->wc_snapshot, S * L * sizeof(float));
+        return;
+    }
+
+    float d = 0.0f, en = 0.0f;                        /* 每秒相对变化 |ΔWc|/|Wc| */
+    for (int i = 0; i < S * L; i++) {
+        float df = ctx->wc_snapshot[i] - ctx->wc_prev_sec[i];
+        d += df * df; en += ctx->wc_snapshot[i] * ctx->wc_snapshot[i];
+    }
+    float delta = (d > 0.0f && en > 0.0f) ? sqrtf(d / en) : 1.0f;
+    if (delta < WC_STABLE_RATIO) ctx->wc_stable_sec++;
+    else                         ctx->wc_stable_sec = 0;
+    memcpy(ctx->wc_prev_sec, ctx->wc_snapshot, S * L * sizeof(float));
+
+    if (ctx->wc_stable_sec >= WC_STABLE_SECS) {
+        FILE *f = fopen("data/wc_fixed.bin", "wb");
+        if (f) {
+            fwrite(ctx->wc_snapshot, sizeof(float), S * L, f);
+            fclose(f);
+            ctx->wc_autosaved = 1;
+            ctx->snapshot_capable = 1;   /* Ctrl+C 兜底也认 */
+            printf("\n[SAVE] 标定完成! Wc 已收敛 (Δ<%.0f%%/秒 持续 %ds, RMS=%.4f ≥ %.1f×初值)\n"
+                   "       data/wc_fixed.bin 已自动保存 — 之后 fixed 模式直接加载, 可 Ctrl+C 退出\n",
+                   WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR);
+        } else {
+            fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
+            ctx->wc_stable_sec = 0;
+        }
+    }
+}
+
 static void check_convergence(rt_ctx_t *ctx) {
     /* C1: 使用共享收敛检测. 去场景层: 收敛样本写回单一 known-good Wc
        (last_good_wc), 供发散救援/freeze 回滚; 无场景记忆, offset 恒 0. */
@@ -1403,10 +1481,11 @@ int main(void) {
             }
 
             /* 方案C fixed: 无梯度不可能发散, 收敛/发散检测跳过 (wc_init_max 对比无意义);
-               adapt 下正常跑 (收敛标记供 Ctrl+C 自动保存标定滤波器). */
+               adapt 下正常跑 (收敛标记 + Wc 稳定性自动保存标定滤波器). */
             if (!anc_fixed()) {
                 check_wc_divergence(ctx);
                 check_convergence(ctx);
+                check_wc_stable_autosave(ctx);  /* 方案C: Wc 收敛稳定 → 运行中自动保存标定 */
             }
 
             /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
@@ -1511,9 +1590,12 @@ int main(void) {
     p_Pa_StopStream(stream);
     p_Pa_CloseStream(stream);
 
-    /* ── 方案C 全自动标定: adapt 曾收敛 → Ctrl+C 退出时自动保存标定滤波器.
+    /* ── 方案C 全自动标定: adapt 曾收敛 → Ctrl+C 退出时自动保存标定滤波器
+       (Wc 稳定性检测已在运行中自动保存过则跳过; 此处兜底 NR 收敛路径).
        fx.wc = 当前工作滤波器 (带本设备绝对振幅+相位), 流已停无并发写. ── */
-    if (ret == 0 && !anc_fixed() && ctx->snapshot_capable) {
+    if (ret == 0 && !anc_fixed() && ctx->wc_autosaved) {
+        printf("[SAVE] 标定滤波器已在运行中自动保存 (data/wc_fixed.bin), 无需重复保存\n");
+    } else if (ret == 0 && !anc_fixed() && ctx->snapshot_capable) {
         FILE *f = fopen("data/wc_fixed.bin", "wb");
         if (f) {
             fwrite(ctx->fx.wc, sizeof(float), S * L, f);
@@ -1523,8 +1605,8 @@ int main(void) {
         } else {
             fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
         }
-    } else if (ret == 0 && !anc_fixed() && !ctx->snapshot_capable) {
-        printf("[SAVE] 跳过: 未检测到收敛 (NR>3dB 持续 3s), 未保存 data/wc_fixed.bin\n");
+    } else if (ret == 0 && !anc_fixed()) {
+        printf("[SAVE] 跳过: 未检测到收敛 (NR>3dB 或 Wc 稳定均未达到), 未保存 data/wc_fixed.bin\n");
     }
 
 cleanup:

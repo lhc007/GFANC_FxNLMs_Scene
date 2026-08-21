@@ -309,8 +309,8 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 # 双模式（方案C, 2026-08-21; 详细见下方「双模式」）：
 #   fixed = 开环 µ=0 无误差麦。首次用 fixed 前先标定一次（全自动，零环境变量）：
 Remove-Item Env:GFANC_ANC_MODE, Env:GFANC_WC_TARGET -ErrorAction SilentlyContinue
-.\scenezone_realtime.exe      # ① 标定（需误差麦）: 放噪音/慢速全带扫频 → 听到降噪后 Ctrl+C
-#                               日志出现 "[SAVE] 已保存标定滤波器 data/wc_fixed.bin" 即存好
+.\scenezone_realtime.exe      # ① 标定（需误差麦）: 放稳态宽带噪声 → 什么都不用管
+#                               日志自动出现 "[SAVE] 标定完成! ... wc_fixed.bin 已自动保存" 即存好，Ctrl+C 退出
 $env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe   # ② 部署: 开环, 自动加载标定, 误差麦拔不拔都行
 Remove-Item Env:GFANC_ANC_MODE -ErrorAction SilentlyContinue   # 回默认闭环(adapt)
 
@@ -633,15 +633,15 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 | 模式 | 命令 | 行为 |
 |------|------|------|
-| adapt（默认） | `.\scenezone_realtime.exe` | 闭环 FxLMS + 误差麦 + 在线 Ŝ（现状行为）；**收敛后 Ctrl+C 自动保存标定滤波器** `data/wc_fixed.bin` |
+| adapt（默认） | `.\scenezone_realtime.exe` | 闭环 FxLMS + 误差麦 + 在线 Ŝ（现状行为）；**Wc 收敛稳定后自动保存标定滤波器**（运行中自动存 `data/wc_fixed.bin`，不用盯日志/掐 Ctrl+C） |
 | fixed（开环） | `$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe` | 开环 µ=0 无误差麦；**启动自动加载** `data/wc_fixed.bin`（CNN 不覆盖）；无文件则退回 CNN 生成式 |
 
 **标定流程（只需一次，全自动，零环境变量）**：
-1. 插上误差麦，跑闭环：`.\scenezone_realtime.exe`，放**噪音或慢速全带扫频**（50–1500Hz，一圈 ≥30s）
-2. 听到降噪效果后 `Ctrl+C` —— 日志出现 `[SAVE] 已保存标定滤波器 data/wc_fixed.bin` 即存好了
+1. 插上误差麦，跑闭环：`.\scenezone_realtime.exe`（建议 `$env:GFANC_MODE='continuous'` 防 RESET 打断收敛，标完 `Remove-Item Env:GFANC_MODE`），放**稳态宽带噪声**（白噪/粉噪，或风扇·空调·马路等真实噪声都行）
+2. **什么都不用管** —— 滤波器收敛后日志自动出现 `[SAVE] 标定完成! ... data/wc_fixed.bin 已自动保存` 即存好，之后 `Ctrl+C` 退出
 3. 之后随时切开环：`$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe`（误差麦拔不拔都行）
 
-> **放扫频 vs 放噪音**：都行，标定存的是 FxLMS 收敛后的滤波器（≈次级路径逆 -P/S），全带扫频比单音/窄带噪声覆盖更均匀。注意两点：① **别用单音**（只校准那一个频率，存下来只消那个频率）；② **扫频频率在变，CNN 可能触发场景切换 RESET 打断收敛** → 标定时加 `$env:GFANC_MODE='continuous'`（关 RESET，CNN 只 INIT 一次，FxLMS 一路收敛到底），标完 `Remove-Item Env:GFANC_MODE`。音量适中防啸叫（反馈抵消需先跑 `calibrate_feedback.exe`）。
+> **标定信号用稳态噪声，不要用扫频，也别用单音**：固定滤波器要的是覆盖全频段的 -P/S。扫频频率在动，最优滤波器跟着动，Wc 永远稳不下来——存出来的是"扫到那个频率时"的窄带滤波器，固定模式下只能消那一个频段，宽带降噪听不出来（这正是"怎么测都不行"的常见原因）。单音同理（只消单频）。稳态宽带噪声让 Wc 收敛到全频段固定滤波器，固定模式才能宽带降噪。音量适中防啸叫（反馈抵消需先跑 `calibrate_feedback.exe`）。
 
 > 为什么需要这一步：fixed 开环没有误差麦反馈，反噪声振幅只能由标定滤波器携带。闭环收敛的 Wc 带本设备绝对振幅+相位（SFANC 的滤波器就是就地 FxLMS 训出来的成品）；CNN 生成式 Wc 是归一化形状（RMS≈0.01，"几乎无声"），开环直接用只有 ~1/10 振幅，听不出降噪。改动摆放/换设备后重跑一次标定即可。
 

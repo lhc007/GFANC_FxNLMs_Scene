@@ -223,7 +223,8 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 **因此 fixed 对标 SFANC = 标定滤波器全自动**（含 `data/wc_fixed.bin`）：
 
 - **config**：`gfanc_config_t` 只留 `anc_mode`（env `GFANC_ANC_MODE=adapt|fixed`）；曾实现又移除的 `fixed_source`/`snapshot_wc`（GFANC_FIXED_SOURCE / GFANC_SNAPSHOT_WC）不恢复——改为全自动
-- **标定（adapt）**：收敛后 Ctrl+C 退出 → 自动把当前工作 Wc（`fx.wc`，带本设备绝对振幅+相位）写 `data/wc_fixed.bin`（S*L float）；未收敛则跳过并提示
+- **标定（adapt）**：**Wc 稳定性收敛检测 → 运行中自动保存**（`check_wc_stable_autosave`）：FxLMS 把 Wc 从 CNN 初值（~0.01）长到工作振幅后，每秒相对变化 <2% 连续 3s 即判收敛，立即写 `data/wc_fixed.bin`（S*L float，用线程安全快照 `wc_snapshot`）——不用盯 NR、不用掐 Ctrl+C 时机。双重保护防误存静音滤波器：① Wc RMS ≥ 初值 3×（工作点判据）；② 安静/冻结/发散/mute 跳过。Ctrl+C 退出保存保留为兜底（NR 收敛路径）
+- **标定信号修正（重要）**：用**稳态宽带噪声**（白噪/粉噪/真实噪声），**不要用扫频**——扫频频率在动，最优 Wc（-P/S 随频变）跟着动永远稳不下来，且存出来的是"扫到那个频率时"的窄带滤波器，fixed 只能消单频段（实机"怎么测都不行"的常见原因）。单音同理。此前 README 的"慢速全带扫频"建议已删除并替换
 - **部署（fixed）**：启动自动加载 `data/wc_fixed.bin` → 静态固定滤波器，CNN 不覆盖（scene_ctrl_process / reset 全 gate）；无文件则退回 CNN 生成式并提示先跑一次闭环
 - **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过
 - **遥测**：fixed 下 NR=n/a，CSV 事件列标 FIXED
