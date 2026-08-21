@@ -306,6 +306,11 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter
 .\scenezone_realtime.exe
 #    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB
 
+# 双模式（方案C, 2026-08-21; 详细见下方「双模式」）：
+#   闭环 Ctrl+C 自动保存标定滤波器 data/wc_fixed.bin → fixed 启动自动加载（误差麦拔不拔都行）
+$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe   # 开环 µ=0 无误差麦（CNN 生成式 / 已保存标定则自动加载）
+Remove-Item Env:GFANC_ANC_MODE -ErrorAction SilentlyContinue   # 回默认闭环(adapt)
+
 # 常用参数（每行独立，按需设；撤销 = Remove-Item Env:XXX）
 $env:GFANC_SEC_FILE="data/secondary_path.bin"   # 次级路径（默认已是它）
 $env:GFANC_SEC_MU='0'                            # 关在线 Ŝ（推荐）
@@ -593,9 +598,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos(anchor,cur)<0.6 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
-| ANC 运行模式 | adapt=默认闭环 / fixed=开环µ=0 (env: GFANC_ANC_MODE=adapt\|fixed) | 方案C 双模式 (2026-08-21): fixed=无误差麦生成式 SFANC (CNN 仍每秒产 Wc, 派发恒走 forward_rt), 详见下节「双模式」 |
-| 固定滤波器来源 | cnn=默认 / file (env: GFANC_FIXED_SOURCE=cnn\|file) | 仅 fixed 模式: cnn=CNN 生成式, file=加载 data/wc_fixed.bin 静态固定滤波器 |
-| 标定快照 | 默认关 (env: GFANC_SNAPSHOT_WC=1) | adapt 模式首次收敛后把 known-good Wc 导出 data/wc_fixed.bin (S*L float), 供 fixed+file 部署 |
+| ANC 运行模式 | adapt=默认闭环 / fixed=开环µ=0 (env: GFANC_ANC_MODE=adapt\|fixed) | 方案C 双模式 (2026-08-21): fixed=无误差麦, 自动加载 data/wc_fixed.bin (闭环 Ctrl+C 自动保存的标定滤波器), 无文件则退回 CNN 生成式; 详见下节「双模式」 |
 | Reset 触发 | 默认 cos(anchor,cur)<0.6 (env: GFANC_RESET_THRESH) | 场景真正切换才重置; 0.6 是实机纯音深对消验证值 (0.8 在深对消时误杀健康 Wc, 见 CHANGELOG) |
 | OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估; 开启命令见上文快速开始「想试场景切换」框 |
 | 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
@@ -625,22 +628,23 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 
 设计文档: [docs/无误差麦方案_与SFANC对照_路线分析.md](docs/无误差麦方案_与SFANC对照_路线分析.md)
 
-| 模式 | env | 行为 |
-|------|-----|------|
-| adapt（默认） | `GFANC_ANC_MODE=adapt` | 闭环 FxLMS + 误差麦 + 在线 Ŝ（现状行为） |
-| fixed + cnn | `GFANC_ANC_MODE=fixed`（默认 `GFANC_FIXED_SOURCE=cnn`） | 开环 µ=0 无误差麦: 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）, CNN 每秒仍经 shadow 交接更新 Wc（生成式 SFANC） |
-| fixed + file | `GFANC_ANC_MODE=fixed GFANC_FIXED_SOURCE=file` | 加载 `data/wc_fixed.bin` 静态固定滤波器, 主线程跳过 scene_ctrl_process（CNN 不覆盖） |
+| 模式 | 命令 | 行为 |
+|------|------|------|
+| adapt（默认） | `.\scenezone_realtime.exe` | 闭环 FxLMS + 误差麦 + 在线 Ŝ（现状行为）；**收敛后 Ctrl+C 自动保存标定滤波器** `data/wc_fixed.bin` |
+| fixed（开环） | `$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe` | 开环 µ=0 无误差麦；**启动自动加载** `data/wc_fixed.bin`（CNN 不覆盖）；无文件则退回 CNN 生成式 |
+
+**标定流程（只需一次，全自动，零环境变量）**：
+1. 插上误差麦，跑闭环：`.\scenezone_realtime.exe`（放噪音）
+2. 听到降噪效果后 `Ctrl+C` —— 日志出现 `[SAVE] 已保存标定滤波器 data/wc_fixed.bin` 即存好了
+3. 之后随时切开环：`$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe`（误差麦拔不拔都行）
+
+> 为什么需要这一步：fixed 开环没有误差麦反馈，反噪声振幅只能由标定滤波器携带。闭环收敛的 Wc 带本设备绝对振幅+相位（SFANC 的滤波器就是就地 FxLMS 训出来的成品）；CNN 生成式 Wc 是归一化形状（RMS≈0.01，"几乎无声"），开环直接用只有 ~1/10 振幅，听不出降噪。改动摆放/换设备后重跑一次标定即可。
 
 fixed 模式行为要点:
 - 误差麦: err_meas 置 0（无误差麦语义）, NR 显示 n/a
 - Wc 变更点全部 gate: 静音/peak 的 Wc 衰减、peak halve、冷启动 30% 软化均跳过（固定滤波器不被瞬态削减）
 - 输出安全保留: NaN 看门狗 + 软限幅 + cold-start ramp
 - 发散检测跳过（无梯度不可能发散）
-
-标定流程（生成 wc_fixed.bin）:
-1. 临时插上误差麦, 跑闭环: `GFANC_ANC_MODE=adapt GFANC_SNAPSHOT_WC=1 scenezone_realtime.exe`
-2. 等收敛日志, 首次收敛自动导出 `data/wc_fixed.bin`（S*L float）
-3. 拔误差麦, 部署: `GFANC_ANC_MODE=fixed GFANC_FIXED_SOURCE=file scenezone_realtime.exe`
 
 ### 参数 ↔ 降噪量实测速查
 

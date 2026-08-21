@@ -102,13 +102,9 @@ typedef struct {
        anc_mode 0=adapt 闭环 (现状默认: FxLMS + 误差麦),
                  1=fixed 开环 (µ=0 无误差麦 — 生成式 SFANC: CNN 仍每秒产 Wc,
                  派发恒走 fxnlms_forward_rt, 无梯度/无Wc变更/无在线Ŝ).
-       fixed_source 0=cnn (CNN 生成式, 默认), 1=file (加载 data/wc_fixed.bin
-                     静态固定滤波器, 主线程跳过 scene_ctrl_process, CNN 不覆盖).
-       snapshot_wc 1=adapt 模式首次收敛时把 last_good_wc 导出 data/wc_fixed.bin
-                   (标定流程: 临时插误差麦 → 收敛 → 导出 → 切 fixed+file 部署). */
+       全自动标定 (对标 SFANC 就地训滤波器): adapt 收敛后 Ctrl+C 自动保存
+       data/wc_fixed.bin; fixed 启动自动加载 (CNN 不覆盖), 无文件则退回 CNN 生成式. */
     int   anc_mode;          /* 0=adapt 闭环(默认), 1=fixed 开环µ=0 (env: GFANC_ANC_MODE=adapt|fixed) */
-    int   fixed_source;      /* 0=cnn 生成式(默认), 1=file 静态 (env: GFANC_FIXED_SOURCE=cnn|file) */
-    int   snapshot_wc;       /* 0=off(默认), 1=首次收敛导出 wc_fixed.bin (env: GFANC_SNAPSHOT_WC=1) */
 
     /* OCG 在线聚类闸门 (ICASSP 2026, 详见 ocg.h):
        在增益域对 CNN 输出做多质心聚类, 仅簇索引变化才更换滤波器 —
@@ -194,7 +190,7 @@ typedef struct {
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
     0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
     1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
-    0, 0, 0,            /* anc_mode, fixed_source, snapshot_wc (方案C双模式: 默认adapt闭环/CNN生成式/无快照) */ \
+    0,                  /* anc_mode (方案C双模式: 默认 adapt 闭环, GFANC_ANC_MODE=fixed 切开环) */ \
     0, 0.8f, 0.1f, 8, 3, /* ocg_enable, ocg_tau, ocg_alpha, ocg_max_clusters, ocg_hold.
                            ocg_enable 默认 0 (2026-08-10 P0-3 证伪): 纯音深对消下增益
                            双模震荡 → 簇翻转 → 每次翻转 RESET, 深对消丢失 (开≈18dB vs 关 27.5dB).
@@ -243,19 +239,12 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
         if (!strcmp(s, "continuous")) cfg->gfanc_mode = 0;
         else if (!strcmp(s, "reset")) cfg->gfanc_mode = 1;
     }
-    /* 双模式 (方案C): GFANC_ANC_MODE=adapt|fixed; GFANC_FIXED_SOURCE=cnn|file;
-       GFANC_SNAPSHOT_WC=1 触发 adapt 首次收敛导出 wc_fixed.bin */
+    /* 双模式 (方案C): GFANC_ANC_MODE=adapt|fixed.
+       标定滤波器 data/wc_fixed.bin 全自动: adapt 收敛后 Ctrl+C 自动保存,
+       fixed 启动自动加载 (无 GFANC_FIXED_SOURCE / GFANC_SNAPSHOT_WC). */
     if ((s = getenv("GFANC_ANC_MODE"))) {
         if (!strcmp(s, "fixed"))     cfg->anc_mode = 1;
         else if (!strcmp(s, "adapt")) cfg->anc_mode = 0;
-    }
-    if ((s = getenv("GFANC_FIXED_SOURCE"))) {
-        if (!strcmp(s, "file")) cfg->fixed_source = 1;
-        else if (!strcmp(s, "cnn")) cfg->fixed_source = 0;
-    }
-    if ((s = getenv("GFANC_SNAPSHOT_WC"))) {
-        if (!strcmp(s, "1") || !strcmp(s, "on") || !strcmp(s, "true")) cfg->snapshot_wc = 1;
-        else cfg->snapshot_wc = (atoi(s) != 0);
     }
     if ((s = getenv("GFANC_RESET_THRESH"))) cfg->switch_threshold = (float)atof(s);
     if ((s = getenv("GFANC_RESET_HYST")))   cfg->reset_hyst = atoi(s);

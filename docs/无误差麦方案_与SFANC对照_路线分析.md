@@ -218,10 +218,13 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 
 ## 11. 实现状态（2026-08-21，分支 plan-c-dual-mode）
 
-方案C 已实现，待硬件验证：
+方案C 双模式已实现。**2026-08-21 实机验证发现**：CNN 生成式 Wc 被 RMS 归一化到 ~0.01（代码注释原文"几乎无声"），fixed 开环无误差麦反馈，反噪声振幅只有需要的 ~1/10（anti≈0.02 vs 误差麦噪声 0.17–0.27）→ 听不出降噪。根因：绝对增益（放多大）依赖部署声路，被设计成仅由运行时 FxLMS 用误差麦现学；SFANC 的 7 个滤波器是**就地 FxLMS 收敛的成品**（增益已固化），所以它们开环能直接降噪。
 
-- **config**：`gfanc_config_t` 新增 `anc_mode`/`fixed_source`/`snapshot_wc` + env `GFANC_ANC_MODE=adapt|fixed`、`GFANC_FIXED_SOURCE=cnn|file`、`GFANC_SNAPSHOT_WC=1`
+**因此 fixed 对标 SFANC = 标定滤波器全自动**（含 `data/wc_fixed.bin`）：
+
+- **config**：`gfanc_config_t` 只留 `anc_mode`（env `GFANC_ANC_MODE=adapt|fixed`）；曾实现又移除的 `fixed_source`/`snapshot_wc`（GFANC_FIXED_SOURCE / GFANC_SNAPSHOT_WC）不恢复——改为全自动
+- **标定（adapt）**：收敛后 Ctrl+C 退出 → 自动把当前工作 Wc（`fx.wc`，带本设备绝对振幅+相位）写 `data/wc_fixed.bin`（S*L float）；未收敛则跳过并提示
+- **部署（fixed）**：启动自动加载 `data/wc_fixed.bin` → 静态固定滤波器，CNN 不覆盖（scene_ctrl_process / reset 全 gate）；无文件则退回 CNN 生成式并提示先跑一次闭环
 - **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过
-- **标定**：adapt + `snapshot_wc` → 首次收敛把 known-good Wc 导出 `data/wc_fixed.bin`；`fixed+file` 启动加载部署，CNN 不覆盖
 - **遥测**：fixed 下 NR=n/a，CSV 事件列标 FIXED
-- **验证**：实时/离线均编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；硬件实测（收敛→快照→fixed 部署→对比 NR）待做
+- **验证**：实时/离线编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；实机 fixed 振幅验证（GFANC_WC_TARGET=0.1→钳位0.05，原场景 ch1 0.19→0.06 ≈6dB；换场景相位不匹配反相 → 需标定滤波器）待定
