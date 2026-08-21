@@ -2,7 +2,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef _WIN32
 #include <io.h>
+#else
+#include <glob.h>
+#endif
 #include "binary_loader.h"
 
 /* R-16-②: .bin 格式头 — magic + version + n_floats + crc32 = 16B */
@@ -63,6 +67,7 @@ uint32_t bin_batch_crc(void)
         纯 ASCII 名, 字节序 == 码点序; 前缀恒为 "data/cnn_", 按 basename 排序等价) */
     char *names[128];
     int n = 0;
+#ifdef _WIN32
     struct _finddata_t fd;
     intptr_t h = _findfirst("data/cnn_*.bin", &fd);   /* intptr_t: 64 位句柄, long 会截断 */
     if (h != -1L) {
@@ -71,6 +76,18 @@ uint32_t bin_batch_crc(void)
         } while (_findnext(h, &fd) == 0);
         _findclose(h);
     }
+#else
+    /* POSIX: glob() 枚举 data/cnn_*.bin (glibc 按字节序排序, 与 Windows 排序语义一致) */
+    glob_t g;
+    if (glob("data/cnn_*.bin", 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc && n < 128; i++) {
+            const char *p = g.gl_pathv[i];
+            const char *base = strrchr(p, '/');
+            names[n++] = strdup(base ? base + 1 : p);
+        }
+        globfree(&g);
+    }
+#endif
     qsort(names, n, sizeof(char *), cmp_pstr);
     for (int i = 0; i < n; i++) {
         char path[512];

@@ -1,10 +1,17 @@
 # SceneZone ANC — offline + realtime + calibration builds
 #
-#   make            → 编译离线版 main.exe
-#   make realtime   → 编译实时版 scenezone_realtime.exe
-#   make calibrate  → 编译反馈路径校准程序 calibrate_feedback.exe
+#   make            → 离线版 main.exe (Windows 下另含 realtime/calibrate)
+#   make realtime   → 编译实时版 scenezone_realtime.exe (Windows 专属)
+#   make calibrate  → 编译反馈路径校准程序 calibrate_feedback.exe (Windows 专属)
 #   make all        → 全部编译
 #   make clean      → 清理编译产物
+#
+#   Linux (WSL): 实时/校准版依赖 Windows API, 阶段 1-A 移植前不构建
+ifeq ($(OS),Windows_NT)
+ALL_TARGETS = main.exe realtime calibrate
+else
+ALL_TARGETS = main.exe
+endif
 
 CC       = gcc
 CFLAGS   = -O2 -Iinclude
@@ -20,7 +27,7 @@ CAL_MODULES = src/fir_filter.c src/binary_loader.c src/pa_loader.c
 
 .PHONY: all realtime calibrate clean
 
-all: main.exe realtime calibrate
+all: $(ALL_TARGETS)
 
 main.exe: main.c $(MODULES)
 	$(CC) $(CFLAGS) main.c $(MODULES) $(LDFLAGS) -o $@

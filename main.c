@@ -15,7 +15,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <windows.h>
+#ifdef _WIN32
+#include <windows.h>   /* 仅 Windows: SetConsoleOutputCP 需要 (clock() 来自 <time.h>) */
+#endif
 
 #include "fir_filter.h"
 #include "binary_loader.h"
@@ -196,7 +198,9 @@ static float path_peak_delay_ms(const float *coeff, int n, float fs)
    ══════════════════════════════════════════════════════════ */
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
     gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
     gfanc_config_load_env(&cfg);
     if (argc < 2) {
