@@ -32,7 +32,7 @@
 | microSD | 32GB 以上 Class 10 | ¥30-60 | 烧系统用 |
 | 键鼠/HDMI | 可有可无 | — | 会 SSH 就不需要 |
 
-> 想先零成本试水？装个 WSL（Windows 自带 Linux）先把第 1.3 步跑了，验证"代码能在 Linux 编译"，板子到了再上板。
+> 💡 **要不要现在买板子？——先别急。** 装个 WSL（Windows 自带 Linux），第 1.3、1.3b 步**全部免费**完成：Linux 编译 + QEMU 交叉编译验证 ARM 正确性 + 静态算力预算。**算力够不够 8×8 这个问题的答案，不买板子就能拿到。** 板子的唯一剩余用途是验证 NEON 向量化的**实际效率**（静态算不出那个 50-80% 的乘子）和真实 I/O 延迟——那属于阶段 1-A（接 USB 声卡）的活，到 1-A 再买，板子一到就干实事，不算白买。
 
 ### 1.2 给开发板烧系统
 
@@ -67,9 +67,48 @@
 - 处理速度：只要快于实时（处理时长 < 音频时长）就行，离线没实时约束
 - 编译报错：绝大多数是 Windows 残留符号，逐个删对应 `windows.h` 依赖即可
 
+> ✅ **已实测（2026-08-21）**: Linux ELF vs Windows PE，`road_noise_0-34` NR_true 平均 **14.7dB** 两侧一致，采样最大差 **1 LSB**（0.0031% FS），差异样本 anti 0.02% / err 0.3%——纯浮点库（MSVCRT vs glibc）舍入差异，无害。
+
+### 1.3b 不买板子也能验证 ARM 正确性 — WSL 交叉编译 + QEMU（零成本）
+
+想确认代码**在 ARM 上也能编译、结果正确**，不需要等板子。WSL 里装个 ARM 交叉编译器 + QEMU 用户态模拟器，直接跑出 ARM 版结果：
+
+```bash
+# 1) WSL 里装工具（root 直接装）:
+apt update && apt install -y gcc-aarch64-linux-gnu qemu-user
+
+# 2) 交叉编译 offline 版为 aarch64 ELF:
+aarch64-linux-gnu-gcc -O2 -Iinclude main.c src/scene_controller.c \
+    src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c \
+    src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o /tmp/main_arm
+
+# 3) 用 QEMU 用户态跑（-L 指定 ARM sysroot）:
+qemu-aarch64 -L /usr/aarch64-linux-gnu /tmp/main_arm "Noise Examples/road_noise_0-34.wav"
+```
+
+**判定标准**: ARM 版与 x86 Linux 版输出逐采样对比，差异 ≤ 1 LSB、差异样本 < 1%、NR_true 一致 → **ARM 正确性验证通过**。
+
+> ✅ **已实测（2026-08-21）**: ARM(QEMU) vs x86(Linux)，`road_noise_0-34` NR_true 平均 **14.7dB** 两侧一致，采样最大差 **1 LSB**，差异样本 anti 0.018% / err 0.324%——与 x86↔Windows 差异同级，纯浮点舍入，数学上一致。
+>
+> ⚠️ **注意**: QEMU 用户态是**指令模拟**（跑 34.8s 音频要 ~168s，约 0.2x 实时），这**不是**真实 RK3568 的速度，只是验证"能在 ARM 指令集上正确运行"。真实速度测不出来，那是板子的活。另外记得确认产物是 ELF（`od -An -tx1 -N4 main_arm` 开头 `7f 45 4c 46`），别被 WSL interop 把 Windows PE 混进来。
+
 ### 1.4 算力微基准（回答"8×8 在 62.5µs 内能不能算完"——不花一分钱）
 
 这是整个阶段 1 最值钱的一步。不用任何音频硬件，直接测 FxLMS 单 tick 耗时。
+
+**先做静态 MAC 预算（不花一分钱，立刻知道数量级）**。FxLMS 是确定性 DSP，热路径 MAC 数从代码就能数出来（2026-08-21 已数）：
+
+| 配置 | 每样本 MACs | 每秒 @16kHz | A55(1.8GHz) 标量 | A55 NEON 理论 | 结论 |
+|---|---|---|---|---|---|
+| **3×2**（PC 原型，E=3/S=2/L=1024） | ~42,000 | 0.67 GMAC/s | 37% 单核 | ~5% | ✅ 随便跑，单核标量都够 |
+| **8×8**（目标，E=8/S=8/L=1024） | ~376,000 | 6.0 GMAC/s | 335%（3.4 核）| 42% 单核 | ⚠️ 必须上 NEON；Ŝ 在线辨识占 37%，可降频或移第二核 |
+
+**结论（静态分析就能定）**:
+- **3×2 可行性已确定**，任何 A55 单核都能跑，无需任何硬件验证。
+- **8×8 必须上 NEON**——标量要 3.4 核，这决定"要不要为 8×8 写 NEON 内联"的答案是**必须写**。
+- **优化杠杆白送**: Ŝ 在线辨识（`sec_online_update`）占 8×8 的 37%，降到慢循环（每 N 样本）或挪第二核，8×8 立刻从"紧"变"松"。
+
+**这之后**，写个微基准上板跑，唯一目的是校准 NEON **实际效率**（静态算不出那个 50-80% 的乘子）。
 
 **先扩编译上限**（当前代码限制 2S/3E，目标 8×8）：
 - `include/scenezone_types.h`: `GFANC_E_MAX` 5→8、`GFANC_S_MAX` 4→8
