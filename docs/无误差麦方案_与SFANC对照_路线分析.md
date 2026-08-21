@@ -213,3 +213,15 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 - 讨论起点：`docs/8x8_实时性验收预算表.md`、`docs/窗户ANC可行性-因果限制_实测_方案.md`
 - SFANC 论文：Luo et al., *Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter ANC*, MSSP 2024. 代码：https://github.com/Luo-Zhengding/SFANC-Window
 - 生成式流派（你的连续权重对应的正统方案）：GFANC-Kalman、Unsupervised-GFANC、Deep Generative Fixed-filter ANC（他们 related works 列表）
+
+---
+
+## 11. 实现状态（2026-08-21，分支 plan-c-dual-mode）
+
+方案C 已实现，待硬件验证：
+
+- **config**：`gfanc_config_t` 新增 `anc_mode`/`fixed_source`/`snapshot_wc` + env `GFANC_ANC_MODE=adapt|fixed`、`GFANC_FIXED_SOURCE=cnn|file`、`GFANC_SNAPSHOT_WC=1`
+- **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过
+- **标定**：adapt + `snapshot_wc` → 首次收敛把 known-good Wc 导出 `data/wc_fixed.bin`；`fixed+file` 启动加载部署，CNN 不覆盖
+- **遥测**：fixed 下 NR=n/a，CSV 事件列标 FIXED
+- **验证**：实时/离线均编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；硬件实测（收敛→快照→fixed 部署→对比 NR）待做

@@ -100,6 +100,10 @@ static float biquad_tick(biquad_t *f, float x)
 /* ── 集中参数 (A2): 单一配置入口, 环境变量可覆盖 ── */
 static gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
 
+/* 双模式 (方案C, 2026-08-21): fixed=开环 µ=0, 无误差麦 — 生成式 SFANC.
+   回调/主线程均只读 cfg.anc_mode (启动后不变, 与其它 cfg 读取同语义). */
+static int anc_fixed(void) { return cfg.anc_mode == 1; }
+
 /* ── 算法常数 (非用户调节, 表达物理/设计约束) ── */
 #define WC_MUTE_DECAY   4e-5f   /* 静音期间 Wc 逐样本衰减因子 (半衰期~0.25s @16kHz) */
 #define OUT_GAIN_SLEW   0.004f  /* 输出增益包络 EMA 系数 (~4ms 时间常数) */
@@ -150,6 +154,7 @@ typedef struct {
        单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
+    int    wc_snapshot_done;      /* 方案C: 标定快照已导出 (snapshot_wc 一次性) */
     float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
     int    reset_pending;         /* cos<τ 连续秒数 (RESET 迟滞, 达 reset_hyst 才触发) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
@@ -330,15 +335,21 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             for (int s = 0; s < S; s++)
                 Fx_arr[e*S+s] = fir_tick(&ctx->bp_fx[e*S+s], Fx_arr[e*S+s]);
 
-        /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度 */
+        /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度.
+           方案C fixed 开环: 无误差麦 → err_meas 置 0. 梯度已被派发绕过,
+           howling/NR 读到 0 无害; err_rms 显示 0 即"无误差麦"的诚实语义. */
         float err_meas[E];
-        for (int e = 0; e < E; e++) {
-            float es = ctx->err_buf[n*E+e];  /* R-29: E hardcoded → E */
-            if (!isfinite(es)) { es = 0.0f; ctx->nan_in_cnt++; }
-            es *= cfg.mic_pre_gain;
-            if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
-            else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
-            err_meas[e] = fir_tick(&ctx->bp_err[e], es);
+        if (anc_fixed()) {
+            for (int e = 0; e < E; e++) err_meas[e] = 0.0f;
+        } else {
+            for (int e = 0; e < E; e++) {
+                float es = ctx->err_buf[n*E+e];  /* R-29: E hardcoded → E */
+                if (!isfinite(es)) { es = 0.0f; ctx->nan_in_cnt++; }
+                es *= cfg.mic_pre_gain;
+                if      (es >  MIC_CLIP_MAX) es =  tanhf(es);
+                else if (es < -MIC_CLIP_MAX) es = -tanhf(-es);
+                err_meas[e] = fir_tick(&ctx->bp_err[e], es);
+            }
         }
 
         /* 自适应 leak: anti RMS 偏高时自动加强正则化, 防 Wc 慢性漂移.
@@ -361,7 +372,13 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
            BUG-3: cold_hold 冷启动**硬限幅段**(前1s, cold_hold>FS_ANC)冻结梯度 —
            输出被钳到 ±0.12 时若继续用 err 驱动 Wc, 强噪声下 Wc 开环增长;
            软释放段(后1s, cap 0.12→1.0)梯度活跃, Wc 在输出受界内自适应收敛. */
-        if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
+        /* 方案C fixed 开环: 恒走 forward_rt — 无梯度/无Wc变更/无在线Ŝ.
+           Wc 仅由 CNN 每秒经 shadow 交接更新 (生成式 SFANC). 静音/peak 的 Wc
+           衰减跳过 (固定滤波器不该被瞬态削减); 输出安全由 NaN 看门狗 + 软限幅
+           + cold-start ramp 兜底. */
+        if (anc_fixed()) {
+            fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
+        } else if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
             || ctx->quiet_active
             || ctx->cold_hold > FS_ANC
             || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
@@ -443,9 +460,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
                 ctx->peak_release_cnt = 0;
                 if (++ctx->peak_hold_cnt >= 10 && !ctx->peak_mute) {
                     ctx->peak_mute = 1;
-                    for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= 0.5f;
-                    ctx->wc_init_max *= 0.5f;  /* R-52: 同步收紧 freeze 基准, 防止膨胀逃逸 */
-                    if (ctx->wc_init_max < 0.001f) ctx->wc_init_max = 0.001f;  /* 防连减到 ~0 → 假 freeze */
+                    /* 方案C fixed: 固定滤波器不受瞬态削减 (无梯度可重建), 仅 adapt 减半 */
+                    if (!anc_fixed()) {
+                        for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= 0.5f;
+                        ctx->wc_init_max *= 0.5f;  /* R-52: 同步收紧 freeze 基准, 防止膨胀逃逸 */
+                        if (ctx->wc_init_max < 0.001f) ctx->wc_init_max = 0.001f;  /* 防连减到 ~0 → 假 freeze */
+                    }
                     ctx->peak_rollback_cnt++;
                 }
             } else {
@@ -647,7 +667,9 @@ static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
     char nr_str[20];
     char topbuf[64];
     (void)new_scene;  /* 仍在 CSV 机器日志使用 (见调用点) */
-    if (ctx->diverged)
+    if (anc_fixed())
+        snprintf(nr_str, sizeof(nr_str), "NR=n/a(开环无误差麦)");
+    else if (ctx->diverged)
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
@@ -770,7 +792,8 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
         /* R-7: 解冻重试 — 回滚到 known-good Wc (去场景层: 单一 last_good_wc) */
         memcpy(ctx->wc_shadow, ctx->last_good_wc, S*L*sizeof(float));
         InterlockedExchangeAdd(&ctx->wc_seq, 2);
-        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
+        if (!anc_fixed())  /* 方案C fixed: 发散检查已跳过, 此分支不可达; 双保险 */
+            InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
         if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: Wc unfreeze retry (rolled back)\n");
         printf("[INFO] Wc unfrozen, watching 3s...\n");
     } else if (freeze_action == 2) {
@@ -799,6 +822,21 @@ static void check_convergence(rt_ctx_t *ctx) {
         &ctx->wc_init_max);
     if (saved) {
         /* last_good_wc 已更新为收敛期 Wc, wc_init_max 已更新为收敛期 max|Wc| */
+        /* 方案C 标定快照: adapt + GFANC_SNAPSHOT_WC=1 → 首次收敛后把 known-good Wc
+           导出 data/wc_fixed.bin (S*L float), 供 fixed+file 模式加载部署.
+           一次性: 写后置 wc_snapshot_done 防每帧重复写盘. */
+        if (cfg.snapshot_wc && !ctx->wc_snapshot_done) {
+            ctx->wc_snapshot_done = 1;
+            FILE *f = fopen("data/wc_fixed.bin", "wb");
+            if (f) {
+                fwrite(ctx->last_good_wc, sizeof(float), S * L, f);
+                fclose(f);
+                printf("[SNAPSHOT] Wc 已导出 data/wc_fixed.bin (%d float, %d B)\n",
+                       S * L, (int)(S * L * (int)sizeof(float)));
+            } else {
+                fprintf(stderr, "[SNAPSHOT] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
+            }
+        }
     }
 }
 
@@ -816,12 +854,15 @@ static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains, int by
        INIT 从 30% 起步 FxLMS 才能长到正确方向 (err 0.024). 满幅 vs 30% 的不一致
        即 250→500 差 / 500→250 好的根因 — 两个方向的 CNN 估计质量不对称
        (250Hz 对齐好、500Hz 失配), 统一 30% 起步让两者都走 FxLMS 重长路径. */
-    if (cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
+    /* 方案C fixed: 跳过冷启动 30% 软化 — 固定滤波器 (CNN 初值或标定导出) 已是
+       已知好解, 无需 FxLMS 重长路径; 仅 adapt 保留 (收敛辅助). */
+    if (!anc_fixed() && cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
         for (int i = 0; i < S * L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
     }
     InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);            /* crossfade 平滑过渡 */
     /* 软重锚定: 不设 cold_hold/mute (冷启动保护仅 INIT 用, 场景切换不需要) */
-    InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
+    if (!anc_fixed())
+        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
     ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
     memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
     ctx->converged_frames = 0;
@@ -1192,6 +1233,31 @@ int main(void) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
     }
 
+    /* ── 方案C 双模式 banner + fixed+file 静态滤波器加载 ── */
+    if (anc_fixed()) {
+        printf("  MODE = FIXED (开环 µ=0, 无误差麦, %s)\n",
+               cfg.fixed_source == 1 ? "静态 wc_fixed.bin" : "CNN 生成式 (scene_ctrl 每秒产 Wc)");
+        if (cfg.fixed_source == 1) {
+            /* 加载标定快照 data/wc_fixed.bin (S*L float) → wc_cur, 由 INIT shadow
+               交接播放. fixed+file 下 scene_ctrl_process 已跳过, CNN 不覆盖. */
+            float *wc_fixed = NULL;
+            int wc_len = bin_load_float("data/wc_fixed.bin", &wc_fixed);
+            if (wc_len != S * L) {
+                fprintf(stderr, "FATAL: wc_fixed.bin size %d != S*L=%d (先跑 GFANC_SNAPSHOT_WC=1 标定)\n",
+                        wc_len, S * L);
+                ret = 1; goto cleanup;
+            }
+            memcpy(ctx->wc_cur, wc_fixed, S * L * sizeof(float));
+            memcpy(ctx->wc_old, wc_fixed, S * L * sizeof(float)); /* 过渡起点 = 同一固定滤波器 */
+            bin_free(wc_fixed);
+            printf("  FIXED+FILE: 已加载 data/wc_fixed.bin (%d float)\n", S * L);
+        }
+    } else if (cfg.snapshot_wc) {
+        printf("  MODE = ADAPT + SNAPSHOT (首次收敛后导出 data/wc_fixed.bin)\n");
+    } else {
+        printf("  MODE = ADAPT (闭环 FxLMS + 误差麦)\n");
+    }
+
     /* 缓冲 */
     ctx->ref_buf = (float *)malloc(FS_HW * sizeof(float));
     ctx->anti_buf = (float *)malloc(FS_HW * S * sizeof(float));
@@ -1259,7 +1325,13 @@ int main(void) {
         const int K = ctx->sc.K;
 
         /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
-        if (ctx->fade_cnt > 0) {
+        if (anc_fixed() && cfg.fixed_source == 1) {
+            /* 方案C fixed+file: 静态固定滤波器 — CNN 不产 Wc, 增益恒 0
+               (reset/OCG/cos 全休眠). wc_cur 由启动加载的 wc_fixed.bin 填充,
+               INIT 的 shadow 交接把它推给回调. */
+            new_scene = 0;
+            for (int i = 0; i < K; i++) gains[i] = 0.0f;
+        } else if (ctx->fade_cnt > 0) {
             memcpy(gains, ctx->sc.prev_gains, K * sizeof(float));
             new_scene = 0;
             for (int i = 1; i < K; i++)
@@ -1272,7 +1344,9 @@ int main(void) {
             /* 首次 INIT (两模式一致): CNN Wc → 影子缓冲 → 冷启动 ramp.
                去场景层: 无场景记忆; wc_init_max 由 wc_cur 推导,
                last_good_wc = INIT 值 (后续由 check_convergence 刷新). */
-            if (cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
+            /* 方案C fixed: 跳过冷启动 30% 软化 — 固定滤波器 (CNN 初值或标定导出)
+               已是已知好解, 无需 FxLMS 重长路径; adapt 保留 (收敛辅助). */
+            if (!anc_fixed() && cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
                 for (int i = 0; i < S*L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
             }
             float mx = sm_wc_max_abs(ctx->wc_cur, S*L);
@@ -1281,7 +1355,8 @@ int main(void) {
             memcpy(ctx->wc_shadow, ctx->wc_cur, S*L*sizeof(float));
             memcpy(ctx->last_good_wc, ctx->wc_cur, S*L*sizeof(float)); /* known-good 基线 */
             InterlockedExchangeAdd(&ctx->wc_seq, 2);
-            InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
+            if (!anc_fixed())
+                InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
             memcpy(ctx->anchor_gains, gains, K * sizeof(float));
             ctx->reset_pending = 0;  /* RESET 迟滞计数清零 (重建锚点) */
@@ -1323,9 +1398,11 @@ int main(void) {
             if (ctx->log_file) {
                 fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s,%d,%d\n",
                         log_sec++, new_scene, gains[new_scene], cos_sim,
-                        ctx->nr_level, ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
+                        anc_fixed() ? 0.0f : ctx->nr_level,  /* 开环无误差麦, NR 无意义 */
+                        ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
                         ctx->safety_mute ? "MUTE" : "",
-                        ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : "",
+                        anc_fixed() ? "FIXED"
+                          : (ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : ""),
                         ctx->ocg.active, ctx->ocg.n_clusters);
                 fflush(ctx->log_file);
             }
@@ -1340,8 +1417,12 @@ int main(void) {
                 ctx->nan_in_cnt = 0;
             }
 
-            check_wc_divergence(ctx);
-            check_convergence(ctx);
+            /* 方案C fixed: 无梯度不可能发散, 收敛/发散检测跳过 (wc_init_max 对比无意义);
+               adapt 下正常跑, 且 snapshot_wc 时收敛后导出标定快照. */
+            if (!anc_fixed()) {
+                check_wc_divergence(ctx);
+                check_convergence(ctx);
+            }
 
             /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
                判据 (2026-08-11 阶段④ + 2026-08-13 阶段⑤修正): 参考麦塌底
@@ -1417,7 +1498,8 @@ int main(void) {
                每次翻转都 RESET → 深对消被反复打断 (最高仅 ~18dB, 而 OCG 关可达
                27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
                cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
-            if (!ctx->quiet_active && cfg.gfanc_mode == 1) {   /* reset (安静期不派发) */
+            if (!ctx->quiet_active && cfg.gfanc_mode == 1
+                && !(anc_fixed() && cfg.fixed_source == 1)) {   /* reset (安静期不派发; 方案C fixed+file 静态无场景切换) */
                 if (cfg.ocg_enable) {
                     /* OCG 已有 ocg_hold 持续性判据, 簇索引变化才切换 */
                     if (ocg_step(&ctx->ocg, gains))
