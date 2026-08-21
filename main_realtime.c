@@ -154,6 +154,7 @@ typedef struct {
        单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
+    int    wc_snapshot_done;      /* 方案C: 标定快照已导出 (snapshot_wc 一次性) */
     float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
     int    reset_pending;         /* cos<τ 连续秒数 (RESET 迟滞, 达 reset_hyst 才触发) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
@@ -812,14 +813,31 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
 static void check_convergence(rt_ctx_t *ctx) {
     /* C1: 使用共享收敛检测. 去场景层: 收敛样本写回单一 known-good Wc
        (last_good_wc), 供发散救援/freeze 回滚; 无场景记忆, offset 恒 0. */
-    /* last_good_wc/wc_init_max 由 sm_check_convergence 内部更新 (发散救援/freeze 回滚用) */
-    (void)sm_check_convergence(
+    int saved = sm_check_convergence(
         ctx->nr_level, cfg.nr_converge_db,
         ctx->safety_mute, ctx->diverged,
         &ctx->converged_frames,
         ctx->last_good_wc, 0,
         ctx->wc_snapshot, S * L,
         &ctx->wc_init_max);
+    if (saved) {
+        /* last_good_wc 已更新为收敛期 Wc, wc_init_max 已更新为收敛期 max|Wc| */
+        /* 方案C 标定快照: adapt + GFANC_SNAPSHOT_WC=1 → 首次收敛后把 known-good Wc
+           导出 data/wc_fixed.bin (S*L float), 供 fixed+file 模式加载部署.
+           一次性: 写后置 wc_snapshot_done 防每帧重复写盘. */
+        if (cfg.snapshot_wc && !ctx->wc_snapshot_done) {
+            ctx->wc_snapshot_done = 1;
+            FILE *f = fopen("data/wc_fixed.bin", "wb");
+            if (f) {
+                fwrite(ctx->last_good_wc, sizeof(float), S * L, f);
+                fclose(f);
+                printf("[SNAPSHOT] Wc 已导出 data/wc_fixed.bin (%d float, %d B)\n",
+                       S * L, (int)(S * L * (int)sizeof(float)));
+            } else {
+                fprintf(stderr, "[SNAPSHOT] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
+            }
+        }
+    }
 }
 
 /* 去场景层 (scenezone-anc): Reset 模式触发 — 无场景记忆, 直接过渡到
@@ -1215,9 +1233,27 @@ int main(void) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
     }
 
-    /* ── 方案C 双模式 banner (fixed = 开环 µ=0 无误差麦, CNN 生成式) ── */
+    /* ── 方案C 双模式 banner + fixed+file 静态滤波器加载 ── */
     if (anc_fixed()) {
-        printf("  MODE = FIXED (开环 µ=0, 无误差麦, CNN 生成式 (scene_ctrl 每秒产 Wc))\n");
+        printf("  MODE = FIXED (开环 µ=0, 无误差麦, %s)\n",
+               cfg.fixed_source == 1 ? "静态 wc_fixed.bin" : "CNN 生成式 (scene_ctrl 每秒产 Wc)");
+        if (cfg.fixed_source == 1) {
+            /* 加载标定快照 data/wc_fixed.bin (S*L float) → wc_cur, 由 INIT shadow
+               交接播放. fixed+file 下 scene_ctrl_process 已跳过, CNN 不覆盖. */
+            float *wc_fixed = NULL;
+            int wc_len = bin_load_float("data/wc_fixed.bin", &wc_fixed);
+            if (wc_len != S * L) {
+                fprintf(stderr, "FATAL: wc_fixed.bin size %d != S*L=%d (先跑 GFANC_SNAPSHOT_WC=1 标定)\n",
+                        wc_len, S * L);
+                ret = 1; goto cleanup;
+            }
+            memcpy(ctx->wc_cur, wc_fixed, S * L * sizeof(float));
+            memcpy(ctx->wc_old, wc_fixed, S * L * sizeof(float)); /* 过渡起点 = 同一固定滤波器 */
+            bin_free(wc_fixed);
+            printf("  FIXED+FILE: 已加载 data/wc_fixed.bin (%d float)\n", S * L);
+        }
+    } else if (cfg.snapshot_wc) {
+        printf("  MODE = ADAPT + SNAPSHOT (首次收敛后导出 data/wc_fixed.bin)\n");
     } else {
         printf("  MODE = ADAPT (闭环 FxLMS + 误差麦)\n");
     }
@@ -1289,7 +1325,13 @@ int main(void) {
         const int K = ctx->sc.K;
 
         /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
-        if (ctx->fade_cnt > 0) {
+        if (anc_fixed() && cfg.fixed_source == 1) {
+            /* 方案C fixed+file: 静态固定滤波器 — CNN 不产 Wc, 增益恒 0
+               (reset/OCG/cos 全休眠). wc_cur 由启动加载的 wc_fixed.bin 填充,
+               INIT 的 shadow 交接把它推给回调. */
+            new_scene = 0;
+            for (int i = 0; i < K; i++) gains[i] = 0.0f;
+        } else if (ctx->fade_cnt > 0) {
             memcpy(gains, ctx->sc.prev_gains, K * sizeof(float));
             new_scene = 0;
             for (int i = 1; i < K; i++)
@@ -1376,7 +1418,7 @@ int main(void) {
             }
 
             /* 方案C fixed: 无梯度不可能发散, 收敛/发散检测跳过 (wc_init_max 对比无意义);
-               adapt 下正常跑. */
+               adapt 下正常跑, 且 snapshot_wc 时收敛后导出标定快照. */
             if (!anc_fixed()) {
                 check_wc_divergence(ctx);
                 check_convergence(ctx);
@@ -1456,7 +1498,8 @@ int main(void) {
                每次翻转都 RESET → 深对消被反复打断 (最高仅 ~18dB, 而 OCG 关可达
                27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
                cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
-            if (!ctx->quiet_active && cfg.gfanc_mode == 1) {   /* reset (安静期不派发) */
+            if (!ctx->quiet_active && cfg.gfanc_mode == 1
+                && !(anc_fixed() && cfg.fixed_source == 1)) {   /* reset (安静期不派发; 方案C fixed+file 静态无场景切换) */
                 if (cfg.ocg_enable) {
                     /* OCG 已有 ocg_hold 持续性判据, 簇索引变化才切换 */
                     if (ocg_step(&ctx->ocg, gains))

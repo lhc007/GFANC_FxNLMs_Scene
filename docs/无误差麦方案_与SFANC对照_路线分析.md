@@ -218,11 +218,10 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 
 ## 11. 实现状态（2026-08-21，分支 plan-c-dual-mode）
 
-方案C 已实现，待硬件验证。**2026-08-21 收窄范围**：对标 SFANC（其无"标定→导出文件→加载"流程），砍掉 `fixed_source`/`snapshot_wc`（file 加载 + 标定快照导出），只保留 `anc_mode` 双模式。
+方案C 已实现，待硬件验证：
 
-- **config**：`gfanc_config_t` 新增 `anc_mode`（env `GFANC_ANC_MODE=adapt|fixed`）
-- **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过；CNN 每秒仍产 Wc（生成式 SFANC，与 SFANC-Window 形态对齐）
+- **config**：`gfanc_config_t` 新增 `anc_mode`/`fixed_source`/`snapshot_wc` + env `GFANC_ANC_MODE=adapt|fixed`、`GFANC_FIXED_SOURCE=cnn|file`、`GFANC_SNAPSHOT_WC=1`
+- **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过
+- **标定**：adapt + `snapshot_wc` → 首次收敛把 known-good Wc 导出 `data/wc_fixed.bin`；`fixed+file` 启动加载部署，CNN 不覆盖
 - **遥测**：fixed 下 NR=n/a，CSV 事件列标 FIXED
-- **验证**：实时/离线均编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；硬件实测（adapt vs fixed 开环对比 NR）待做
-
-> 曾实现又移除：`fixed+file` 静态滤波器加载 + `GFANC_SNAPSHOT_WC` 标定快照导出（首版"首次收敛即导出"存浅滤波、后改"只存最优 NR"）。因用户对标 SFANC 决定不要 file 功能，整套移除，git 历史可回溯。
+- **验证**：实时/离线均编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；硬件实测（收敛→快照→fixed 部署→对比 NR）待做
