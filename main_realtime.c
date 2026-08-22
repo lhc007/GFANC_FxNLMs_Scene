@@ -2,7 +2,8 @@
  *
  * 编译: gcc -O2 -Iinclude main_realtime.c src/scene_controller.c
  *       src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c
- *       src/cnn_m5_forward.c src/pa_loader.c -lm -o scenezone_realtime.exe
+ *       src/cnn_m5_forward.c src/scene_bank.c src/howling_detect.c
+ *       src/sec_online.c src/pa_loader.c -lm -o scenezone_realtime.exe
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,14 +19,13 @@
 #include "cnn_m5_forward.h"
 #include "scene_controller.h"
 #include "scene_manager.h"
-#include "ocg.h"
 #include "fxnlms_mimo.h"
 #include "scene_bank.h"
 #include "howling_detect.h"
 #include "sec_online.h"
 
-/* Phase 3: deploy 分类 CNN 权重集前缀 (data/cnn_bank_*.bin, K=N=4, SFANC 硬选库).
-   calibrate 回归集 (data/cnn_*.bin, K=30) 保持不动. */
+/* SFANC 硬选库: deploy 分类 CNN 权重集前缀 (data/cnn_bank_*.bin, K=N).
+   标定态不初始化 CNN (纯闭环 FxLMS 零启动, 收敛后存库槽). */
 #define DEPLOY_CNN_BASE "cnn_bank"
 
 /* ── ADV-F3: 回调 WCET 监控 (诊断). GFANC_WCET=1 开启 (默认关, 零开销).
@@ -117,7 +117,6 @@ static int anc_fixed(void) { return cfg.anc_mode == 1; }
 typedef struct {
     /* ANC 模块 */
     scene_ctrl_t  sc;
-    ocg_t         ocg;          /* OCG 多质心聚类闸门 (reset 模式决策) */
     fxnlms_mimo_t fx;
     fir_filter_t  bp_fir;        /* ref 带通 CNN (1024tap, 分类用) */
     fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (256tap, 群延迟8ms) */
@@ -159,24 +158,21 @@ typedef struct {
        单一 known-good Wc 备份, 供发散救援 + freeze 重试回滚. */
     float  last_good_wc[S*L];
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
-    int    snapshot_capable;      /* 方案C: adapt 曾收敛 (自动保存标定滤波器判据: NR 或 Wc 稳定) */
-    int    fixed_wc_loaded;       /* 方案C: fixed 启动已加载 data/wc_fixed.bin (静态, CNN 不覆盖) */
+    int    snapshot_capable;      /* 标定: 曾收敛 (自动存库槽判据: NR 或 Wc 稳定) */
 
     /* SFANC 硬选库决策层 (Phase 2 deploy): 整库常驻内存, 慢循环分类→选槽→crossfade */
     float *wc_bank;               /* 整个库 [n_slots*S*L] (deploy 选槽用) */
     uint32_t bank_n_slots;        /* 库槽数 N */
     int    deploy_class;          /* 当前播放的库槽索引 */
     int    sim_tick;              /* GFANC_BANK_SIM 轮换计数 (秒) */
-    /* 方案C 标定 (Wc 稳定性自动保存): FxLMS 把 Wc 从 CNN 初值长到工作振幅后,
-       每秒相对变化 <5%, 连续 3 秒即判收敛 → 运行中自动保存, 不用掐 Ctrl+C. */
+    /* 标定 (Wc 稳定性自动存槽): FxLMS 把 Wc 从零长到工作振幅后, 每秒相对变化
+       <5%, 连续 3 秒即判收敛 → 运行中自动存库槽, 不用掐 Ctrl+C. */
     float  wc_prev_sec[S*L];      /* 上一秒 Wc 快照 (稳定性对比) */
-    float  wc_init_rms;           /* 首秒捕获 CNN 初值 Wc RMS (~0.01 几乎无声) — 工作点判定基准 */
+    float  wc_init_rms;           /* 首秒捕获零启动 Wc RMS 基线 — 工作点判定基准 */
     int    wc_stable_sec;         /* Wc 连续稳定秒数 */
-    int    wc_autosaved;          /* 已自动保存标定滤波器 (一次性) */
-    float  anchor_gains[SC_DW_MAX];    /* 上次重置时的 30 维增益锚点 (reset 模式 cos_sim 对比) */
-    int    reset_pending;         /* cos<τ 连续秒数 (RESET 迟滞, 达 reset_hyst 才触发) */
+    int    wc_autosaved;          /* 已自动存库槽 (一次性) */
     int    freeze_timer;          /* Wc freeze 计时器 (秒), >0=冻结中, 60s后尝试解冻 */
-    int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结直到场景切换 */
+    int    freeze_permanent;      /* 解冻后3s内再次触发 → 永久冻结 */
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
     volatile int peak_mute;       /* 峰值快检测触发静音 */
     int    peak_release_cnt;      /* peak_mute 释放迟滞: 连续低于阈值的样本数 (10ms 防抖) */
@@ -317,9 +313,9 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         float ref_cnn = fir_tick(&ctx->bp_fir, ref_sample);
         float ref_anc = fir_tick(&ctx->bp_fir_anc, ref_sample);
 
-        /* CNN 累积 */
-        /* CNN 双缓冲: 填满一块→原子标记就绪→切到另一块 */
-        if (ctx->cnn_cnt < FS_ANC) {
+        /* CNN 累积 (deploy 分类决策用; 标定无 CNN, 不填).
+           CNN 双缓冲: 填满一块→原子标记就绪→切到另一块 */
+        if (anc_fixed() && ctx->cnn_cnt < FS_ANC) {
             ctx->cnn_buf[ctx->cnn_fill_idx][ctx->cnn_cnt++] = ref_cnn;
             if (ctx->cnn_cnt >= FS_ANC) {
                 /* R-20: 检测主线程超1s未消费 → 记录丢帧 */
@@ -683,28 +679,32 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 
 /* ── 主循环辅助函数 (CR-4: 从 ~110 行 while 块拆分) ── */
 
-static void print_diagnostics(rt_ctx_t *ctx, int new_scene, float cos_sim,
-                              const float *gains) {
+static void print_diagnostics(rt_ctx_t *ctx) {
     char nr_str[20];
-    char topbuf[64];
-    (void)new_scene;  /* 仍在 CSV 机器日志使用 (见调用点) */
     if (anc_fixed())
         snprintf(nr_str, sizeof(nr_str), "NR=n/a(开环无误差麦)");
     else if (ctx->diverged)
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
-    sm_fmt_top_gains(gains, ctx->sc.K, topbuf, sizeof(topbuf));
-    printf("[CNN] top=%s cos=%.2f clu=%d/%d %s anti=%.4f%s%s%s%s gain=%.0fx cb=%d%s\n",
-           topbuf, cos_sim,
-           ctx->ocg.active, ctx->ocg.n_clusters,
-           nr_str, ctx->anti_rms,
-           ctx->safety_mute ? " [MUTE]" : "",
-           ctx->peak_mute ? " [PMUTE]" : "",
-           ctx->quiet_active ? " [QUIET]" : "",
-           ctx->ramp_cnt > 0 ? " [RAMP]" : "",
-           cfg.mic_pre_gain, ctx->callback_count,
-           ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
+    if (anc_fixed())
+        printf("[BANK] 类=%d/%d %s anti=%.4f%s%s%s%s gain=%.0fx cb=%d%s\n",
+               ctx->deploy_class, (int)ctx->bank_n_slots, nr_str, ctx->anti_rms,
+               ctx->safety_mute ? " [MUTE]" : "",
+               ctx->peak_mute ? " [PMUTE]" : "",
+               ctx->quiet_active ? " [QUIET]" : "",
+               ctx->ramp_cnt > 0 ? " [RAMP]" : "",
+               cfg.mic_pre_gain, ctx->callback_count,
+               ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
+    else
+        printf("[ANC] %s anti=%.4f%s%s%s%s gain=%.0fx cb=%d%s\n",
+               nr_str, ctx->anti_rms,
+               ctx->safety_mute ? " [MUTE]" : "",
+               ctx->peak_mute ? " [PMUTE]" : "",
+               ctx->quiet_active ? " [QUIET]" : "",
+               ctx->ramp_cnt > 0 ? " [RAMP]" : "",
+               cfg.mic_pre_gain, ctx->callback_count,
+               ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
     if (ctx->peak_rollback_cnt > 0) {
         printf("       ⚠ peak_mute 触发 %d 次 — Wc 已减半 (输出曾饱和)\n",
                ctx->peak_rollback_cnt);
@@ -831,10 +831,10 @@ static void check_wc_divergence(rt_ctx_t *ctx) {
     }
 }
 
-/* ── 方案C 标定: Wc 稳定性收敛 → 运行中自动保存 data/wc_fixed.bin.
-   不用盯 NR / 掐 Ctrl+C 时机. FxLMS 把 Wc 从 CNN 初值 (~0.01, 几乎无声) 长到
-   工作振幅后, 每秒相对变化降到 < WC_STABLE_RATIO, 连续 WC_STABLE_SECS 秒即判
-   收敛 → 立即自动保存. 防误存静音滤波器的双重保护:
+/* ── 标定: Wc 稳定性收敛 → 运行中自动存库槽 cfg.cal_scene_index (对标 SFANC
+   就地训滤波器). 不用盯 NR / 掐 Ctrl+C 时机. FxLMS 把 Wc 从零长到工作振幅后,
+   每秒相对变化降到 < WC_STABLE_RATIO, 连续 WC_STABLE_SECS 秒即判收敛 →
+   立即自动存槽. 防误存静音滤波器的双重保护:
    1) Wc RMS 必须长到初值 WC_GROW_FACTOR 倍以上 (初值~0.01 → 需 ≥ ~0.03);
    2) 安静/冻结/发散/mute 期间跳过 (Wc 衰减或静止 ≠ 收敛).
    注意: 标定信号要用稳态宽带噪声 (或真实噪声), 不要用扫频 — 扫频频率在动,
@@ -866,9 +866,9 @@ static void check_wc_stable_autosave(rt_ctx_t *ctx) {
         memcpy(ctx->wc_prev_sec, ctx->wc_snapshot, S * L * sizeof(float));
         return;
     }
-    /* 工作点判据: Wc RMS ≥ 初值 3×. 初值取 max(捕获值, 0.01) — 冷启动 30%
-       软化使捕获值可能只有 ~0.003, 用它当基准会把"没长起来"误判成工作点.
-       0.01 是 CNN 生成式 RMS 目标 (代码注释"几乎无声"), 正是静音/工作的分界. */
+    /* 工作点判据: Wc RMS ≥ 初值 3×. 初值取 max(捕获值, 0.01) — 零启动首秒
+       捕获值≈0, 用它当基准会把"没长起来"误判成工作点.
+       0.01 是保守最小工作 RMS (对标旧 CNN 生成式"几乎无声"目标), 静音/工作的分界. */
     float base = (ctx->wc_init_rms > 0.01f) ? ctx->wc_init_rms : 0.01f;
     if (rms < WC_GROW_FACTOR * base) {                /* 还没长到工作点 */
         ctx->wc_stable_sec = 0;
@@ -887,23 +887,19 @@ static void check_wc_stable_autosave(rt_ctx_t *ctx) {
     memcpy(ctx->wc_prev_sec, ctx->wc_snapshot, S * L * sizeof(float));
 
     if (ctx->wc_stable_sec >= WC_STABLE_SECS) {
-        FILE *f = fopen("data/wc_fixed.bin", "wb");
-        int bank_ok = -1;
-        if (f) {
-            fwrite(ctx->wc_snapshot, sizeof(float), S * L, f);
-            fclose(f);
-            /* Phase 1: 收敛成品同步写库槽 cfg.cal_scene_index (绝对增益原样).
-               Phase 3c: GFANC_CAL_INDEX=k 选槽 — 每类噪声标定一次填一槽.
-               标定=就地 FxLMS 收敛成品, 绝不 RMS 归一化 (研究结论: 归一化是开环无声根因). */
-            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, cfg.cal_scene_index, ctx->wc_snapshot);
+        /* 收敛成品写库槽 cfg.cal_scene_index (绝对增益原样).
+           GFANC_CAL_INDEX=k 选槽 — 每类噪声标定一次填一槽.
+           标定=就地 FxLMS 收敛成品, 绝不 RMS 归一化 (研究结论: 归一化是开环无声根因). */
+        int bank_ok = scene_bank_save_slot(cfg.bank_file, S, L, cfg.cal_scene_index, ctx->wc_snapshot);
+        if (bank_ok == 0) {
             ctx->wc_autosaved = 1;
             ctx->snapshot_capable = 1;   /* Ctrl+C 兜底也认 */
             printf("\n[SAVE] 标定完成! Wc 已收敛 (Δ<%.0f%%/秒 持续 %ds, RMS=%.4f ≥ %.1f×初值)\n"
-                   "       data/wc_fixed.bin 已自动保存 (bank 槽%d %s) — 之后 deploy 模式直接加载, 可 Ctrl+C 退出\n",
+                   "       已自动存库 %s 槽%d — deploy 模式自动加载, 可 Ctrl+C 退出\n",
                    WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR,
-                   cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
+                   cfg.bank_file, cfg.cal_scene_index);
         } else {
-            fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
+            fprintf(stderr, "[SAVE] 写库槽 %d 失败 (%s)\n", cfg.cal_scene_index, cfg.bank_file);
             ctx->wc_stable_sec = 0;
         }
     }
@@ -921,46 +917,9 @@ static void check_convergence(rt_ctx_t *ctx) {
         &ctx->wc_init_max);
     if (saved) {
         /* last_good_wc 已更新为收敛期 Wc, wc_init_max 已更新为收敛期 max|Wc| */
-        /* 方案C 全自动标定: 曾收敛 → Ctrl+C 退出时自动保存 data/wc_fixed.bin */
+        /* 标定: 曾收敛 → Ctrl+C 退出时兜底写库槽 */
         ctx->snapshot_capable = 1;
     }
-}
-
-/* 去场景层 (scenezone-anc): Reset 模式触发 — 无场景记忆, 直接过渡到
-   scene_ctrl_process 本秒产出的新候选 wc_cur. Continuous 模式不调用.
-   P0-6 (2026-08-14) 软重锚定: 场景切换只做 crossfade(wc_old→wc_cur) + 重锚定,
-   去掉 cold_hold/mute — 那 3.5s 打断本是冷启动保护, 场景切换用 peak_mute 兜底即可.
-   否则切换 latency = 2s cold_hold + 1.5s mute, 比 FxLMS 小步长硬爬还慢 (问题1). */
-static void apply_reset(rt_ctx_t *ctx, float cos_sim, const float *gains, int by_ocg) {
-    memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float)); /* 过渡起点 */
-    /* wc_cur 已是 scene_ctrl_process 算出的新候选.
-       RESET 与 INIT 一致: 对 CNN 直接权重候选施加 wc_cold_start 衰减, 再 crossfade.
-       (2026-08-17 修 250→500 转换差): 500Hz 的 CNN 估计相位失配, 若满幅交接,
-       FxLMS 被锁死在错误方向 (err 0.040, anti 0.21 比 500Hz 单独 0.15 更大却对消更差);
-       INIT 从 30% 起步 FxLMS 才能长到正确方向 (err 0.024). 满幅 vs 30% 的不一致
-       即 250→500 差 / 500→250 好的根因 — 两个方向的 CNN 估计质量不对称
-       (250Hz 对齐好、500Hz 失配), 统一 30% 起步让两者都走 FxLMS 重长路径. */
-    /* 方案C fixed: 跳过冷启动 30% 软化 — 固定滤波器 (CNN 初值或标定导出) 已是
-       已知好解, 无需 FxLMS 重长路径; 仅 adapt 保留 (收敛辅助). */
-    if (!anc_fixed() && cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
-        for (int i = 0; i < S * L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
-    }
-    InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);            /* crossfade 平滑过渡 */
-    /* 软重锚定: 不设 cold_hold/mute (冷启动保护仅 INIT 用, 场景切换不需要) */
-    if (!anc_fixed())
-        InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
-    ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
-    memcpy(ctx->anchor_gains, gains, ctx->sc.K * sizeof(float));
-    ctx->converged_frames = 0;
-    if (ctx->log_file) fprintf(ctx->log_file, "# EVENT: reset %s cos=%.3f clu=%d/%d\n",
-                               by_ocg ? "ocg" : "cos",
-                               cos_sim, ctx->ocg.active, ctx->ocg.n_clusters);
-    /* 诚实标注触发源: cos 门打 cos<τ; OCG 打簇索引变化 (cos 仅为诊断, 可能 ≥τ) */
-    if (by_ocg)
-        printf("  -> RESET (OCG clu=%d/%d, cos=%.2f diag)\n",
-               ctx->ocg.active, ctx->ocg.n_clusters, cos_sim);
-    else
-        printf("  -> RESET (cos=%.2f < %.2f)\n", cos_sim, cfg.switch_threshold);
 }
 
 int main(void) {
@@ -1015,10 +974,9 @@ int main(void) {
     const char *sec_file = getenv("GFANC_SEC_FILE");
     if (!sec_file || !sec_file[0])
         sec_file = "data/secondary_path.bin";
-    float *sec_path, *sub_filters, *bp_coeff;
+    float *sec_path, *bp_coeff;
     int sec_len = bin_load_float(sec_file, &sec_path);
     printf("  Ŝ file: %s\n", sec_file);
-    int sub_len = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     /* R-13: 尝试加载 ANC 专用短带通 (256tap). 无文件时截取 1024tap 前 256 点作为近似. */
     float *bp_anc_coeff = NULL;
@@ -1029,47 +987,15 @@ int main(void) {
         fprintf(stderr, "FATAL: %s too short/load failed (%d<%d)\n", sec_file, sec_len, E*S*SEC_LEN);
         ret = 1; goto cleanup;
     }
-    if (sub_len < SC_C*SC_S || sub_len % (SC_C*SC_S) != 0) {
-        fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, SC_C*SC_S);
-        ret = 1; goto cleanup;
-    }
     if (bp_len < BP_LEN) {
         fprintf(stderr, "FATAL: bandpass_fir.bin too short/load failed (%d<%d)\n", bp_len, BP_LEN);
         ret = 1; goto cleanup;
     }
-    {
-        int L_from_sub = sub_len / (SC_C*SC_S);
-        if (L_from_sub < 64 || L_from_sub > 4096) {
-            fprintf(stderr, "FATAL: filter length L=%d out of range [64,4096]\n", L_from_sub);
-            ret = 1; goto cleanup;
-        }
-        if (L_from_sub != L) {
-            fprintf(stderr, "FATAL: sub_filters L=%d mismatches compile-time L=%d\n", L_from_sub, L);
-            ret = 1; goto cleanup;
-        }
-    }
-    /* Phase 3: deploy 模式优先加载 SFANC 分类权重集 (cnn_bank_*, K=N=4);
-       缺失 (Phase 3 前) 或 calibrate 模式 → 回归集 (cnn_*, K=30). */
-    {
-        char bank_linear[128];
-        snprintf(bank_linear, sizeof(bank_linear), "data/%s_linear_weight.bin",
-                 DEPLOY_CNN_BASE);
-        int bank_cnn_avail = 0;
-        FILE *probe = fopen(bank_linear, "rb");
-        if (probe) { fclose(probe); bank_cnn_avail = 1; }
-        const char *cnn_base = "cnn";
-        if (anc_fixed() && bank_cnn_avail) cnn_base = DEPLOY_CNN_BASE;
-        if (cnn_m5_init_base(cnn_base) != 0) {
-            fprintf(stderr, "FATAL: CNN init failed (%s_*.bin missing/corrupt?)\n", cnn_base);
-            ret = 1; goto cleanup;
-        }
-        printf("  OK %s K=%d L=%d%s\n", cnn_base, cnn_m5_get_K(),
-               sub_len / (SC_C*SC_S),
-               (anc_fixed() && bank_cnn_avail) ? " [deploy 分类 CNN]" : "");
-    }
+    /* 分类 CNN (cnn_bank_*) 初始化 + 决策层 scene_ctrl 在 deploy 库加载段完成;
+       标定不 init CNN (纯闭环零启动). */
 
-    /* R-27: 批次指纹 — 检测 cnn/sub_filters/bandpass 是否跨批混配 (WARN, 不阻断) */
-    bin_check_batch();
+    /* R-27: 批次指纹 — 检测 cnn_bank/bandpass 是否跨批混配 (仅 deploy, WARN 不阻断) */
+    if (anc_fixed()) bin_check_batch();
 
     /* 初始化 ANC 模块 */
     PaStream *stream = NULL;
@@ -1303,31 +1229,8 @@ int main(void) {
     }
 #endif
 
-    if (scene_ctrl_init(&ctx->sc, sub_filters, L) != 0) {
-        fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); ret = 1; goto cleanup;
-    }
-    /* P0-2: 增益时间平滑参数 (默认已在 scene_ctrl_init 设好, env 覆盖) */
-    scene_ctrl_set_gain_smoothing(&ctx->sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
-    /* OCG 聚类闸门初始化: τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold);
-       持续性命中帧数 ocg_hold (P0-3 修复, 前提②) */
-    if (ocg_init(&ctx->ocg, ctx->sc.K, cfg.ocg_tau,
-                 cfg.ocg_alpha, cfg.ocg_max_clusters, cfg.ocg_hold) != 0) {
-        fprintf(stderr, "ERROR: ocg_init failed\n"); ret = 1; goto cleanup;
-    }
-    /* ── Wc 增益自动标定: 极保守起始, LMS 在有真实噪声时从零缓慢收敛.
-       anti ≈ Wc_RMS × ref_filt × √L. 默认 0.01: ref=0.025→anti≈0.008 (−42dBFS).
-       几乎无声, 确保噪声突增时不会饱和; LMS 在 10-30s 内自行收敛到工作点.
-       收敛后 last_good_wc 保存正确幅值, 切回直接恢复 (不经过此保守值).
-       通过 GFANC_WC_TARGET 环境变量覆盖. ── */
-    {
-        float wc_target = cfg.wc_rms_target;
-        if (wc_target < 0.005f) wc_target = 0.005f;
-        if (wc_target > 0.05f) wc_target = 0.05f;
-        printf("  Wc RMS target=%.3f (stub_rms=%.4f, gain=%.1fx)\n",
-               wc_target, ctx->sc.stub_rms,
-               ctx->sc.stub_rms > 1e-6f ? wc_target / ctx->sc.stub_rms : 0.0f);
-        ctx->sc.wc_rms_target = wc_target;
-    }
+    /* scene_ctrl_init (决策层) 仅在 deploy 库加载段调用 (需 cnn_bank 的 K 信息);
+       标定不初始化 CNN/决策层. */
     howling_init(&ctx->hw, HOWLING_ENABLED);
     if (anc_fixed()) {
         /* 方案C deploy: 开环纯前向实例 — xd=NULL (省 E*S*L bytes), 无梯度链.
@@ -1341,60 +1244,69 @@ int main(void) {
         }
     }
 
-    /* ── 方案C 双模式 banner + deploy 滤波器库自动加载 ── */
+    /* ── 双模式 banner + deploy 滤波器库加载 ── */
     if (anc_fixed()) {
-        /* deploy (开环无误差麦): 优先加载 SFANC 库 data/wc_bank.bin → 整库常驻内存.
+        /* deploy (开环无误差麦): 唯一数据源 = SFANC 库 cfg.bank_file → 整库常驻内存.
            Phase 2 决策层: 慢循环 CNN argmax → 防抖 → 选槽 c → crossfade.
            GFANC_BANK_SIM=1: 定时轮换类验证切换无爆音 (不依赖 CNN).
-           无库 → 回退旧 data/wc_fixed.bin (N=1 对照); 再无 → CNN 生成式 (弱降噪). */
-        int loaded = 0;
+           无库 / 无分类 CNN → FATAL (已删 wc_fixed/CNN 生成式兜底). */
         scene_bank_t bank;
-        if (scene_bank_load(cfg.bank_file, S, L, &bank) == 0) {
-            if (bank.n_slots >= 1 && bank.slot_len == (uint32_t)(S * L)) {
-                /* 整库拷贝到 ctx (选槽需随机访问) */
-                ctx->wc_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
-                if (ctx->wc_bank) {
-                    memcpy(ctx->wc_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
-                    ctx->bank_n_slots = bank.n_slots;
-                    ctx->deploy_class  = 0;
-                    ctx->sim_tick      = 0;
-                    memcpy(ctx->wc_cur, ctx->wc_bank, S * L * sizeof(float));      /* 槽 0 起步 */
-                    memcpy(ctx->wc_old, ctx->wc_bank, S * L * sizeof(float));      /* 过渡起点 = 同槽 */
-                    scene_ctrl_set_bank(&ctx->sc, (int)bank.n_slots);             /* 决策层接入库 */
-                    scene_ctrl_set_bank_hold(&ctx->sc, cfg.bank_hold_frames);
-                    loaded = 1;
-                    ctx->fixed_wc_loaded = 1;
-                    printf("  MODE = DEPLOY + 库 %s (%u 槽, slot_len=%u)", cfg.bank_file,
-                           bank.n_slots, bank.slot_len);
-                    if (cfg.bank_sim)
-                        printf(" GFANC_BANK_SIM 轮换 %ds/类\n", cfg.bank_sim_sec);
-                    else
-                        printf(" 分类选库 (K=%d, 防抖 %d帧)\n", ctx->sc.K, cfg.bank_hold_frames);
-                    if (bank.n_slots != (uint32_t)ctx->sc.K && !cfg.bank_sim)
-                        fprintf(stderr, "[WARN] 库 N=%u != CNN K=%d — 分类 CNN 未重训对齐, "
-                                "决策层将 argmax 越界钳到 N-1 (Phase 3 重训后移除警告)\n",
-                                bank.n_slots, ctx->sc.K);
-                }
-            }
+        if (scene_bank_load(cfg.bank_file, S, L, &bank) != 0) {
+            fprintf(stderr, "FATAL: SFANC 库 %s 加载失败 — deploy 开环需要成品滤波器库.\n"
+                    "      请先跑闭环标定 (标定态收敛后自动存槽) 或离线生成库.\n",
+                    cfg.bank_file);
+            ret = 1; goto cleanup;
+        }
+        if (bank.n_slots < 1 || bank.slot_len != (uint32_t)(S * L)) {
+            fprintf(stderr, "FATAL: 库 %s 槽数=%u slot_len=%u (期望 >=1 槽, S*L=%d)\n",
+                    cfg.bank_file, bank.n_slots, bank.slot_len, S * L);
             scene_bank_free(&bank);
+            ret = 1; goto cleanup;
         }
-        if (!loaded) {
-            float *wc_fixed = NULL;
-            int wc_len = bin_load_float("data/wc_fixed.bin", &wc_fixed);
-            if (wc_len == S * L) {
-                memcpy(ctx->wc_cur, wc_fixed, S * L * sizeof(float));
-                memcpy(ctx->wc_old, wc_fixed, S * L * sizeof(float)); /* 过渡起点 = 同一固定滤波器 */
-                bin_free(wc_fixed);
-                ctx->fixed_wc_loaded = 1;
-                printf("  MODE = DEPLOY + 静态标定滤波器 data/wc_fixed.bin (%d float, CNN 不覆盖)\n", S * L);
-            } else {
-                if (wc_fixed) bin_free(wc_fixed);
-                printf("  MODE = DEPLOY (开环 µ=0, 无误差麦, CNN 生成式 — 未找到 data/wc_bank.bin / data/wc_fixed.bin, "
-                       "降噪弱; 请先跑一次闭环标定: 听效果收敛后 Ctrl+C 自动保存)\n");
-            }
+        /* 决策层初始化: 分类 CNN (K=N) → scene_ctrl (argmax/防抖) */
+        if (cnn_m5_init_base(DEPLOY_CNN_BASE) != 0) {
+            fprintf(stderr, "FATAL: 分类 CNN 初始化失败 (data/cnn_bank_*.bin 缺失/损坏) — "
+                    "deploy 决策层需要它 argmax 选库槽\n");
+            scene_bank_free(&bank);
+            ret = 1; goto cleanup;
         }
+        if (scene_ctrl_init(&ctx->sc) != 0) {
+            fprintf(stderr, "FATAL: scene_ctrl_init failed\n");
+            scene_bank_free(&bank);
+            ret = 1; goto cleanup;
+        }
+        /* 整库拷贝到 ctx (选槽需随机访问) */
+        ctx->wc_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
+        if (!ctx->wc_bank) {
+            fprintf(stderr, "OOM: wc_bank\n");
+            scene_bank_free(&bank);
+            ret = 1; goto cleanup;
+        }
+        memcpy(ctx->wc_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
+        ctx->bank_n_slots = bank.n_slots;
+        ctx->deploy_class  = 0;
+        ctx->sim_tick      = 0;
+        memcpy(ctx->wc_cur, ctx->wc_bank, S * L * sizeof(float));      /* 槽 0 起步 */
+        memcpy(ctx->wc_old, ctx->wc_bank, S * L * sizeof(float));      /* 过渡起点 = 同槽 */
+        scene_ctrl_set_bank(&ctx->sc, (int)bank.n_slots);             /* 决策层接入库 */
+        scene_ctrl_set_bank_hold(&ctx->sc, cfg.bank_hold_frames);
+        scene_bank_free(&bank);
+        printf("  MODE = DEPLOY + 库 %s (%u 槽, slot_len=%u)", cfg.bank_file,
+               ctx->bank_n_slots, (uint32_t)(S * L));
+        if (cfg.bank_sim)
+            printf(" GFANC_BANK_SIM 轮换 %ds/类\n", cfg.bank_sim_sec);
+        else
+            printf(" 分类选库 (K=%d, 防抖 %d帧)\n", ctx->sc.K, cfg.bank_hold_frames);
+        if (ctx->bank_n_slots != (uint32_t)ctx->sc.K && !cfg.bank_sim)
+            fprintf(stderr, "[WARN] 库 N=%u != CNN K=%d — 分类 CNN 未重训对齐, "
+                    "决策层将 argmax 越界钳到 N-1\n",
+                    ctx->bank_n_slots, ctx->sc.K);
     } else {
-        printf("  MODE = CALIBRATE (闭环 FxLMS + 误差麦; 收敛后 Ctrl+C 自动保存标定滤波器)\n");
+        /* 标定 (adapt): 零启动闭环 FxLMS — Wc 从零收敛, 收敛后自动存库槽. */
+        memset(ctx->wc_cur, 0, S * L * sizeof(float));
+        memset(ctx->wc_old, 0, S * L * sizeof(float));
+        printf("  MODE = CALIBRATE (闭环 FxLMS + 误差麦, 零启动; 收敛后自动存库槽 %d)\n",
+               cfg.cal_scene_index);
     }
 
     /* 缓冲 */
@@ -1437,21 +1349,29 @@ int main(void) {
     ctx->log_file = fopen("scenezone_log.csv", "a");
     if (ctx->log_file) {
         gf_log_timestamp(ctx->log_file, "start");  /* R-28: 可移植时间戳 */
-        fprintf(ctx->log_file, "# sec,scene,max_prob,cos_sim,NR_dB,err_rms,anti_rms,ref_rms,event,k_cluster,n_clusters\n");
+        fprintf(ctx->log_file, "# sec,scene,NR_dB,err_rms,anti_rms,ref_rms,event\n");
         fflush(ctx->log_file);
     }
 
-    /* 主循环: CNN 1Hz 产 Wc, 驱动 Reset/Continuous 双模式 (去场景层) */
+    /* 主循环: deploy = 1Hz CNN 分类决策 (选库槽→crossfade);
+       标定 = 1Hz tick (安静/冻结/发散/收敛自动存槽/诊断). */
     int log_sec = 0;
+    int cal_tick = 0;
     while (ctx->running) {
         gf_sleep_ms(100);  /* R-28: 可移植睡眠 */
-        LONG ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
-        if (ready < 0) continue;
+        LONG ready = -1;
+        if (anc_fixed()) {
+            ready = InterlockedExchange(&ctx->cnn_buf_ready, -1);
+            if (ready < 0) continue;   /* deploy: 等 CNN 1s 缓冲就绪 (首次 ~1s) */
+        } else if (++cal_tick < 10) {
+            continue;                   /* 标定: 1Hz tick (10×100ms) */
+        }
+        cal_tick = 0;
 
-        /* P0-5: 安静退出 (噪声回归) → 下秒走 first_sec INIT 重建 Wc.
+        /* P0-5: 安静退出 (噪声回归) → 下秒走 first_sec INIT 重建 Wc (仅标定).
            跳过自动增益重标定 — 保留已标定增益, 防噪声回归瞬间重标定.
-           清 quiet_active (恢复派发) + 取消挂起的 CrossFader (避免与 INIT 冲突). */
-        if (ctx->reinit_needed) {
+           清 quiet_active + 取消挂起的 CrossFader (避免与 INIT 冲突). */
+        if (!anc_fixed() && ctx->reinit_needed) {
             ctx->quiet_active = 0;
             InterlockedExchange(&ctx->fade_cnt, 0);
             ctx->first_sec = 1;
@@ -1459,16 +1379,14 @@ int main(void) {
             ctx->init_skip_agc = 1;
         }
 
-        float gains[SC_DW_MAX] = {0};
-        int new_scene;
-        const int K = ctx->sc.K;
+        int new_scene = 0;
 
-        /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
-        if (anc_fixed() && ctx->fixed_wc_loaded) {
-            /* ── SFANC 硬选库决策层 (Phase 2 deploy) ──
-               类源: GFANC_BANK_SIM 定时轮换 (验证切换无爆音), 或 CNN argmax → 防抖.
-               类变 → wc_old=当前播放, wc_cur=库槽[c], fade_cnt (delayless crossfade).
-               固定库槽 Wc 为离线收敛成品 (绝对增益烘焙, 无 RMS 归一化) — 开环有效降噪命门. */
+        /* ── SFANC 硬选库决策层 (deploy) ──
+           类源: GFANC_BANK_SIM 定时轮换 (验证切换无爆音), 或 CNN argmax → 防抖.
+           类变 → wc_old=当前播放, wc_cur=库槽[c], fade_cnt (delayless crossfade).
+           固定库槽 Wc 为离线收敛成品 (绝对增益烘焙, 无 RMS 归一化) — 开环有效降噪命门.
+           标定无 CNN 决策: 纯闭环 FxLMS, Wc 由梯度驱动. */
+        if (anc_fixed()) {
             int c = ctx->deploy_class;
             if (!ctx->first_sec && ctx->fade_cnt == 0) {   /* 首秒 INIT 提交槽0; crossfade 期间跳过决策 */
                 if (cfg.bank_sim && ctx->bank_n_slots > 1) {
@@ -1496,25 +1414,13 @@ int main(void) {
                 ctx->deploy_class = c;
             }
             new_scene = ctx->deploy_class;
-            for (int i = 0; i < K; i++) gains[i] = 0.0f;
-        } else if (ctx->fade_cnt > 0) {
-            memcpy(gains, ctx->sc.prev_gains, K * sizeof(float));
-            new_scene = 0;
-            for (int i = 1; i < K; i++)
-                if (fabsf(gains[i]) > fabsf(gains[new_scene])) new_scene = i;
-        } else {
-            new_scene = scene_ctrl_process(&ctx->sc, ctx->cnn_buf[ready], ctx->wc_cur, gains);
         }
 
         if (ctx->first_sec) {
-            /* 首次 INIT (两模式一致): CNN Wc → 影子缓冲 → 冷启动 ramp.
+            /* 首次 INIT (两模式一致): 提交当前 Wc → 影子缓冲 → 冷启动 ramp.
                去场景层: 无场景记忆; wc_init_max 由 wc_cur 推导,
-               last_good_wc = INIT 值 (后续由 check_convergence 刷新). */
-            /* 方案C fixed: 跳过冷启动 30% 软化 — 固定滤波器 (CNN 初值或标定导出)
-               已是已知好解, 无需 FxLMS 重长路径; adapt 保留 (收敛辅助). */
-            if (!anc_fixed() && cfg.wc_cold_start < 1.0f && cfg.wc_cold_start > 0.0f) {
-                for (int i = 0; i < S*L; i++) ctx->wc_cur[i] *= cfg.wc_cold_start;
-            }
+               last_good_wc = INIT 值 (后续由 check_convergence 刷新).
+               deploy = 库槽0 (加载时已就绪, 已知好解不软化); 标定 = 零启动. */
             float mx = sm_wc_max_abs(ctx->wc_cur, S*L);
             ctx->wc_init_max = (mx > 0.001f) ? mx : 0.01f;
             /* 通过影子缓冲提交 Wc (主线程→回调, 零数据竞争) */
@@ -1524,19 +1430,13 @@ int main(void) {
             if (!anc_fixed())
                 InterlockedExchange((LONG volatile *)&ctx->fx.freeze_lms, 0);
             ctx->freeze_timer = 0; ctx->freeze_permanent = 0;
-            memcpy(ctx->anchor_gains, gains, K * sizeof(float));
-            ctx->reset_pending = 0;  /* RESET 迟滞计数清零 (重建锚点) */
-            ocg_reset(&ctx->ocg, gains);  /* OCG: 首个增益建立簇 0 */
-            /* INIT 用 2× ramp: Wc 从零开始, LMS 需更长时间收敛.
-               RESET 用 1× ramp: CrossFader 已平滑过渡, 无需延长. */
+            /* INIT 用 2× ramp: 标定 Wc 从零开始, LMS 需更长时间收敛 */
             int init_ramp_ms = cfg.ramp_ms * 2;
             InterlockedExchange(&ctx->ramp_cnt, (FS_ANC * init_ramp_ms / 1000));
             InterlockedExchange(&ctx->mute_hold, (FS_ANC * cfg.mute_hold_ms / 1000));
             InterlockedExchange(&ctx->cold_hold, 2 * FS_ANC);  /* 冷启动 anti 限幅 */
-            char topbuf[64];
-            sm_fmt_top_gains(gains, K, topbuf, sizeof(topbuf));
-            printf("[CNN] INIT top=%s (ramp %dms, mute_hold %dms)\n",
-                   topbuf, init_ramp_ms, cfg.mute_hold_ms);
+            printf("[ANC] INIT Wc=%s (ramp %dms, mute_hold %dms)\n",
+                   anc_fixed() ? "库槽0" : "零启动", init_ramp_ms, cfg.mute_hold_ms);
             /* ── 自动增益标定: 如用户未设 GFANC_MIC_GAIN, 根据实测 ref 电平一次标定 ──
                P0-5: 安静重建时跳过 (init_skip_agc) — 保留已标定增益 */
             if (!getenv("GFANC_MIC_GAIN") && !ctx->init_skip_agc) {
@@ -1554,22 +1454,17 @@ int main(void) {
             ctx->first_sec = 0;
             ctx->init_skip_agc = 0;
         } else {
-            /* S-1修复: cos(anchor, cur) 替代 cos(prev, cur).
-               Reset 模式以该值作触发判据; Continuous 模式仅供诊断. */
-            float cos_sim = sm_cos_sim(ctx->anchor_gains, gains, K);
-
-            print_diagnostics(ctx, new_scene, cos_sim, gains);
+            print_diagnostics(ctx);
 
             /* 运行时统计日志 (C1) */
             if (ctx->log_file) {
-                fprintf(ctx->log_file, "%d,%d,%.3f,%.3f,%.1f,%.4f,%.4f,%.4f,%s%s,%d,%d\n",
-                        log_sec++, new_scene, gains[new_scene], cos_sim,
+                fprintf(ctx->log_file, "%d,%d,%.1f,%.4f,%.4f,%.4f,%s%s\n",
+                        log_sec++, new_scene,
                         anc_fixed() ? 0.0f : ctx->nr_level,  /* 开环无误差麦, NR 无意义 */
                         ctx->err_rms, ctx->anti_rms, ctx->ref_rms,
                         ctx->safety_mute ? "MUTE" : "",
                         anc_fixed() ? "FIXED"
-                          : (ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : ""),
-                        ctx->ocg.active, ctx->ocg.n_clusters);
+                          : (ctx->fx.freeze_lms ? (ctx->freeze_permanent ? "FREEZE_PERM" : "FREEZE") : ""));
                 fflush(ctx->log_file);
             }
 
@@ -1583,12 +1478,12 @@ int main(void) {
                 ctx->nan_in_cnt = 0;
             }
 
-            /* 方案C fixed: 无梯度不可能发散, 收敛/发散检测跳过 (wc_init_max 对比无意义);
-               adapt 下正常跑 (收敛标记 + Wc 稳定性自动保存标定滤波器). */
+            /* 标定 (deploy 开环无梯度, 发散/收敛检测跳过 — wc_init_max 对比无意义):
+               发散救援 + freeze + 收敛标记 + Wc 稳定性自动存库槽. */
             if (!anc_fixed()) {
                 check_wc_divergence(ctx);
                 check_convergence(ctx);
-                check_wc_stable_autosave(ctx);  /* 方案C: Wc 收敛稳定 → 运行中自动保存标定 */
+                check_wc_stable_autosave(ctx);  /* Wc 收敛稳定 → 运行中自动存库槽 */
             }
 
             /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
@@ -1657,64 +1552,25 @@ int main(void) {
                 ctx->quiet_sec = 0;
             }
 
-            /* 去场景层模式派发: reset=OCG 簇索引变化 → CrossFader 过渡到新 Wc;
-               continuous=永不重置 (CNN 仅首秒 INIT 一次).
-               P0-5: quiet_active 期间跳过 — 反噪声在消退, 不允许重置重新拉高 Wc.
-               OCG (默认关闭 — 2026-08-10 P0-3 实测证伪): 纯音深对消下增益在两
-               个模式间震荡 (帧间 cos 0.65-0.71), OCG 簇分配随震荡翻转 (0↔1↔2),
-               每次翻转都 RESET → 深对消被反复打断 (最高仅 ~18dB, 而 OCG 关可达
-               27.5dB), err 锯齿 0.05↔0.18. OCG 关 (GFANC_OCG=0) 回退旧闸门
-               cos(anchor,cur)<τ, 已验证稳定. OCG 代码保留, 待簇判据更鲁棒后再评估. */
-            if (!ctx->quiet_active && cfg.gfanc_mode == 1
-                && !(anc_fixed() && ctx->fixed_wc_loaded)) {   /* reset (安静期不派发; 方案C fixed+静态 无场景切换) */
-                if (cfg.ocg_enable) {
-                    /* OCG 已有 ocg_hold 持续性判据, 簇索引变化才切换 */
-                    if (ocg_step(&ctx->ocg, gains))
-                        apply_reset(ctx, cos_sim, gains, 1);
-                } else {
-                    /* cos 闸门 + RESET 迟滞: cos 连续 reset_hyst 秒 < τ 才触发软重锚定.
-                       场景切换提交 wc_cur (CNN 已算好的新滤波器), FxLMS 从正确起点微调.
-                       迟滞挡 1 秒瞬态; 软重锚定无 cold_hold/mute 打断. */
-                    if (cos_sim < cfg.switch_threshold) {
-                        if (++ctx->reset_pending >= cfg.reset_hyst) {
-                            apply_reset(ctx, cos_sim, gains, 0);
-                            ctx->reset_pending = 0;
-                        }
-                    } else {
-                        ctx->reset_pending = 0;
-                    }
-                }
-            }                                   /* continuous: 不动作 */
         }
-        memcpy(ctx->sc.prev_gains, gains, K * sizeof(float));
     }
 
     printf("\nStopping...\n");
     p_Pa_StopStream(stream);
     p_Pa_CloseStream(stream);
 
-    /* ── 方案C 全自动标定: adapt 曾收敛 → Ctrl+C 退出时自动保存标定滤波器
+    /* ── 标定全自动保存: adapt 曾收敛 → Ctrl+C 退出时兜底写库槽 cfg.cal_scene_index
        (Wc 稳定性检测已在运行中自动保存过则跳过; 此处兜底 NR 收敛路径).
        fx.wc = 当前工作滤波器 (带本设备绝对振幅+相位), 流已停无并发写. ── */
     if (ret == 0 && !anc_fixed() && ctx->wc_autosaved) {
-        printf("[SAVE] 标定滤波器已在运行中自动保存 (data/wc_fixed.bin), 无需重复保存\n");
+        printf("[SAVE] 标定滤波器已在运行中自动保存 (库槽%d), 无需重复保存\n",
+               cfg.cal_scene_index);
     } else if (ret == 0 && !anc_fixed() && ctx->snapshot_capable) {
-        FILE *f = fopen("data/wc_fixed.bin", "wb");
-        int bank_ok = -1;
-        if (f) {
-            fwrite(ctx->fx.wc, sizeof(float), S * L, f);
-            fclose(f);
-            /* Phase 1: 兜底保存也同步写库槽 cfg.cal_scene_index (绝对增益原样, 不 RMS 归一化) */
-            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, cfg.cal_scene_index, ctx->fx.wc);
-            printf("[SAVE] 已保存标定滤波器 data/wc_fixed.bin (%d float, %d B) — "
-                   "下次 deploy 模式自动加载 (bank 槽%d %s)\n",
-                   S * L, (int)(S * L * (int)sizeof(float)),
-                   cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
-        } else {
-            fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
-        }
+        int bank_ok = scene_bank_save_slot(cfg.bank_file, S, L, cfg.cal_scene_index, ctx->fx.wc);
+        printf("[SAVE] 已保存标定滤波器 → 库 %s 槽%d (%s) — deploy 模式自动加载\n",
+               cfg.bank_file, cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
     } else if (ret == 0 && !anc_fixed()) {
-        printf("[SAVE] 跳过: 未检测到收敛 (NR>3dB 或 Wc 稳定均未达到), 未保存 data/wc_fixed.bin\n");
+        printf("[SAVE] 跳过: 未检测到收敛 (NR 或 Wc 稳定均未达到), 未保存库槽\n");
     }
 
 cleanup:
@@ -1742,7 +1598,7 @@ cleanup:
             fclose(lf);
         }
     }
-    cnn_m5_free();  /* C2: 释放 CNN 实例 (权重+激活缓冲) */
+    if (anc_fixed()) cnn_m5_free();  /* C2: 释放 CNN 实例 (仅 deploy init, 权重+激活缓冲) */
     p_Pa_Terminate();
     if (ret == 0) printf("Done.\n");
     return ret;

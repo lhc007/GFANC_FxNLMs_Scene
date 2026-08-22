@@ -1,13 +1,13 @@
 """
 CNN 分类器从零训练 — SFANC 硬选库 (deploy) 决策 CNN, 通用 N 类.
 
-与 train_real_cnn.py (直接权重回归) 的区别 (Phase 2/3):
+SFANC 硬选库唯一决策 CNN (分类, 通用 N 类):
   - 标签: 离线打分标签 (export/generate_bank.py --labels 生成),
           CSV 列 File_path, filter_idx — 无语义场景, 槽 k = 第 k 条滤波器.
-  - 硬标签: one-hot + CrossEntropyLoss (删 KLDivLoss/软标签)
+  - 硬标签: one-hot + CrossEntropyLoss
   - K:      从标签推导 (max filter_idx + 1), 无需 scene_definitions_bank.json
   - 输出:   models/MIMO_M5_Scene_Bank.pth
-回归 CNN (K=30) 保留给 calibrate 模式 (标定暖启动), 互不影响.
+回归 CNN 线 (直接权重 K=30) 已整体移除 — 本脚本是唯一 CNN 训练入口.
 
 用法:
     python training/network/train_real_bank_cnn.py
@@ -183,7 +183,7 @@ _bp_pad = _bp.numel() - 1
 
 
 def prepare_batch(x):
-    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_process 一致)"""
+    """[B,1,16000] -> 带通 -> minmaxscaler (与部署端 scene_ctrl_norm_forward 一致)"""
     x = nn.functional.conv1d(x, _bp_w, padding=_bp_pad)[:, :, :16000]
     scale = x.amax(dim=-1, keepdim=True) - x.amin(dim=-1, keepdim=True)
     return torch.where(scale > 1e-10, x / scale.clamp(min=1e-10), x)

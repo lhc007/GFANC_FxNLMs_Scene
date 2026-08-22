@@ -13,7 +13,7 @@ void  bin_free(float *data);
 float *bin_load(const char *name, int *n_out);
 
 /* ── R-27: 批次指纹 (batch fingerprint) ──
- * 指纹 = 对 [排序后的 data/cnn_*.bin + sub_filters.bin + bandpass_fir.bin
+ * 指纹 = 对 [排序后的 data/cnn_bank_*.bin + bandpass_fir.bin
  *           + bandpass_anc.bin] 原始字节做链式 crc32
  *         (与 Python zlib.crc32(data, prev) 语义一致, 见 export_bin.py).
  * 声学路径 (secondary/primary/feedback/…) 是安装态可替换的测量值, 不入指纹

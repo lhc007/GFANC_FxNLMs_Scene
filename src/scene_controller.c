@@ -1,12 +1,8 @@
-/** SceneController — CNN 决策层 (去场景层 + SFANC 硬选库).
+/** SceneController — CNN 决策层 (SFANC 硬选库分类).
  *
- * 对应 Python: gfanc/SceneController.py (直接权重回归版, 参考 MIMO_GFANC
- *   Main_GFANC_FxNLMS_Reset.ipynb 的 soft 权重 Wc 构造).
+ * 每秒一次: 1s 带通噪声 → minmax → CNN → argmax → 防抖 → 类索引 → 调用方选库槽.
  *
- * 每秒一次: 1s 带通噪声 → minmax → CNN → (calibrate) tanh 增益 → Wc 构造
- *   或 (deploy) argmax → 类索引 → 调用方选库槽.
- *
- * K (CNN 输出维) 从 cnn_linear_weight.bin 大小自动推导 (cnn_m5_forward.c).
+ * K (CNN 输出维) 从 cnn_bank_linear_weight.bin 大小自动推导 (cnn_m5_forward.c).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,63 +12,24 @@
 #include "scene_controller.h"
 #include "cnn_m5_forward.h"
 
-int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
+int scene_ctrl_init(scene_ctrl_t *sc)
 {
-    int S = SC_S, C = SC_C;
     sc->K = cnn_m5_get_K();
-    /* 双模式 (Phase 3):
-       K==S*C (30) → 直接权重回归 (calibrate 暖启动, scene_ctrl_process);
-       K!=S*C (N=4) → SFANC 分类 (deploy, scene_ctrl_classify).
-       分类 CNN 的 K 与库槽数 N 对齐由调用方校验 (main_realtime WARN). */
-    sc->classify_mode = (sc->K != S * C) ? 1 : 0;
-    if (sc->classify_mode) {
-        printf("  scene_ctrl: 分类模式 (K=%d, SFANC 硬选库 — deploy)\n", sc->K);
-    } else {
-        printf("  scene_ctrl: 回归模式 (K=%d = S%d×C%d, 直接权重 — calibrate)\n",
-               sc->K, S, C);
-    }
-    sc->sub_filters = sub_filters;
-    sc->L           = filter_len;
-    sc->prev_gains_valid = 0;
-    memset(sc->prev_gains, 0, sizeof(sc->prev_gains));
-    sc->gain_smooth_beta   = 0.5f;   /* P0-2 默认, 可被 scene_ctrl_set_gain_smoothing 覆盖 */
-    sc->gain_smooth_switch = 0.85f;
+    printf("  scene_ctrl: 分类模式 (K=%d, SFANC 硬选库 — deploy)\n", sc->K);
     sc->norm_denom_valid = 0;        /* 输入归一化 EMA 稳定标定 (2026-08-10) */
     sc->norm_ema_alpha   = 0.1f;
-    /* SFANC 分类选库 (Phase 2) 初始状态: 未接入库, 无选定类, 防抖计数清零 */
+    /* SFANC 分类选库 初始状态: 未接入库, 无选定类, 防抖计数清零 */
     sc->bank_n           = 0;
     sc->sel_class        = 0;
     sc->cand_class       = -1;       /* 无候选 */
     sc->cand_cnt         = 0;
     sc->bank_hold_frames = 2;        /* GFANC_BANK_HOLD 默认 */
-
-    /* stub RMS: 所有子滤波器等权求和 → RMS.
-       R-24: 静态临时缓冲 (init 期一次性使用, ≤32KB) */
-    int L = filter_len;
-    static float stub_buf[GFANC_S_MAX * GFANC_L_MAX];
-    float *stub = stub_buf;
-    memset(stub, 0, S * L * sizeof(float));
-    for (int c = 0; c < C; c++)
-        for (int s = 0; s < S; s++)
-            for (int l = 0; l < L; l++)
-                stub[s * L + l] += sub_filters[(c * S + s) * L + l];
-    float ss = 0;
-    for (int i = 0; i < S * L; i++) ss += stub[i] * stub[i];
-    sc->stub_rms = sqrtf(ss / (S * L));
-    sc->wc_rms_target = sc->stub_rms;  /* 默认值, 实时版按 Ŝ 物理特性覆盖 */
     return 0;
 }
 
 void scene_ctrl_free(scene_ctrl_t *sc)
 {
     (void)sc;   /* 无动态分配, 保留为 no-op */
-}
-
-/** P0-2 增益时间平滑参数 (beta∈[0,1], 1=关闭; switch_cos=场景切换旁路阈值). */
-void scene_ctrl_set_gain_smoothing(scene_ctrl_t *sc, float beta, float switch_cos)
-{
-    sc->gain_smooth_beta   = (beta >= 0.0f && beta <= 1.0f) ? beta : 0.5f;
-    sc->gain_smooth_switch = switch_cos;
 }
 
 void scene_ctrl_set_bank(scene_ctrl_t *sc, int n_slots)
@@ -89,41 +46,6 @@ void scene_ctrl_set_bank(scene_ctrl_t *sc, int n_slots)
 void scene_ctrl_set_bank_hold(scene_ctrl_t *sc, int hold_frames)
 {
     sc->bank_hold_frames = (hold_frames > 0) ? hold_frames : 2;
-}
-
-/** 直接权重 Wc 构造: wc[s*L+l] = Σ_c gains[s*C+c] · sub[(c*S+s)*L+l].
- *  gains 为 tanh 输出 (带符号 [-1,1]), 不额外归一化/钳位.
- *  末尾 S-4 取反 + 缩放到目标 RMS (自动标定, 基于 Ŝ 物理衰减). */
-void scene_ctrl_construct_wc(const scene_ctrl_t *sc, const float *gains, float *wc_out)
-{
-    int S = SC_S, C = SC_C, L = sc->L;
-
-    for (int s = 0; s < S; s++)
-        for (int l = 0; l < L; l++) {
-            float v = 0;
-            for (int c = 0; c < C; c++)
-                v += gains[s * C + c] * sc->sub_filters[(c * S + s) * L + l];
-            wc_out[s * L + l] = v;
-        }
-
-    /* S-4 取反. 然后缩放到目标 RMS (自动标定, 基于 Ŝ 物理衰减) */
-    float rms_sq = 0;
-    for (int i = 0; i < S * L; i++) rms_sq += wc_out[i] * wc_out[i];
-    float wc_rms = sqrtf(rms_sq / (S * L));
-    float target_rms = sc->wc_rms_target;
-    if (wc_rms > 1e-6f && target_rms > 1e-6f) {
-        float scale = target_rms / wc_rms;
-        for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i] * scale;
-    } else {
-        if (wc_rms < 1e-6f) {
-            static int warn_cnt = 0;
-            if (warn_cnt < 3) {
-                fprintf(stderr, "[WARN] Wc RMS=%.6f near zero (all gains ~0)\n", wc_rms);
-                warn_cnt++;
-            }
-        }
-        for (int i = 0; i < S * L; i++) wc_out[i] = -wc_out[i];
-    }
 }
 
 /* 共享前置: minmax → EMA denom 稳定 → 归一化 → CNN 前向 → logits.
@@ -161,76 +83,6 @@ static int scene_ctrl_norm_forward(scene_ctrl_t *sc, const float *audio, float *
 
     if (cnn_m5_forward(cnn_in, logits) != 0) return -1;
     return 0;
-}
-
-int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
-                       float *wc_out, float *gains_out)
-{
-    int S = SC_S, C = SC_C, L = sc->L, SC = S * C;
-    int K = sc->K;
-
-    /* 分类模式 (deploy, K=N≠S*C): 无回归 Wc 合成路径 — 调用方必须走
-       scene_ctrl_classify 选库槽. 防御: 输出零, 防 OOB (logits 只有 K<N 维). */
-    if (sc->classify_mode) {
-        memset(gains_out, 0, SC * sizeof(float));
-        memset(wc_out, 0, S * L * sizeof(float));
-        return 0;
-    }
-
-    /* CNN 前向 → 30 维原始 logits */
-    float logits[SC_DW_MAX];
-    int rc = scene_ctrl_norm_forward(sc, audio, logits);
-    if (rc != 0) {
-        /* 弱信号 (1) 或 CNN 失败 (-1): 保持上一秒增益 (若有), 否则零增益
-           (FxNLMS 从零自适应收敛) */
-        if (sc->prev_gains_valid) {
-            memcpy(gains_out, sc->prev_gains, SC * sizeof(float));
-            scene_ctrl_construct_wc(sc, gains_out, wc_out);
-            return 0;
-        }
-        memset(gains_out, 0, SC * sizeof(float));
-        memset(wc_out, 0, S * L * sizeof(float));
-        return 0;
-    }
-
-    /* tanh → 带符号子带增益 [-1,1] (与训练 tanh+MSE 一致) */
-    int argmax = 0;
-    float gmax = fabsf(logits[0]);
-    for (int i = 0; i < SC; i++) {
-        float g = tanhf(logits[i]);
-        gains_out[i] = g;
-        if (fabsf(g) > gmax) { gmax = fabsf(g); argmax = i; }
-    }
-
-    /* P0-2 自适应增益时间平滑: 纯音下 bands 跨秒翻转 (抖动) 会让 OCG/cos 闸门受害.
-       大变化 (帧间 cos < switch, 场景真切换) → β=1 立即跟随, 无切换延迟;
-       小抖动 (cos ≥ switch) → β 慢速 EMA 吸收, 增益方向稳定.
-       注: 平滑后的 gains_out 同时用于 Wc 构造、cos 闸门、OCG 簇判定. */
-    if (sc->prev_gains_valid && sc->gain_smooth_beta < 1.0f) {
-        float dot = 0, na = 0, nb = 0;
-        for (int i = 0; i < SC; i++) {
-            dot += sc->prev_gains[i] * gains_out[i];
-            na  += sc->prev_gains[i] * sc->prev_gains[i];
-            nb  += gains_out[i] * gains_out[i];
-        }
-        float cos_prev = (na > 1e-9f && nb > 1e-9f)
-                       ? dot / (sqrtf(na) * sqrtf(nb)) : 1.0f;
-        float beta = (cos_prev < sc->gain_smooth_switch) ? 1.0f : sc->gain_smooth_beta;
-        if (beta < 1.0f) {
-            for (int i = 0; i < SC; i++)
-                gains_out[i] = (1.0f - beta) * sc->prev_gains[i] + beta * gains_out[i];
-        }
-    }
-
-    /* 直接权重构造 Wc + RMS 标定 + 取反 (用平滑后增益, 抑制 Wc 逐秒跳变) */
-    scene_ctrl_construct_wc(sc, gains_out, wc_out);
-
-    /* 更新历史增益 (存平滑后值, 作为下帧抖动比较基准) */
-    memcpy(sc->prev_gains, gains_out, SC * sizeof(float));
-    sc->prev_gains_valid = 1;
-    (void)K;
-
-    return argmax;
 }
 
 /* SFANC 分类决策 (deploy): audio_1s → minmax → CNN → argmax → 防抖 → 更新 sel_class.

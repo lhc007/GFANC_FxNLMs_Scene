@@ -1,13 +1,16 @@
-/** GFANC FxNLMS — 离线 WAV 降噪 (统一实时路径).
+/** SceneZone-ANC — 离线 WAV 降噪评估 (SFANC 硬选库, 纯开环).
  *
- *  信号路径与 main_realtime.c 完全一致, 仅 I/O 不同:
+ *  信号路径与 main_realtime.c deploy 分支完全一致, 仅 I/O 不同:
  *    实时版: PortAudio 硬件 (ADC/DAC)
  *    离线版: WAV 文件读写
+ *  开环硬选 (唯一路径): 从 data/wc_bank.bin 选槽 (SIM 轮换 / 分类 CNN argmax /
+ *    静态槽), 固定 Wc 纯前向 (µ=0, 无误差麦驱动). 误差麦信号仍合成 (Pri+Ŝ)
+ *    用于 NR_true 度量 (离线可测). 无库 → FATAL.
  *
  *  编译: gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c
  *              src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c
- *              -lm -o main.exe
- *  运行: ./main.exe <noise.wav>
+ *              src/scene_bank.c -lm -o main.exe
+ *  运行: ./main.exe <noise.wav>   (GFANC_BANK_SIM=1 轮换 / GFANC_FORCE_CLASS=k 静态)
  *  输出: anti_out.wav (S=2ch 反噪声), error_out.wav (E=3ch 误差麦信号)
  */
 #include <stdio.h>
@@ -24,7 +27,6 @@
 #include "cnn_m5_forward.h"
 #include "scene_controller.h"
 #include "scene_manager.h"
-#include "ocg.h"
 #include "fxnlms_mimo.h"
 #include "scene_bank.h"
 
@@ -173,6 +175,7 @@ static float *resample_mono(const float *in, int n_in, int sr_in, int sr_out, in
 #define E       3
 #define S       2
 #define C       15
+#define L       1024  /* 控制滤波器长度 (与库槽长 S*L 对齐, scene_bank_load 校验) */
 #define FS      16000
 #define BP_LEN  1024   /* CNN 带通 (分类需频率分辨率) */
 #define BP_ANC_LEN 64 /* BUG-6: ANC 带通 (与实时版一致, 64tap 群延迟 2ms vs 8ms — 砍环路延迟) */
@@ -214,18 +217,19 @@ int main(int argc, char **argv)
     gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
     gfanc_config_load_env(&cfg);
     if (argc < 2) {
-        printf("GFANC FxNLMS — Offline WAV ANC Demo\n\n");
-        printf("Usage: %s <noise.wav>\n\n", argv[0]);
+        printf("SceneZone-ANC — Offline WAV ANC Eval (SFANC 硬选库, 纯开环)\n\n");
+        printf("Usage: %s <noise.wav>\n", argv[0]);
+        printf("  GFANC_BANK_SIM=1    定时轮换库槽类 (验证切换无爆音)\n");
+        printf("  GFANC_FORCE_CLASS=k 强制静态库槽 k\n\n");
         printf("Output: anti_out.wav (%d ch), error_out.wav (%d ch)\n", S, E);
         return 1;
     }
 
     /* ── 1. 加载权重 (R-3: 逐文件校验长度) ── */
     printf("Loading weights...\n");
-    float *sec_path, *pri_path, *sub_filters, *bp_coeff;
+    float *sec_path, *pri_path, *bp_coeff;
     int sec_len  = bin_load_float("data/secondary_path.bin", &sec_path);
     int pri_len  = bin_load_float("data/primary_path.bin", &pri_path);
-    int sub_len  = bin_load_float("data/sub_filters.bin", &sub_filters);
     int bp_len   = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
     /* BUG-6: ANC 专用短带通 (64tap, 与实时版一致). 无文件时截取 1024tap 前 64 点. */
     float *bp_anc_coeff = NULL;
@@ -254,28 +258,16 @@ int main(int argc, char **argv)
             memcpy(pad + preview_delay, pri_path, E*PRI_LEN*sizeof(float));
             pri_path_used = pad;
             printf("  VIRT preview: %s ms → %d samples added to Pri\n", vp, preview_delay); } }
-    if (sub_len < C*S || sub_len % (C*S) != 0) {
-        fprintf(stderr, "FATAL: sub_filters.bin invalid size %d (expect multiple of %d)\n", sub_len, C*S);
-        return 1;
-    }
     if (bp_len < BP_LEN) {
         fprintf(stderr, "FATAL: bandpass_fir.bin too short/load failed (%d<%d)\n", bp_len, BP_LEN);
         return 1;
     }
-    int L = sub_len / (C * S); /* 1024 */
-    if (L < 64 || L > 4096) {
-        fprintf(stderr, "FATAL: filter length L=%d out of range [64,4096]\n", L);
-        return 1;
-    }
-    printf("  OK: sec=%d pri=%d sub=%d bp=%d L=%d\n", sec_len, pri_len, sub_len, bp_len, L);
+    printf("  OK: sec=%d pri=%d bp=%d L=%d\n", sec_len, pri_len, bp_len, L);
     (void)pri_len;
 
     /* ── 2. 初始化组件 ── */
-    /* CNN 必须先初始化 (加载权重) */
-    if (cnn_m5_init() != 0) { fprintf(stderr, "CNN init failed\n"); return 1; }
-    printf("  CNN loaded.\n");
-
-    /* R-27: 批次指纹 — 检测 cnn/sub_filters/bandpass 是否跨批混配 (WARN, 不阻断) */
+    /* R-27: 批次指纹 — 检测 cnn_bank/bandpass 是否跨批混配 (WARN, 不阻断).
+       分类 CNN (cnn_bank_*.bin) 只在库 N≥2 且需要分类时初始化, 见下方模式选择. */
     bin_check_batch();
 
     /* 2a. 带通 FIR */
@@ -314,16 +306,12 @@ int main(int argc, char **argv)
                " (默认0ms, GFANC_EMBED_DELAY_MS 显式开启; 可覆盖)\n",
                virt_delay * 1000 / FS, virt_delay); }
     int sec_padded = SEC_LEN + DSP_DELAY + virt_delay;
-    fir_filter_t *sec_firs = (fir_filter_t *)calloc(E * S, sizeof(fir_filter_t));
     float *sec_coeffs = (float *)calloc(E * S * sec_padded, sizeof(float));
     for (int e = 0; e < E; e++)
         for (int s = 0; s < S; s++) {
             int idx = e * S + s;
             memcpy(sec_coeffs + idx * sec_padded + DSP_DELAY + virt_delay,
                    sec_path + idx * SEC_LEN, SEC_LEN * sizeof(float));
-            sec_firs[idx].coeffs = sec_coeffs + idx * sec_padded;
-            sec_firs[idx].n_taps = sec_padded;
-            sec_firs[idx].delay_line = (gfanc_delay_t *)calloc(sec_padded, sizeof(gfanc_delay_t));
         }
 
     /* 因果性报告: 净预览时间 = τ_pri − τ_spk − τ_proc.
@@ -351,21 +339,7 @@ int main(int argc, char **argv)
         pri_firs[e].ptr = pri_raw_firs[e].ptr = 0;
     }
 
-    /* 2d. Scene Controller (直接权重 Wc 生产者) */
-    scene_ctrl_t sc;
-    if (scene_ctrl_init(&sc, sub_filters, L) != 0) {
-        fprintf(stderr, "ERROR: scene_ctrl_init failed\n"); return 1;
-    }
-    /* P0-2: 增益时间平滑参数 (与实时版一致, env 覆盖) */
-    scene_ctrl_set_gain_smoothing(&sc, cfg.gain_smooth_beta, cfg.gain_smooth_switch);
-    /* OCG 聚类闸门 (与实时版一致): τ 独立 (P0-1, ocg_tau 不再复用 switch_threshold);
-       持续性命中帧数 ocg_hold (P0-3 修复, 前提②) */
-    ocg_t ocg;
-    if (ocg_init(&ocg, sc.K, cfg.ocg_tau,
-                 cfg.ocg_alpha, cfg.ocg_max_clusters, cfg.ocg_hold) != 0) {
-        fprintf(stderr, "ERROR: ocg_init failed\n"); return 1;
-    }
-    /* 直接权重模式要求 CNN 输出 = S*C = 30 (已在 scene_ctrl_init 校验) */
+    /* 2d. (SFANC 分类决策层 在库加载后按需初始化, 见下方模式选择) */
 
     /* 2e. FxNLMS — R-58-10: 步长默认值与修复后链路重新标定.
        R-58-8 曾在旧链路 (含 es∝G² 双增益 + 梯度相位失配) 下扫描, 0.005 发散、
@@ -386,10 +360,7 @@ int main(int argc, char **argv)
     if (fxnlms_init(&fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
         fprintf(stderr, "ERROR: fxnlms_init OOM\n"); return 1;
     }
-    /* R-58-9: 离线仿真走 fxnlms_tick_rt 路径, 显式切到 sum 归一化 (与训练世界一致).
-       实时版 (main_realtime.c) 不调用此函数 → 保持默认 mean+cap 硬件标定语义. */
-    fxnlms_set_norm(&fx, 1);
-    printf("  System ready (CNN loaded).\n");
+    printf("  System ready.\n");
 
     /* ── 3. 读取 WAV ── */
     wav_t wav;
@@ -474,21 +445,6 @@ int main(int argc, char **argv)
         bp_err_nr[e].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
         bp_err_nr[e].ptr = 0;
     }
-    /* R-58-10: 梯度 Fx 也过 64tap 带通 (与 err_meas 同路径) — 修复梯度相位失配.
-       err_meas = bp_err(es) 带 31.5 样本群延迟, 若 Fx = Ŝ⊗ref_anc 不过 bp → 梯度与
-       误差错位 31.5 样本 → FxLMS 临界稳定 → Wc 相位慢漂移 → 降噪随时间衰减 (root cause).
-       修复: Fx 过同一 bp_anc → ∂err_meas/∂Wc = bp(Ŝ⊗x) 与 eg 逐样本对齐.
-       注意: 必须 E×S 每条路径一个独立 FIR — 若每 e 共享一个, s=1 的 tick 会用
-       s=0 污染的延迟线 → 第二扬声器的滤波参考被交叉污染 → Wc[1] 梯度错位 → 慢漂移. */
-    fir_filter_t bp_fx[E * S];
-    memset(bp_fx, 0, sizeof(bp_fx));
-    for (int i = 0; i < E * S; i++) {
-        bp_fx[i].coeffs = bp_anc_coeff;
-        bp_fx[i].n_taps = BP_ANC_LEN;
-        bp_fx[i].delay_line = (gfanc_delay_t *)calloc(BP_ANC_LEN, sizeof(gfanc_delay_t));
-        bp_fx[i].ptr = 0;
-    }
-
     /* ── 4. 离线 ANC (与实时版 main_realtime.c 信号路径一致, 仅 I/O 不同) ── */
     int chunk = FS, n_sec = (N + chunk - 1) / chunk;
     float *anti_out = (float *)calloc(S * N, sizeof(float));
@@ -497,13 +453,6 @@ int main(int argc, char **argv)
     /* CrossFader 状态 */
     int   fade_cnt = 0;
     float wc_old[S*L], wc_cur[S*L];
-
-    /* ── Reset 模式锚点 (去场景层, 匹配实时版) ──
-       CNN 仍是每秒 Wc 生产者 (scene_ctrl_process, 直接权重); 场景切换/记忆/滞回/OCG 已移除.
-       reset 模式: cos_sim(anchor_gains, cur_gains) < switch_threshold → CrossFader 重置到新 Wc.
-       continuous 模式: 仅首秒初始化, 之后 FxNLMS 永不重置. */
-    float anchor_gains[SC_DW_MAX];  /* 上次重置时的 30 维增益锚点 */
-    int   first_sec = 1;            /* 首秒 INIT: CNN Wc → FxNLMS 初始化 */
 
     /* ── NR 累积 (诚实NR, 匹配实时版) ── */
     float acc_err = 0, acc_anti_est = 0, acc_d_est = 0, acc_err_cross = 0;
@@ -520,190 +469,115 @@ int main(int argc, char **argv)
     float err_meas[E] = {0};
 
     printf("\n%4s | %22s | %6s | %6s | %6s | %7s | %6s | %s\n",
-           "Sec", "TopBands", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
+           "Sec", "BankClass", "NR_est", "NR_true", "err", "refFilt", "anti", "Note");
     for (int i = 0; i < 105; i++) printf("-");
     printf("\n");
 
-    /* A/B 对照 (GFANC_CNN_FIXED=1): 覆盖 CNN 输出为固定增益 (250Hz 纯音的实测输出),
-       证明"CNN 频率盲 → 输出方向恒定"对降噪的实际影响 (仅 FxLMS 自适应). */
-    int cnn_fixed = getenv("GFANC_CNN_FIXED") ? atoi(getenv("GFANC_CNN_FIXED")) : 0;
-    static const float fixed_gains[SC_DW_MAX] = {
-        /* spk0 (低频→高频): 250Hz 实测 tanh 输出 */
-        0.34f, 0.52f, 0.93f, 0.54f, 0.41f, 0.55f, 0.63f, 0.30f,
-        -0.04f, -0.05f, 0.00f, -0.05f, -0.03f, -0.02f, 0.73f,
-        /* spk1 */
-        0.45f, 0.47f, 0.72f, 0.49f, 0.63f, 0.48f, 0.31f, 0.16f,
-        0.28f, 0.15f, 0.09f, 0.07f, 0.04f, -0.04f, 0.40f
-    };
-
-    /* ── 方案C deploy 离线等价: GFANC_OPEN_LOOP=1 开环硬选验证 ──
-       加载 SFANC 库槽 (GFANC_FORCE_CLASS 强制槽, 默认 0), 固定 Wc 纯前向
-       (forward_rt_open, 无梯度/无 CNN 覆盖) — 与 main_realtime deploy 分支同一形态.
-       误差麦信号仍合成 (Pri+Ŝ) 用于 NR_true 度量 (离线可测), 但不驱动任何更新.
-       GFANC_FORCE_CLASS=k 用于量化"选错库槽"代价 (开环错选=反相更差).
-       GFANC_BANK_SIM=1: 定时轮换类 (每 GFANC_BANK_SIM_SEC 秒), 验证切换无爆音 —
-       与 main_realtime 决策层 SIM 路径同构, 但加载整个库做轮换. */
-    int open_loop = getenv("GFANC_OPEN_LOOP") ? atoi(getenv("GFANC_OPEN_LOOP")) : 0;
+    /* ── SFANC 硬选库评估 (纯开环, 唯一路径): 加载库 → 三模式选槽 ──
+       误差麦信号仍合成 (Pri+Ŝ) 用于 NR_true 度量 (离线可测), 但不驱动任何更新 —
+       物理无梯度链 (deploy 与 main_realtime 同一形态). 无库 → FATAL (硬选部署前提). */
     int force_class = getenv("GFANC_FORCE_CLASS") ? atoi(getenv("GFANC_FORCE_CLASS")) : 0;
-    int bank_sim = getenv("GFANC_BANK_SIM") ? atoi(getenv("GFANC_BANK_SIM")) : 0;
-    int bank_sim_sec = getenv("GFANC_BANK_SIM_SEC") ? atoi(getenv("GFANC_BANK_SIM_SEC")) : 3;
-    float *open_wc = NULL;          /* 单槽 Wc (GFANC_FORCE_CLASS 或 N=1 静态) */
-    float *open_bank = NULL;        /* 整库 [N*S*L] (bank_sim 轮换用) */
+    int bank_sim     = cfg.bank_sim;
+    int bank_sim_sec = cfg.bank_sim_sec;
+    float *open_wc = NULL;          /* 初始槽 Wc (fxnlms_set_wc 预载) */
+    float *open_bank = NULL;        /* 整库 [N*S*L] (SIM/分类轮换用) */
     int open_bank_n = 0;
-    int open_class = 0;             /* 当前库槽索引 (SIM 轮换 或 分类选定) */
-    int open_classify = 0;          /* 1=真分类选库 (bank CNN argmax+防抖), 0=SIM/静态 */
-    if (open_loop) {
+    int open_class = 0;             /* 当前库槽索引 */
+    int mode_sim = 0;               /* 1=SIM 轮换 (GFANC_BANK_SIM=1, N≥2) */
+    int mode_class = 0;             /* 1=真分类选库 (N≥2 + cnn_bank_*.bin) */
+    scene_ctrl_t sc;                /* 分类决策层 (mode_class 时初始化) */
+    {
         scene_bank_t bank;
-        int loaded = 0;
-        if (scene_bank_load(cfg.bank_file, S, L, &bank) == 0) {
-            if (bank_sim && bank.n_slots >= 2) {
-                /* SIM 轮换: 整库拷入 (需随机访问槽) */
-                open_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
-                if (open_bank) {
-                    memcpy(open_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
-                    open_bank_n = (int)bank.n_slots;
-                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
-                    if (open_wc) { memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float)); loaded = 1; }
-                    printf("  OPEN_LOOP + SIM: 整库 %u 槽, 每 %d s 轮换类 (验证切换无爆音)\n",
-                           bank.n_slots, bank_sim_sec);
-                }
-            } else if (!bank_sim && bank.n_slots >= 2 && file_exists("data/cnn_bank_linear_weight.bin")) {
-                /* 真分类选库 (Phase 3): 整库 + SFANC 分类 CNN (cnn_bank_*, K=N).
-                   替换回归 CNN 单例为分类 CNN, scene_ctrl 重初始化为分类模式. */
-                open_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
-                if (open_bank) {
-                    memcpy(open_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
-                    open_bank_n = (int)bank.n_slots;
-                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
-                    if (open_wc) { memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float)); loaded = 1; }
-                    cnn_m5_free();
-                    if (cnn_m5_init_base("cnn_bank") == 0) {
-                        scene_ctrl_init(&sc, sub_filters, L);          /* classify_mode=1 */
-                        scene_ctrl_set_bank(&sc, open_bank_n);
-                        scene_ctrl_set_bank_hold(&sc, cfg.bank_hold_frames);
-                        open_classify = 1;
-                        printf("  OPEN_LOOP + 分类: 整库 %u 槽, SFANC CNN 分类选槽 "
-                               "(K=%d, 防抖 %d帧) — 每 s argmax→防抖→crossfade\n",
-                               bank.n_slots, sc.K, cfg.bank_hold_frames);
-                    } else {
-                        cnn_m5_init();  /* 回退回归 CNN */
-                        fprintf(stderr, "  [WARN] cnn_bank CNN 加载失败, 回退静态槽 0\n");
-                    }
-                }
-            } else {
-                const float *slot = scene_bank_slot(&bank, force_class);
-                if (slot) {
-                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
-                    if (open_wc) { memcpy(open_wc, slot, (size_t)S * L * sizeof(float)); loaded = 1; }
-                    printf("  OPEN_LOOP: wc_bank.bin slot %d (%u 槽)\n", force_class, bank.n_slots);
-                }
-            }
-            scene_bank_free(&bank);
+        if (scene_bank_load(cfg.bank_file, S, L, &bank) != 0) {
+            fprintf(stderr, "FATAL: 无库 %s — SFANC 硬选评估必须 data/wc_bank.bin "
+                    "(先 export/generate_bank.py 生成)\n", cfg.bank_file);
+            fxnlms_free(&fx); return 1;
         }
-        if (!loaded) {
-            int wc_len = bin_load_float("data/wc_fixed.bin", &open_wc);
-            if (wc_len == S * L) {
-                loaded = 1;
-                printf("  OPEN_LOOP: 回退 data/wc_fixed.bin (N=1)\n");
+        open_bank_n = (int)bank.n_slots;
+        open_bank = (float *)malloc((size_t)open_bank_n * bank.slot_len * sizeof(float));
+        if (!open_bank) { scene_bank_free(&bank); fxnlms_free(&fx); return 1; }
+        memcpy(open_bank, bank.data, (size_t)open_bank_n * bank.slot_len * sizeof(float));
+        open_wc = (float *)malloc((size_t)S * L * sizeof(float));
+        if (!open_wc) { scene_bank_free(&bank); fxnlms_free(&fx); return 1; }
+        scene_bank_free(&bank);
+
+        if (bank_sim && open_bank_n >= 2) {
+            /* SIM 轮换: 每 bank_sim_sec 秒换类, 验证切换无爆音 (决策层验证用, 不依赖 CNN) */
+            mode_sim = 1;
+            memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float));
+            printf("  [BANK] SIM 轮换: 整库 %d 槽, 每 %d s 换类 (验证切换无爆音)\n",
+                   open_bank_n, bank_sim_sec);
+        } else if (open_bank_n >= 2 && file_exists("data/cnn_bank_linear_weight.bin")) {
+            /* 真分类选库: SFANC 分类 CNN (cnn_bank_*, K=N), 决策层初始化.
+               K==N 对齐由 scene_ctrl_init + set_bank 保证 (argmax 越界已防御). */
+            if (cnn_m5_init_base("cnn_bank") != 0) {
+                fprintf(stderr, "  [WARN] cnn_bank CNN 加载失败, 回退静态槽 %d\n", force_class);
+                int c = force_class % open_bank_n;
+                memcpy(open_wc, open_bank + (size_t)c * S * L, (size_t)S * L * sizeof(float));
+                open_class = c;
             } else {
-                if (open_wc) { bin_free(open_wc); open_wc = NULL; }
+                scene_ctrl_init(&sc);
+                scene_ctrl_set_bank(&sc, open_bank_n);
+                scene_ctrl_set_bank_hold(&sc, cfg.bank_hold_frames);
+                mode_class = 1;
+                memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float));   /* 初始槽 0 */
+                printf("  [BANK] 分类选槽: 整库 %d 槽, CNN argmax+防抖 (K=%d, %d帧) — "
+                       "每 s 选槽→crossfade\n", open_bank_n, sc.K, cfg.bank_hold_frames);
             }
-        }
-        if (!loaded) {
-            fprintf(stderr, "ERROR: GFANC_OPEN_LOOP 需要 data/wc_bank.bin 或 data/wc_fixed.bin\n");
-            fxnlms_free(&fx); scene_ctrl_free(&sc); return 1;
+        } else {
+            /* 静态: N=1 恒播槽 0; N≥2 缺分类 CNN → force_class 选槽 (WARN) */
+            int c = (open_bank_n >= 2) ? (force_class % open_bank_n) : 0;
+            memcpy(open_wc, open_bank + (size_t)c * S * L, (size_t)S * L * sizeof(float));
+            open_class = c;
+            if (open_bank_n >= 2)
+                fprintf(stderr, "  [WARN] 库 N=%d ≥2 但缺分类 CNN (data/cnn_bank_*.bin) — 静态槽 %d\n",
+                        open_bank_n, c);
+            else
+                printf("  [BANK] 静态槽 0 (N=1)\n");
         }
         fxnlms_set_wc(&fx, open_wc);
-        printf("  OPEN_LOOP: 固定库槽 Wc, 纯前向无梯度 (deploy 离线等价, CNN 不参与)\n");
     }
+    printf("  OPEN_LOOP: 固定库槽 Wc, 纯前向无梯度 (deploy 离线等价)\n");
 
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
 
-        /* 4a. CNN 直接权重 Wc 构造 (每秒) — open_loop 跳过: 固定库槽 Wc, CNN 不参与 */
-        float gains[SC_DW_MAX];
-        int K = sc.K;
-        if (open_loop) {
-            memset(gains, 0, K * sizeof(float));   /* 诊断 top 显示 0 */
-            memcpy(sc.prev_gains, gains, K * sizeof(float));
-        } else if (len == chunk) {
-            scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
-        } else {
-            memcpy(gains, sc.prev_gains, K * sizeof(float));
-        }
-        if (cnn_fixed && !open_loop) {
-            /* A/B: 覆盖为固定增益 → Wc 恒定, 只剩 FxLMS 逐样本自适应 */
-            memcpy(gains, fixed_gains, K * sizeof(float));
-            scene_ctrl_construct_wc(&sc, gains, wc_cur);
-        }
-
-        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) — open_loop 整块跳过 (无切换),
-           仅 GFANC_BANK_SIM 例外: 定时轮换类验证切换无爆音 (与 main_realtime SIM 同构). */
+        /* 4a. 每秒决策层选槽 (SIM / 分类): 换槽时启动 delayless crossfade
+           (wc_old=当前 fx.wc → wc_cur=新槽), 与实时部署决策层同一机制.
+           fade 进行中 (fade_cnt>0) 不打断 — 轮换间隔 >> fade_len, 正常不会重叠.
+           静态 (非 SIM/分类): 固定库槽 Wc 恒播 — fxnlms_set_wc 已预载, 无每帧切换. */
         char action[20] = "-";
-        if (open_loop) {
-            /* SIM 轮换: 每 bank_sim_sec 秒换下一个库槽, 换槽时启动 delayless crossfade
-               (wc_old=当前 fx.wc → wc_cur=新槽), 与实时决策层换类同一机制.
-               fade 进行中 (fade_cnt>0) 不打断 — 轮换间隔 >> fade_len, 正常不会重叠. */
-            if (bank_sim && open_bank_n >= 2 && sec > 0) {
-                int c = (sec / bank_sim_sec) % open_bank_n;
-                if (c != open_class) {
-                    memcpy(wc_old, fx.wc, S * L * sizeof(float));
-                    memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
-                    fade_cnt = cfg.fade_len;
-                    snprintf(action, sizeof(action), "SIM%d->%d", open_class, c);
-                    printf("  [BANK] SIM 类 %d → %d (slot %d, fade %d)\n",
-                           open_class, c, c, cfg.fade_len);
-                    open_class = c;
-                }
-            }
-            /* 分类开环 (SFANC): 每秒 CNN argmax → 防抖选类 → 换槽启动 crossfade
-               (与实时部署决策层同构). 弱信号/CNN 失败 → scene_ctrl_classify 保持当前类,
-               不换槽. 仅整秒 (len==chunk) 分类 — 末尾不足 1s 片段跳过 (scene_ctrl
-               固定读 16000 样本, 超尾会 OOB; 与 4a 的 len==chunk 守卫一致). */
-            else if (open_classify && len == chunk) {
-                int c = scene_ctrl_classify(&sc, ref_filt_all + start, NULL);
-                if (c < 0) c = 0;
-                if (c >= open_bank_n) c = open_bank_n - 1;
-                if (c != open_class) {
-                    memcpy(wc_old, fx.wc, S * L * sizeof(float));
-                    memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
-                    fade_cnt = cfg.fade_len;
-                    snprintf(action, sizeof(action), "C%d->%d", open_class, c);
-                    printf("  [BANK] 分类 %d→%d (filter %d, slot %d, fade %d)\n",
-                           open_class, c, c, c, cfg.fade_len);
-                    open_class = c;
-                }
-            }
-            /* 静态开环 (非 SIM): 固定库槽 Wc 恒播, 无 INIT/RESET/CNN — fxnlms_set_wc 已预载 */
-        } else if (first_sec) {
-            /* 首秒 INIT: CNN Wc → FxNLMS 初始化 (两模式一致) */
-            memcpy(anchor_gains, gains, K * sizeof(float));
-            ocg_reset(&ocg, gains);  /* OCG: 首个增益建立簇 0 */
-            fxnlms_set_wc(&fx, wc_cur);
-            snprintf(action, sizeof(action), "INIT");
-            /* auto_gain 已由预处理前预扫描设定 (R-58: 原此处计算但预处理已完成 → 从未生效) */
-            first_sec = 0;
-        } else {
-            /* S-1: cos(anchor_gains, cur_gains) — 30 维直接权重增益 */
-            float cos_sim = sm_cos_sim(anchor_gains, gains, K);
-
-            /* reset 模式: OCG 簇索引变化 (默认) 或 cos(anchor,cur)<τ (GFANC_OCG=0)
-               → CrossFader 重置到新 Wc; continuous 模式: CNN 不参与后续 Wc 构造.
-               OCG: 多质心聚类抑制簇内抖动/慢漂移导致的反复重置 (ICASSP 2026). */
-            int do_reset = cfg.ocg_enable ? ocg_step(&ocg, gains)
-                                          : (cos_sim < cfg.switch_threshold);
-            if (cfg.gfanc_mode == 1 && do_reset) {
-                memcpy(wc_old, fx.wc, S * L * sizeof(float));  /* 过渡起点 (当前收敛 Wc) */
-                /* wc_cur 已是 scene_ctrl_process 算出的新候选 */
+        if (mode_sim && sec > 0) {
+            int c = (sec / bank_sim_sec) % open_bank_n;
+            if (c != open_class) {
+                memcpy(wc_old, fx.wc, S * L * sizeof(float));
+                memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
                 fade_cnt = cfg.fade_len;
-                memcpy(anchor_gains, gains, K * sizeof(float));
-                snprintf(action, sizeof(action), "RESET");
+                snprintf(action, sizeof(action), "SIM%d->%d", open_class, c);
+                printf("  [BANK] SIM 类 %d → %d (slot %d, fade %d)\n",
+                       open_class, c, c, cfg.fade_len);
+                open_class = c;
+            }
+        } else if (mode_class && len == chunk) {
+            /* 分类: 每秒 CNN argmax → 防抖选类 → 换槽 crossfade. 弱信号/CNN 失败 →
+               scene_ctrl_classify 保持当前类, 不换槽. 仅整秒 (len==chunk) 分类 —
+               末尾不足 1s 片段跳过 (scene_ctrl 固定读 16000 样本, 超尾会 OOB). */
+            int c = scene_ctrl_classify(&sc, ref_filt_all + start, NULL);
+            if (c < 0) c = 0;
+            if (c >= open_bank_n) c = open_bank_n - 1;
+            if (c != open_class) {
+                memcpy(wc_old, fx.wc, S * L * sizeof(float));
+                memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
+                fade_cnt = cfg.fade_len;
+                snprintf(action, sizeof(action), "C%d->%d", open_class, c);
+                printf("  [BANK] 分类 %d→%d (filter %d, slot %d, fade %d)\n",
+                       open_class, c, c, c, cfg.fade_len);
+                open_class = c;
             }
         }
-        memcpy(sc.prev_gains, gains, K * sizeof(float));
 
-        /* 4c. 逐样本 FxNLMS (匹配实时版 audio_cb) */
+        /* 4b. 逐样本纯前向 (deploy 硬选: 无梯度链) */
         float err_pwr = 0, dis_pwr = 0;
         acc_err = acc_anti_est = acc_d_est = acc_err_cross = 0;
         acc_err_win = 0;
@@ -713,8 +587,7 @@ int main(int argc, char **argv)
             float ref_filt = ref_anc_all[idx];   /* BUG-6: 64tap ANC 带通 (匹配实时) */
             acc_ref += ref_filt_all[idx] * ref_filt_all[idx];  /* 1024tap CNN 带通 (匹配实时 ref_rms 显示) */
 
-            /* CrossFader — 闭环 RESET 与 open_loop SIM 轮换共用 (fade_cnt>0 才激活).
-               静态 open_loop (非 SIM) fade_cnt 恒 0, 跳过, 无开销. */
+            /* CrossFader — 类切换共用 (fade_cnt>0 才激活). 静态 fade_cnt 恒 0, 跳过. */
             if (fade_cnt > 0) {
                 float a = (float)fade_cnt / cfg.fade_len;
                 for (int i = 0; i < S * L; i++)
@@ -724,26 +597,9 @@ int main(int argc, char **argv)
             }
 
             /* anti_spk = Wc ⊗ x_hist (纯前向, 不写 xd/不读 err_meas).
-               open_loop: 物理无梯度链 — Fx 计算/合成误差都只为度量, 不驱动更新.
-               闭环: Fx = Ŝ ⊗ ref_filt 驱动梯度. */
-            float Fx_arr[E * S];
+               物理无梯度链 — Fx/误差合成只为度量 (NR_true), 不驱动任何更新. */
             float anti_spk[S];
-            if (open_loop) {
-                fxnlms_forward_rt_open(&fx, ref_filt, anti_spk);
-            } else {
-                for (int e = 0; e < E; e++)
-                    for (int s = 0; s < S; s++)
-                        Fx_arr[e * S + s] = fir_tick(&sec_firs[e * S + s], ref_filt);
-                /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复时间衰减根因).
-                   每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
-                for (int e = 0; e < E; e++)
-                    for (int s = 0; s < S; s++)
-                        Fx_arr[e * S + s] = fir_tick(&bp_fx[e * S + s], Fx_arr[e * S + s]);
-                if (fade_cnt == 0)
-                    fxnlms_tick_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
-                else
-                    fxnlms_forward_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
-            }
+            fxnlms_forward_rt_open(&fx, ref_filt, anti_spk);
 
             for (int s = 0; s < S; s++) {
                 if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
@@ -839,12 +695,11 @@ int main(int argc, char **argv)
         if (diverged) snprintf(nr_est_str, sizeof(nr_est_str), "DIV!");
         else          snprintf(nr_est_str, sizeof(nr_est_str), "%.1f", nr_est);
         snprintf(nr_true_str, sizeof(nr_true_str), "%.1f", nr_true);
-        char topbuf[64];
-        sm_fmt_top_gains(gains, K, topbuf, sizeof(topbuf));
+        char bankbuf[32];
+        snprintf(bankbuf, sizeof(bankbuf), "[BANK] 类 %d/%d", open_class, open_bank_n);
         printf("%4d | %22s | %6s | %6s | %5.3f | %6.4f | %5.4f | %s",
-               sec + 1, topbuf, nr_est_str, nr_true_str,
+               sec + 1, bankbuf, nr_est_str, nr_true_str,
                err_rms, ref_rms, anti_rms, action);
-        if (cfg.ocg_enable) printf(" [C%d/%d]", ocg.active, ocg.n_clusters);
         if (sec == 0) printf(" [FxRMS=%.4f]", sqrtf(acc_ref / len));
         printf("\n");
 
@@ -871,19 +726,18 @@ int main(int argc, char **argv)
     /* ── 6. 清理 ── */
     free(anti_out); free(err_out); free(ref_filt_all); free(ref_anc_all);
     for (int e = 0; e < E; e++) { free(bp_err[e].delay_line); free(bp_err_nr[e].delay_line); }
-    for (int i = 0; i < E * S; i++) free(bp_fx[i].delay_line);
     fxnlms_free(&fx);
     scene_ctrl_free(&sc);
-    for (int i = 0; i < E * S; i++) { free(sec_firs[i].delay_line); free(sec_firs_err[i].delay_line); }
-    free(sec_firs); free(sec_firs_err); free(sec_coeffs);
+    for (int i = 0; i < E * S; i++) free(sec_firs_err[i].delay_line);
+    free(sec_firs_err); free(sec_coeffs);
     for (int e = 0; e < E; e++) { free(pri_firs[e].delay_line); free(pri_raw_firs[e].delay_line); }
     free(bp_fir.delay_line);
     free(wav.data); if (ref_resampled) free(ref_resampled);
-    bin_free(sec_path); if (pri_path_used != pri_path) free(pri_path_used); bin_free(pri_path); bin_free(sub_filters);
+    bin_free(sec_path); if (pri_path_used != pri_path) free(pri_path_used); bin_free(pri_path);
     bin_free(bp_coeff);
     if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
-    if (open_wc) free(open_wc);              /* GFANC_OPEN_LOOP 库槽副本 */
-    if (open_bank) free(open_bank);          /* GFANC_BANK_SIM 整库副本 */
+    if (open_wc) free(open_wc);              /* 初始库槽副本 */
+    if (open_bank) free(open_bank);          /* 整库副本 */
     printf("Done.\n");
     return 0;
 }

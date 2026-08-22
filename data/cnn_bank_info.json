@@ -21,9 +21,9 @@
   "mode": "classification",
   "activation": "none",
   "classes": [
-    "road",
-    "children",
-    "construction",
-    "railway"
+    "filter_0",
+    "filter_1",
+    "filter_2",
+    "filter_3"
   ]
 }

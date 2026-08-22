@@ -3,8 +3,7 @@
   "E": 3,
   "S": 2,
   "C": 15,
-  "K": 30,
-  "filter_len": 1024,
+  "K": 4,
   "pri_len": 1024,
   "sec_len": 1024,
   "input_len": 16000,
@@ -12,8 +11,7 @@
   "bp_anc_len": 256,
   "dsp_delay": 16,
   "fade_len": 1600,
-  "sc_dim": 30,
-  "cnn_mode": "direct_weight",
-  "cnn_activation": "tanh",
-  "n_cnn_out": 30
+  "cnn_mode": "classification",
+  "cnn_activation": "none",
+  "n_cnn_out": 4
 }

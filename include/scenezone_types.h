@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>  /* gf_log (ADV-D4: LOG 宏去 GCC ##__VA_ARGS__ 扩展) */
-#include <string.h>  /* gfanc_config_load_env: GFANC_MODE strcmp */
+#include <string.h>  /* gfanc_config_load_env: GFANC_ANC_MODE strcmp */
 
 typedef float gfanc_float_t;
 
@@ -64,15 +64,12 @@ typedef struct {
     /* ANC 自适应 */
     float step_size;             /* LMS 步长 μ */
     float leak;                  /* 泄漏因子 */
-    float wc_rms_target;         /* Wc 初始 RMS 目标 (env: GFANC_WC_TARGET) */
     int   fade_len;              /* CrossFader 过渡样本数 */
     int   ramp_ms;               /* 冷启动 ramp 时长 ms */
     int   mute_hold_ms;          /* safety_mute 抑制时长 ms */
 
     /* 安全保护 */
-    float freeze_ratio;          /* max|Wc| > ratio×stub_rms → 冻结 */
-    float switch_threshold;      /* cos_sim 场景切换阈值 */
-    int   reset_hyst;            /* cos<τ 连续秒数才 RESET 迟滞 (env: GFANC_RESET_HYST, 默认 1) */
+    float freeze_ratio;          /* max|Wc| 超限 → 冻结 */
     float nr_converge_db;        /* 收敛判定 NR 阈值 dB */
     int   freeze_retry_sec;      /* freeze 后尝试解冻的秒数 */
     float diverge_anti_rms;      /* anti_rms 连续3s超此值 → Wc 发散救援 (env: GFANC_DIVERGE_ANTI) */
@@ -91,37 +88,13 @@ typedef struct {
     int   embed_delay_ms;        /* 嵌入式信号链处理延迟 ADC+DSP+DAC (env: GFANC_EMBED_DELAY_MS, 默认0ms — R-58-8).
                                     离线 main.c pad Ŝ 模拟因果缺口; 0=实时PC等效(无处理延迟). */
     float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
-    float wc_cold_start;         /* 首次场景Wc衰减系数, 0.3=从30%开始收敛防overshoot (env: GFANC_WC_COLD) */
 
-    /* 去场景层 (scenezone-anc): 无场景切换, CNN 只产 Wc.
-       模式: 0=continuous (CNN 仅首秒初始化, FxNLMS 永不重置),
-             1=reset (多质心 OCG 簇索引闸门 → CrossFader 重置). */
-    int   gfanc_mode;          /* env: GFANC_MODE=reset|continuous */
-
-    /* 双模式 (方案C, 2026-08-21, 详见 docs/无误差麦方案_与SFANC对照_路线分析.md):
-       anc_mode 0=adapt 闭环 (现状默认: FxLMS + 误差麦),
-                 1=fixed 开环 (µ=0 无误差麦 — 生成式 SFANC: CNN 仍每秒产 Wc,
-                 派发恒走 fxnlms_forward_rt, 无梯度/无Wc变更/无在线Ŝ).
-       全自动标定 (对标 SFANC 就地训滤波器): adapt 收敛后 Ctrl+C 自动保存
-       data/wc_fixed.bin; fixed 启动自动加载 (CNN 不覆盖), 无文件则退回 CNN 生成式. */
-    int   anc_mode;          /* 0=adapt 闭环(默认), 1=fixed 开环µ=0 (env: GFANC_ANC_MODE=adapt|fixed) */
-
-    /* OCG 在线聚类闸门 (ICASSP 2026, 详见 ocg.h):
-       在增益域对 CNN 输出做多质心聚类, 仅簇索引变化才更换滤波器 —
-       抑制簇内抖动/慢漂移导致的反复重置, 保护 FxNLMS 收敛.
-       τ 独立 (P0-1: 解耦 switch_threshold, 不再复用 GFANC_RESET_THRESH) */
-    int   ocg_enable;          /* 1=OCG 闸门, 0=旧 cos(anchor,cur)<τ (env: GFANC_OCG) */
-    float ocg_tau;             /* 簇半径阈值: cos(g',c)>=τ 归入, 否则新建簇 (env: GFANC_OCG_TAU, 默认 0.8) */
-    float ocg_alpha;           /* 质心 EMA 漂移系数 (env: GFANC_OCG_ALPHA, 默认 0.1) */
-    int   ocg_max_clusters;    /* 簇上限 (env: GFANC_OCG_CLUSTERS, 默认 8) */
-    int   ocg_hold;            /* 持续性判据: 候选簇需连续命中帧数 (1Hz→帧数≈秒数, 默认 3)
-                                  (env: GFANC_OCG_HOLD, 默认 3; <=1 回退立即切换) */
-
-    /* CNN 增益时间平滑 (P0-2, 治纯音带跨秒翻转抖动 — bands 2/6/14/17/19):
-       自适应 EMA — 帧间 cos < switch (场景真切换) → β=1 立即跟随 (无延迟);
-       否则 β 慢速平滑, 吸收带选择抖动 (OCG/cos 闸门不再被抖动触发). */
-    float gain_smooth_beta;    /* EMA 平滑系数 (env: GFANC_GAIN_SMOOTH, 默认 0.5; 1=关闭平滑) */
-    float gain_smooth_switch;  /* 旁路阈值: 帧间增益 cos 低于此视为场景切换, β 强制 1 (默认 0.85) */
+    /* 双模式 (SFANC 硬选库, 2026-08-21, 详见 docs/无误差麦方案_与SFANC对照_路线分析.md):
+       anc_mode 0=adapt 标定闭环: 零启动 FxLMS + 误差麦, 收敛自动存库槽
+                 (无回归 warm-start, 无 reset/OCG/增益平滑).
+       anc_mode 1=fixed 部署开环: 无误差麦 — 分类 CNN argmax 选库槽, 库槽 Wc
+                 纯前向 (fxnlms_forward_rt_open), 无梯度/无在线Ŝ; 无库直接 FATAL. */
+    int   anc_mode;          /* 0=adapt 标定闭环(默认), 1=fixed 部署开环 (env: GFANC_ANC_MODE=adapt|fixed) */
 
     /* SFANC 硬选库决策层 (Phase 2, 计划见 docs/无误差麦方案_与SFANC对照_路线分析.md):
        分类 CNN argmax → 防抖 → 选库槽 c → crossfade. */
@@ -179,15 +152,8 @@ typedef struct {
                            leak 固定不缩放 (2026-08-13): leak 是泄漏因子, 与 Ŝ 幅度无关,
                            曾随 s_scale×0.489 → 2.4e-7 不足以抑制梯度噪声 → Wc 无界膨胀.
                            leak 5e-6→5e-7 (2026-08-05): 弱信号下 leak 压死 Wc 生长 */ \
-    0.01f,              /* wc_rms_target (初始Wc幅度, env: GFANC_WC_TARGET).
-                           Python Ŝ (RMS≈0.039): ref=0.04→anti≈0.013, 安静且稳定 */ \
     1600, 400, 1500,    /* fade_len, ramp_ms, mute_hold_ms */ \
-    30.0f, 0.7f, 1, 3.0f, /* freeze_ratio, switch_threshold, reset_hyst, nr_converge_db.
-                           switch_threshold 0.6→0.7 (2026-08-14): 软重锚定 — 500Hz 切换
-                           cos 0.63~0.67 需触发提交 wc_cur; 250Hz 深对消 cos 0.88+ 不误触.
-                           0.6 下 500Hz 切换永不触发 → FxLMS 小步长硬爬 2~3s (问题1).
-                           reset_hyst=1 (2026-08-14): 软重锚定无 cold_hold/mute 打断,
-                           迟滞只需挡 1 秒瞬态; latency = 1s CNN + 1s 迟滞 + crossfade ≈ 2s. */ \
+    30.0f, 3.0f,        /* freeze_ratio, nr_converge_db */ \
     60,                 /* freeze_retry_sec */ \
     0.25f,              /* diverge_anti_rms */ \
     0.6f,               /* diverge_err_ratio (P0-4: anti 高且 err/ref>0.6 才救援; 深对消 err/ref≈0.4 不误杀) */ \
@@ -198,36 +164,17 @@ typedef struct {
                            → anti 相位错位 48 样本 → 自适应正反馈发散; 需评估嵌入式目标时
                            GFANC_EMBED_DELAY_MS 显式开启) */ \
     5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
-    0.3f,               /* wc_cold_start (首次场景Wc衰减, 0.3=30%, 1.0=关闭) */ \
-    1,                  /* gfanc_mode: 默认 reset (去场景层后主模式), GFANC_MODE=continuous 切换 */ \
-    0,                  /* anc_mode (方案C双模式: 默认 adapt 闭环, GFANC_ANC_MODE=fixed 切开环) */ \
-    0, 0.8f, 0.1f, 8, 3, /* ocg_enable, ocg_tau, ocg_alpha, ocg_max_clusters, ocg_hold.
-                           ocg_enable 默认 0 (2026-08-10 P0-3 证伪): 纯音深对消下增益
-                           双模震荡 → 簇翻转 → 每次翻转 RESET, 深对消丢失 (开≈18dB vs 关 27.5dB).
-                           2026-08-11 修复: 实机 CNN 稳定 (前提① cos>0.95 达成) +
-                           ocg_hold 持续性判据 (前提②: 候选簇连续 3s 命中才切换, 治抖动
-                           翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
-    0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
-                           帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
+    0,                  /* anc_mode (双模式: 0=adapt 闭环标定, 1=fixed 开环µ=0 部署.
+                           GFANC_ANC_MODE=adapt|fixed) */ \
     2, "data/wc_bank.bin", 0, 0, 3, /* bank_hold_frames(2), bank_file, cal_scene_index(0),
                            bank_sim(0), bank_sim_sec(3).
-                           SFANC 硬选库决策层 (Phase 2): 分类防抖 + 库路径 + 标定槽索引 */ \
+                           SFANC 硬选库决策层: 分类防抖 + 库路径 + 标定槽索引 */ \
     0.02f, 8.0f, 3, 1.5f, 0.042f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
                            quiet_hold, quiet_exit, quiet_ref_max, quiet_err_ref,
                            quiet_err_max(弃用), quiet_err_exit, quiet_ref_memory.
                            P0-5 阶段④: anti>0.02 且 ref<0.042 且 err_ref>1.5 且"ref 曾于
                            quiet_ref_memory 秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
-                           2026-08-14 阶段⑥: quiet_hold 1→3 + quiet_ref_max 0.045→0.042 —
-                           实测 Ŝ 下 500→250Hz 切换 anti 失配→refFilt 瞬态 dip 0.0464→0.0445
-                           跌破 0.045 门槛 (余量仅 2~7%) + hold=1 秒 → 误判"噪声消失", 反噪声
-                           被清后噪声仍在 ~2.4s 全程 0dB. 降门槛拉开余量 + hold 回 3 抗瞬态.
-                           quiet_err_ref (阶段⑤修正): 深对消纯音 err_ref≈0.7-1.1 被挡, 只有
-                           噪声真停 (err 被 anti 自身输出主导, err_ref≈2.4) 才通过.
-                           NR/err 门已移出判据 (实测 NR 噪声停后不塌 8-12dB、err 过渡期
-                           先冲高). quiet_ref_memory 守卫治阶段④ 实测: 宽带弱噪声
-                           (ref≈0.038 < 门槛) 被绝对阈值误判"噪声消失" → 反相被砍 → 0dB.
-                           退出: ref 重回 1.5× 或 err 重回 2.0× 安静基准 → 重建.
-                           quiet_anti_rms 0.05→0.02: 残余 anti≈0.03 也能抓到. */ \
+                           退出: ref 重回 1.5× 或 err 重回 2.0× 安静基准 → 重建. */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -244,32 +191,15 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_EMBED_DELAY_MS"))) cfg->embed_delay_ms = atoi(s);
     if ((s = getenv("GFANC_DIVERGE_ANTI"))) cfg->diverge_anti_rms = (float)atof(s);
     if ((s = getenv("GFANC_DIVERGE_ERR_RATIO"))) cfg->diverge_err_ratio = (float)atof(s);
-    if ((s = getenv("GFANC_WC_TARGET")))  cfg->wc_rms_target = (float)atof(s);
     if ((s = getenv("GFANC_SEC_MU")))     cfg->sec_online_mu  = (float)atof(s);
-    if ((s = getenv("GFANC_WC_COLD")))   cfg->wc_cold_start  = (float)atof(s);
     if ((s = getenv("GFANC_HW_THRESH"))) cfg->hw_thresh_db   = (float)atof(s);
-    if ((s = getenv("GFANC_MODE"))) {
-        if (!strcmp(s, "continuous")) cfg->gfanc_mode = 0;
-        else if (!strcmp(s, "reset")) cfg->gfanc_mode = 1;
-    }
-    /* 双模式 (方案C): GFANC_ANC_MODE=adapt|fixed.
-       标定滤波器 data/wc_fixed.bin 全自动: adapt 收敛后 Ctrl+C 自动保存,
-       fixed 启动自动加载 (无 GFANC_FIXED_SOURCE / GFANC_SNAPSHOT_WC). */
+    /* 双模式 (SFANC 硬选库): GFANC_ANC_MODE=adapt|fixed.
+       标定 = 零启动闭环, 收敛后自动存库槽 (GFANC_CAL_INDEX, 不写 wc_fixed);
+       fixed = 无误差麦纯开环, 无库直接 FATAL. */
     if ((s = getenv("GFANC_ANC_MODE"))) {
         if (!strcmp(s, "fixed"))     cfg->anc_mode = 1;
         else if (!strcmp(s, "adapt")) cfg->anc_mode = 0;
     }
-    if ((s = getenv("GFANC_RESET_THRESH"))) cfg->switch_threshold = (float)atof(s);
-    if ((s = getenv("GFANC_RESET_HYST")))   cfg->reset_hyst = atoi(s);
-    if ((s = getenv("GFANC_OCG"))) {
-        if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "false")) cfg->ocg_enable = 0;
-        else if (!strcmp(s, "1") || !strcmp(s, "on") || !strcmp(s, "true")) cfg->ocg_enable = 1;
-    }
-    if ((s = getenv("GFANC_OCG_TAU")))     cfg->ocg_tau     = (float)atof(s);
-    if ((s = getenv("GFANC_OCG_ALPHA")))    cfg->ocg_alpha = (float)atof(s);
-    if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
-    if ((s = getenv("GFANC_OCG_HOLD")))     cfg->ocg_hold    = atoi(s);
-    if ((s = getenv("GFANC_GAIN_SMOOTH"))) cfg->gain_smooth_beta = (float)atof(s);
     if ((s = getenv("GFANC_BANK_HOLD")))  cfg->bank_hold_frames = atoi(s);
     if ((s = getenv("GFANC_BANK_FILE"))) {
         snprintf(cfg->bank_file, sizeof(cfg->bank_file), "%s", s);

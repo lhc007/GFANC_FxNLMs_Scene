@@ -2,13 +2,13 @@
 
 架构: stem(Conv+BN+ReLU+MaxPool) → 2×2 ResBlock(64,64) → Pool → Linear(64,K)
 
-C2 修复 (ADVERSARIAL_REVIEW): 全局静态变量 → 实例化接口.
+SFANC 分类 CNN (SFANC 硬选库决策层): base="cnn_bank" → data/cnn_bank_*.bin
+(K=N 类, argmax 选库槽). K 由 linear_weight 文件大小推导 (K = n/CH).
 用法:
-    cnn_instance_t cnn;
-    cnn_init(&cnn);                    // 从 data/ 下 .bin 文件加载所有权重
-    cnn_forward(&cnn, audio, logits);  // 前向推理
-    cnn_free(&cnn);                   // 释放
-向后兼容: cnn_m5_init/forward/get_K/free 宏 → 全局单例.
+    cnn_m5_init_base("cnn_bank");        // 从 data/cnn_bank_*.bin 加载 (全局单例)
+    cnn_m5_forward(audio, logits);       // 前向推理
+    cnn_m5_get_K();                      // 查询类数
+    cnn_m5_free();                       // 释放
 */
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +47,7 @@ typedef cnn_model_t       model_t;
 /* C2: 全局单例 — 向后兼容宏 (cnn_m5_*) 使用的实例 */
 cnn_instance_t _gfanc_cnn_singleton;
 
-/* ── 加载 (base = 权重集前缀: "cnn"=回归(K=30, calibrate), "cnn_bank"=分类(K=N, deploy)) ── */
+/* ── 加载 (base = 权重集前缀: "cnn_bank"=分类(K=N, SFANC 硬选库) ── */
 static int load_conv(const char *base, const char *tag, conv_layer_t *c, int oc, int ic, int k, int s, int p) {
     c->out_ch = oc; c->in_ch = ic; c->ksize = k; c->stride = s; c->pad = p;
     char path[256];
@@ -119,11 +119,6 @@ int cnn_init_base(cnn_instance_t *cnn, const char *base)
     (void)n_b;
 
     return 0;
-}
-
-int cnn_init(cnn_instance_t *cnn)
-{
-    return cnn_init_base(cnn, "cnn");
 }
 
 static void free_conv(conv_layer_t *c)

@@ -4,9 +4,8 @@
  *  注意: 此模块仅包含纯函数 (无 I/O, 无线程同步, 无全局状态).
  *        线程同步 (Interlocked + wc_shadow) 和 I/O 仍由各自主程序处理.
  *
- *  scenezone-anc (v1.6): 已删除场景记忆/切换/滞回死代码
- *    (sm_scene_switch_execute / sm_first_sec_init / sm_check_scene_switch / sm_wc_rms),
- *    保留直接权重模式仍在用的纯函数.
+ *  scenezone-anc (SFANC 硬选库): 已删除场景记忆/切换/滞回死代码与回归 CNN 线,
+ *    保留硬选/标定通用的纯函数.
  */
 #ifndef SCENE_MANAGER_H
 #define SCENE_MANAGER_H
@@ -22,26 +21,6 @@ extern "C" {
 /* ══════════════════════════════════════════════════════════
    共享计算函数 (纯函数, main.c + main_realtime.c 共用)
    ══════════════════════════════════════════════════════════ */
-
-/** 计算两个向量之间的余弦相似度 (reset 判定: anchor vs current).
- *
- *  direct-weight 模式: 输入为 30 维子带增益向量 (S×C), 不再输入 softmax 概率.
- *
- *  @param anchor  锚点向量 (上次重置时的增益, K 维)
- *  @param cur     当前增益向量 (K 维)
- *  @param K       向量维数 (=S*C=30)
- *  @return        余弦相似度 ∈ [-1, 1], 1=完全相同, -1=完全相反
- */
-static inline float sm_cos_sim(const float *anchor, const float *cur, int K)
-{
-    float dot = 0.0f, np = 0.0f, nc = 0.0f;
-    for (int k = 0; k < K; k++) {
-        dot += anchor[k] * cur[k];
-        np  += anchor[k] * anchor[k];
-        nc  += cur[k]  * cur[k];
-    }
-    return dot / (sqrtf(np) * sqrtf(nc) + 1e-10f);
-}
 
 /** 计算 Wc 系数数组中绝对值最大的元素.
  *
@@ -148,39 +127,6 @@ static inline int sm_check_convergence(
         *converged_frames = 0;
     }
     return 0;
-}
-
-/** 格式化 30 维直接权重增益中 |gain| 占比最高的 3 个子滤波器.
- *
- *  替代旧的 Band 列 (argmax 单值): 单看最大值信息量低 (CNN 输出层 bias[2] 恒占优,
- *  argmax 常钉死在一个低频带上), 但真实信息在整套增益向量的分布. top-3 + 占比
- *  能同时看到"哪个带最重"和"各带权重如何分配".
- *
- *  @param gains   30 维子带增益 (S×C, 直接权重输出, tanh 后 [-1,1])
- *  @param K       维数 (=S*C=30)
- *  @param buf     输出缓冲 (建议 ≥64B)
- *  @param buflen  buf 大小
- *  输出形如 "2(32%) 14(18%) 17(11%)"; 全部 ~0 时输出 "-".
- *  占比 = |gain[i]| / Σ|gain[j]| (各子滤波器对控制信号的权重份额).
- */
-static inline void sm_fmt_top_gains(const float *gains, int K, char *buf, int buflen)
-{
-    int   top[3] = {-1, -1, -1};
-    float tv[3]  = {0.0f, 0.0f, 0.0f};
-    float sum = 0.0f;
-    for (int i = 0; i < K; i++) {
-        float a = fabsf(gains[i]);
-        sum += a;
-        if      (a > tv[0]) { tv[2]=tv[1]; top[2]=top[1]; tv[1]=tv[0]; top[1]=top[0]; tv[0]=a; top[0]=i; }
-        else if (a > tv[1]) { tv[2]=tv[1]; top[2]=top[1]; tv[1]=a; top[1]=i; }
-        else if (a > tv[2]) { tv[2]=a; top[2]=i; }
-    }
-    if (sum <= 1e-9f || top[0] < 0) { snprintf(buf, buflen, "-"); return; }
-    int off = 0;
-    for (int t = 0; t < 3 && top[t] >= 0; t++) {
-        int pct = (int)lroundf(100.0f * tv[t] / sum);
-        off += snprintf(buf + off, buflen - off, "%s%d(%d%%)", t ? " " : "", top[t], pct);
-    }
 }
 
 #ifdef __cplusplus

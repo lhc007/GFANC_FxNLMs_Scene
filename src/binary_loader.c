@@ -63,13 +63,14 @@ uint32_t bin_batch_crc(void)
 {
     uint32_t crc = 0;
 
-    /* 1) data/cnn_*.bin — 排序后逐个折入 (与 Python sorted(glob()) 一致:
-        纯 ASCII 名, 字节序 == 码点序; 前缀恒为 "data/cnn_", 按 basename 排序等价) */
+    /* 1) data/cnn_bank_*.bin — 分类 CNN 权重集 (SFANC 硬选库决策层), 排序后逐个折入
+        (与 Python sorted(glob()) 一致: 纯 ASCII 名, 字节序 == 码点序;
+        前缀恒为 "data/cnn_bank_", 按 basename 排序等价) */
     char *names[128];
     int n = 0;
 #ifdef _WIN32
     struct _finddata_t fd;
-    intptr_t h = _findfirst("data/cnn_*.bin", &fd);   /* intptr_t: 64 位句柄, long 会截断 */
+    intptr_t h = _findfirst("data/cnn_bank_*.bin", &fd);   /* intptr_t: 64 位句柄, long 会截断 */
     if (h != -1L) {
         do {
             if (n < 128) names[n++] = strdup(fd.name);
@@ -77,9 +78,9 @@ uint32_t bin_batch_crc(void)
         _findclose(h);
     }
 #else
-    /* POSIX: glob() 枚举 data/cnn_*.bin (glibc 按字节序排序, 与 Windows 排序语义一致) */
+    /* POSIX: glob() 枚举 data/cnn_bank_*.bin (glibc 按字节序排序, 与 Windows 排序语义一致) */
     glob_t g;
-    if (glob("data/cnn_*.bin", 0, NULL, &g) == 0) {
+    if (glob("data/cnn_bank_*.bin", 0, NULL, &g) == 0) {
         for (size_t i = 0; i < g.gl_pathc && n < 128; i++) {
             const char *p = g.gl_pathv[i];
             const char *base = strrchr(p, '/');
@@ -98,11 +99,10 @@ uint32_t bin_batch_crc(void)
 
     /* 2) 固定算法文件 (非声学路径) — 与 export_bin.py 顺序一致 */
     static const char *fixed[] = {
-        "data/sub_filters.bin",
         "data/bandpass_fir.bin",
         "data/bandpass_anc.bin",
     };
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 2; i++)
         crc_fold_file(&crc, fixed[i]);
 
     return crc;
@@ -125,13 +125,13 @@ int bin_check_batch(void)
     uint32_t actual   = bin_batch_crc();
 
     if (expected == actual) {
-        printf("  [batch] 批次指纹一致 0x%08x (cnn/sub_filters/bandpass 同批)\n", actual);
+        printf("  [batch] 批次指纹一致 0x%08x (cnn_bank/bandpass 同批)\n", actual);
         return 0;
     }
     fprintf(stderr,
-            "  [WARN] 批次混配检测: data/ 的 cnn_*.bin / sub_filters / bandpass 来自不同批次!\n"
-            "        记录批次=0x%08x, 当前文件=0x%08x — Wc 预设初值可能与训练世界错位\n"
-            "        (FxLMS 会自适应纠正, 仅影响暖启动收敛). 修复: 重跑 python export/export_bin.py.\n",
+            "  [WARN] 批次混配检测: data/ 的 cnn_bank_*.bin / bandpass 来自不同批次!\n"
+            "        记录批次=0x%08x, 当前文件=0x%08x — 分类 CNN 决策与库/带通可能错位\n"
+            "        (决策层 argmax 可能误选库槽). 修复: 重跑 python export/export_bin.py.\n",
             expected, actual);
     return 1;
 }

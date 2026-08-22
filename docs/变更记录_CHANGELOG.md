@@ -31,6 +31,47 @@
 
 ## 记录列表（最新在上）
 
+### [2026-08-22] 新增合成噪声生成器 — 分类 CNN 训练数据可选走 SFANC-Window 同款
+- **状态**: 工作区未提交
+- **基线**: 工作区未提交（叠加在清理回归线之上）
+- **变更代码**:
+  - 新增: `export/generate_synthetic_noise.py` — 合成噪声生成器 (SFANC-Window 同款): N 类对数分频频带覆盖 50-1500Hz, 每类 1 段代表性宽带 `band_k.wav` (喂 generate_bank.py --filters) + M 段 1s 训练样本 `cls_k/*.wav` + `data/bank_labels_{train,valid}.csv`
+  - 修改: `README.md` — 阶段 2-⑧ 加"可选替代: 合成噪声打标签"块 + 项目结构树补脚本
+- **变更原因**: 用户选择分类 CNN 训练数据不用真实语料打分 (generate_bank.py --labels), 改用 SFANC-Window 同款合成噪声 (白噪过随机带通, 按频带定类)。类 k ↔ 频带 k ↔ 库槽 k 语义对齐。
+- **造成影响**:
+  - 行为: 训练管线新增一条可选路径; C 运行时零改动
+  - 配置: 无新 env; 新脚本 argparse (--n-classes 默认 4, --clips-per-class 默认 2000)
+  - 测试/回归: 冒烟验证 CSV 列格式 (File_path, filter_idx)、WAV 1s/16k、band_0/band_3 频谱质心落位正确; 未跑真实规模 (重计算留给用户)
+  - 性能/内存: 2000 段/类 × 4 类 ≈ 256MB 磁盘
+  - 未验证项: 真实规模合成 + CNN 重训 + 导出后离线 NR 未验证 (用户跑)
+- **验证方式**: `python export/generate_synthetic_noise.py --n-classes 4 --clips-per-class 3` 冒烟 → CSV/WAV 格式 + 频谱质心检查通过
+- **回退方式**: 删除脚本 + 撤 README 块即可 (训练管线回到真实语料打分路径)
+
+### [2026-08-22] 清理回归 CNN 线 — 只保留 SFANC 硬选库单一架构
+- **状态**: 工作区未提交
+- **基线**: fdf86fa
+- **变更代码**:
+  - 删除: `include/ocg.h` `src/ocg.c` `build/ocg_selftest.c` `tools/mkbank.c`（回归线聚类/重置/查槽工具）
+  - 删除: 回归 CNN 数据 `data/cnn_*.bin`、`data/cnn_info.json`、`data/sub_filters.bin`、`data/sub_filters_info.json`、`data/wc_fixed.bin`（含引用）
+  - 删除: 回归训练线 `SceneZone_Scene/training/{network,labeling,control_filters,export}/` 15 个脚本 + `tools/` 6 个回归诊断脚本 + `docs/场景切换交接_CNN权重vs_FxLMS自适应.md`
+  - 修改: `src/binary_loader.c` — 批次指纹 glob `cnn_*.bin`→`cnn_bank_*.bin`，`fixed[]` 删 `sub_filters.bin`（留 bandpass_fir/bandpass_anc）
+  - 修改: `export/export_bin.py` — 删 `--bank`/BANK_MODE/DW 分支，只导分类 CNN + 声学路径 + 带通 + 指纹 + 配置
+  - 修改: `include/scenezone_types.h` — `gfanc_config_t` 删 wc_rms_target/switch_threshold/reset_hyst/wc_cold_start/gfanc_mode/ocg_*/gain_smooth_* 字段与 env 解析
+  - 修改: `src/scene_controller.c`/`.h` — 删 `scene_ctrl_construct_wc`/`scene_ctrl_process`/`scene_ctrl_set_gain_smoothing`，`scene_ctrl_init(sc)` 无参（K 由 cnn_bank 推导），struct 删回归字段；`scene_manager.h` 删 `sm_cos_sim`/`sm_fmt_top_gains`
+  - 修改: `src/cnn_m5_forward.c` — 删回归包装 `cnn_init()`，入口统一 `cnn_init_base("cnn_bank")`
+  - 修改: `main_realtime.c` — 删 `sub_filters.bin` 加载/FATAL、回归 CNN 分支、`apply_reset`/OCG/增益平滑；标定改零启动闭环+收敛自动存槽；部署无库直接 FATAL
+  - 修改: `main.c` — 删回归闭环评估路径，`GFANC_OPEN_LOOP` 成唯一模式（env 删），纯开环 SFANC 硬选
+  - 修改: `Makefile` — 删 `src/ocg.c`，模块表拆离线/实时；`README.md`/CHANGELOG 同步改写
+- **变更原因**: 回归 CNN 线（直接权重/子滤波器/OCG/场景切换）是前架构遗留，部署决策路径零消费但仍硬耦合三处（stub_rms、启动 FATAL、标定 warm-start）。项目定稿为 SFANC 硬选库后整体移除，只保留当前架构需要的东西。
+- **造成影响**:
+  - 行为: 标定态从零启动闭环 FxLMS（无回归 warm-start），收敛自动存库槽；部署态无库直接 FATAL（删 wc_fixed/CNN 生成式兜底）；离线纯开环唯一路径（`GFANC_OPEN_LOOP` env 不再需要）
+  - 配置: 删除 `GFANC_MODE` `GFANC_WC_TARGET` `GFANC_WC_COLD` `GFANC_RESET_THRESH/HYST` `GFANC_OCG*` `GFANC_GAIN_SMOOTH` `GFANC_OPEN_LOOP` env；保留 `GFANC_BANK_SIM` `GFANC_FORCE_CLASS` `GFANC_CAL_INDEX` 等
+  - 测试/回归: 待离线短跑验证（todo 9，不跑重计算）
+  - 性能/内存: 移除回归权重加载，启动更轻；推理只走分类 CNN
+  - 未验证项: 实机标定/部署需硬件（用户跑）；离线开环 NR_true 数字待刷新
+- **验证方式**: `make clean && make` 三目标构建；残留 grep（sub_filters/ocg_/scene_ctrl_process/construct_wc/wc_fixed/gain_smooth/GFANC_MODE）；离线短跑 `GFANC_BANK_SIM=1` 轮转 + 分类选槽
+- **回退方式**: 回归线文件已删除，无法简单回退（需从 git 恢复）；改回 baseline fdf86fa 可整体回退
+
 ### [2026-08-18] 项目重命名 — GFANC FxNLMS → SceneZone ANC（L2: 对外名 + 文件名）
 - **状态**: 已提交（随本提交落库）
 - **基线**: 2f29779

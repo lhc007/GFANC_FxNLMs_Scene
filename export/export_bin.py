@@ -2,12 +2,15 @@
 
 用法: python export/export_bin.py
 
-输出: data/*.bin + data/cnn_info.json + data/scenezone_config.json
+输出: data/*.bin + data/cnn_bank_info.json + data/scenezone_config.json
+
+只导出 SFANC 硬选库部署集: 分类 CNN (MIMO_M5_Scene_Bank.pth → data/cnn_bank_*.bin)
++ 声学路径 + 带通 + 批次指纹 + 全局配置. 回归 CNN 线 (cnn_*.bin / sub_filters) 已移除.
 
 R-16-②: v2 格式添加 16B 头 {magic"GFNC", version, n_floats, crc32}.
 C 端 bin_load_float 自动检测 magic — 新格式校验, 旧格式直接加载.
 """
-import os, sys, json, struct, zlib, glob, argparse
+import os, sys, json, struct, zlib, glob
 import numpy as np
 import scipy.io as sio
 import torch
@@ -17,13 +20,6 @@ from pathlib import Path
 BIN_MAGIC   = b'GFNC'          # 4 bytes magic
 BIN_VERSION = 1                 # uint32 LE
 BIN_HDR_FMT = '<4sIII'          # magic(4s) + version(I) + n_floats(I) + crc32(I) = 16B
-
-# Phase 3: --bank 只导出 SFANC 分类 CNN 集 (cnn_bank_*.bin), 不动回归集 (cnn_*.bin)
-_AP = argparse.ArgumentParser(description='export_bin.py — 导出 C 端 .bin 权重')
-_AP.add_argument('--bank', action='store_true',
-                 help='只导出 SFANC 分类 CNN (MIMO_M5_Scene_Bank.pth → data/cnn_bank_*.bin), '
-                      '回归集/路径/带通不变')
-BANK_MODE = _AP.parse_args().bank
 
 # ═══════════════════════════════════════════════════════════════
 # 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则查找项目内
@@ -35,37 +31,15 @@ else:
     # 默认: 项目根目录下的 SceneZone_Scene
     PY_PROJ = Path(os.path.dirname(os.path.abspath(__file__))).parent / 'SceneZone_Scene'
 
-# CNN 模型 — 直接权重回归版优先, 否则回退到场景分类器 (backward compat)
-CNN_CKPT_DW  = PY_PROJ / 'models' / 'MIMO_M5_DirectWeight_Real.pth'
-CNN_CKPT_SCE = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
-CNN_CKPT_BANK = PY_PROJ / 'models' / 'MIMO_M5_Scene_Bank.pth'
-if BANK_MODE:
-    # SFANC 分类 CNN (Phase 3): K=N 通用类, 硬标签 CrossEntropy 训练.
-    # K 从 ckpt linear weight 推导 (无语义 scene_definitions_bank.json).
-    CNN_MODEL = CNN_CKPT_BANK
-    CNN_BASE  = 'cnn_bank'          # 权重集前缀 → data/cnn_bank_*.bin
-    CNN_MODE  = 'classification'    # argmax 硬选库槽
-    CNN_ACT   = 'none'              # 分类: logits 直接 argmax, 无 tanh/softmax
-    SCENE_DEF = None
-    INFO_NAME = 'cnn_bank_info.json'
-    if not CNN_MODEL.exists():
-        raise SystemExit(f'ERROR: --bank 需要 {CNN_MODEL.name} (先跑 '
-                         f'training/network/train_real_bank_cnn.py)')
-    IS_DW = False
-else:
-    CNN_MODEL = CNN_CKPT_DW if CNN_CKPT_DW.exists() else CNN_CKPT_SCE
-    CNN_BASE  = 'cnn'
-    CNN_MODE  = 'direct_weight'
-    CNN_ACT   = 'tanh'
-    INFO_NAME = 'cnn_info.json'
-    IS_DW = CNN_MODEL == CNN_CKPT_DW    # True=直接权重回归 (S*C=30 维), False=场景分类 (K 维)
-
-# 子滤波器 (.mat)
-SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat'
-
-# 场景定义 (centroids) — 仅非 bank 模式 (场景分类 backward compat) 需要
-if not BANK_MODE:
-    SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
+# CNN 模型 — SFANC 分类 CNN (硬标签 CrossEntropy 训练, K=N 通用类)
+CNN_MODEL = PY_PROJ / 'models' / 'MIMO_M5_Scene_Bank.pth'
+CNN_BASE  = 'cnn_bank'          # 权重集前缀 → data/cnn_bank_*.bin
+CNN_MODE  = 'classification'    # argmax 硬选库槽
+CNN_ACT   = 'none'              # 分类: logits 直接 argmax, 无 tanh/softmax
+INFO_NAME = 'cnn_bank_info.json'
+if not CNN_MODEL.exists():
+    raise SystemExit(f'ERROR: 需要 {CNN_MODEL.name} (先跑 '
+                     f'training/network/train_real_bank_cnn.py)')
 
 # 主/次声学路径 — R-58-6: 统一到真实硬件录制路径 (用户硬件 3E-2S-1R)!
 # 训练 (Pre_training_broadband_and_decompose.py) 必须同步用这两个文件,
@@ -81,39 +55,14 @@ SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR    = SCRIPT_DIR.parent / 'data'
 OUT_DIR.mkdir(exist_ok=True)
 
-# 系统参数 (S/C/E 固定, K 从场景定义自动读取)
+# 系统参数 (S/C/E 固定)
 S, C, E = 2, 15, 3   # S=扬声器, C=子滤波器数, E=误差麦克风数
 
-# ── CNN 输出维度: DW 模式 = S*C (直接权重), Scene/Bank 模式 = K (类数) ──
+# ── CNN 输出维度: 库分类 K = ckpt 输出维 (槽序 == 库槽序, 无语义 JSON) ──
 ckpt = torch.load(str(CNN_MODEL), map_location='cpu', weights_only=True)
 n_out = ckpt['linear.weight'].shape[0]
-if IS_DW:
-    # 直接权重回归: 输出必须 = S*C = 30 (S 扬声器 × C 子带增益)
-    if n_out != S * C:
-        raise SystemExit(
-            f'ERROR: direct-weight CNN expects {S*C} (=S{S}×C{C}) outputs, '
-            f'but {CNN_MODEL.name} linear layer has {n_out}. '
-            f'Retrain with K=SC (see training/network/Train_validate.py).'
-        )
-    K = n_out
-    print(f'CNN mode: direct_weight (回归头 {K}=S*C 维, tanh 激活)')
-else:
-    if BANK_MODE:
-        # 通用 N 类: K 直接从 ckpt 输出维推导 (槽序 == 库槽序, 无语义 JSON)
-        K = n_out
-        print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
-    else:
-        # 场景分类 (backward compat): K 从 scene_definitions_real.json 读取
-        with open(SCENE_DEF, encoding='utf-8') as f:
-            scene_doc = json.load(f)
-        K = scene_doc.get('n_scenes') or len(scene_doc.get('scenes', []))
-        if n_out != K:
-            raise SystemExit(
-                f'ERROR: K mismatch — {SCENE_DEF.name} has {K} classes, '
-                f'but {CNN_MODEL.name} linear layer expects {n_out}. '
-                f'Check your SCENE_DEF / CNN_MODEL paths.'
-            )
-        print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
+K = n_out
+print(f'CNN mode: classification (K={K} 维, activation=none)')
 print(f'CNN checkpoint 输出 {n_out} 维 OK ({CNN_BASE}_*.bin)')
 
 def write_bin(name, arr):
@@ -132,7 +81,7 @@ def write_json(name, data):
     with open(OUT_DIR / name, 'w') as f:
         json.dump(data, f, indent=2)
 
-# ── 1. CNN 权重 ──
+# ── 1. CNN 权重 (分类选库) ──
 print('Exporting CNN weights...')
 sys.path.insert(0, str(PY_PROJ))
 from gfanc.Network import m5_scene
@@ -202,31 +151,16 @@ cnn_info = {
     'pool_kernel': 4, 'pool_stride': 4,
     'fc_in': 64, 'fc_out': K,
     'bn_eps': 1e-5,
-    # C 端推理激活: direct_weight=tanh (回归头输出归一化增益), scene/bank=分类无激活
+    # C 端推理激活: 分类无激活 (logits 直接 argmax)
     'mode': CNN_MODE,
     'activation': CNN_ACT,
-}
-if BANK_MODE:
     # 库分类: 无语义类名 — 槽 k 即滤波器 k (类序 == 库槽序)
-    cnn_info['classes'] = [f'filter_{k}' for k in range(K)]
+    'classes': [f'filter_{k}' for k in range(K)],
+}
 write_json(INFO_NAME, cnn_info)
 print(f'  {INFO_NAME} saved')
 
-# ── 1b. bank 模式: 只导出分类 CNN 集 (cnn_bank_*.bin), 不动回归集/路径/带通 ──
-if BANK_MODE:
-    print(f'\n--bank 完成: {CNN_BASE}_*.bin (K={K}, mode={CNN_MODE}) → {OUT_DIR}/')
-    print('  回归集 (cnn_*.bin) 未动, 供 calibrate 模式使用.')
-    sys.exit(0)
-
-# ── 2. 子滤波器 ──
-print('Exporting sub-filters...')
-Wc_v = sio.loadmat(str(SUB_FILTER))['Wc_v']
-write_bin('sub_filters', Wc_v)
-sub_info = {'C': C, 'S': S, 'filter_len': int(Wc_v.shape[2])}
-write_json('sub_filters_info.json', sub_info)
-print(f'  sub_filters.bin: shape={list(Wc_v.shape)}')
-
-# ── 3. 声学路径 ──
+# ── 2. 声学路径 ──
 print('Exporting acoustic paths...')
 Pri = np.load(str(PRI_PATH))
 Sec = np.load(str(SEC_PATH))
@@ -241,23 +175,14 @@ write_bin('secondary_path', Sec)
 print(f'  primary_path.bin: {list(Pri.shape)}')
 print(f'  secondary_path.bin: {list(Sec.shape)}')
 
-# ── 4. 场景定义 (仅场景分类模式; 直接权重模式无 centroid, 运行时改为权重混合) ──
-if IS_DW:
-    print('Skipping scene_defs.bin (direct_weight 模式无 centroid)')
-else:
-    print('Exporting scene definitions...')
-    centroids = np.array([scene_doc['scenes'][str(k)]['centroid'] for k in range(K)], dtype=np.float32)
-    write_bin('scene_defs', centroids)
-    print(f'  scene_defs.bin: {list(centroids.shape)}')
-
-# ── 5. 带通 FIR ──
+# ── 3. 带通 FIR ──
 print('Exporting bandpass FIR...')
 bp = sio.loadmat(str(BP_FIR))
 bp_coeff = bp['fir_bandpass_coeff'].flatten().astype(np.float32)
 write_bin('bandpass_fir', bp_coeff)
 print(f'  bandpass_fir.bin: {len(bp_coeff)} taps')
 
-# ── 5b. ANC 专用短带通 FIR (R-13: 64tap, 群延迟 2ms vs 8ms — 砍环路延迟) ──
+# ── 3b. ANC 专用短带通 FIR (R-13: 64tap, 群延迟 2ms vs 8ms — 砍环路延迟) ──
 print('Exporting ANC bandpass FIR (64tap)...')
 from scipy.signal import firwin
 # P0-7 (2026-08-14): 低截止 20→50Hz(折中) — S 在 100Hz 以下滚降 25dB(实测), <50Hz
@@ -268,14 +193,13 @@ write_bin('bandpass_anc', bp_anc_coeff)
 print(f'  bandpass_anc.bin: {len(bp_anc_coeff)} taps, '
       f'gd={(64-1)/(2*16000)*1000:.1f}ms (vs 1024tap gd={(1024-1)/(2*16000)*1000:.1f}ms)')
 
-# ── 5c. 批次指纹 (R-27) — 防 cnn/sub_filters/bandpass 跨批混配 ──
-# 指纹 = 对 [排序后的 cnn_*.bin + sub_filters + bandpass_fir + bandpass_anc]
+# ── 4. 批次指纹 (R-27) — 防 cnn_bank/bandpass 跨批混配 ──
+# 指纹 = 对 [排序后的 cnn_bank_*.bin + bandpass_fir + bandpass_anc]
 #       原始字节做链式 crc32 (与 C 端 binary_loader.c bin_crc32_chain 语义一致:
 #       zlib.crc32(data, prev) 续算). 声学路径 (primary/secondary/feedback…) 是
 #       安装态可替换的测量值, 不入指纹 — 换 Ŝ 属设计行为 (R-16-①/BUG-8).
 def _batch_crc32():
-    files = sorted(glob.glob(str(OUT_DIR / 'cnn_*.bin'))) + [
-        str(OUT_DIR / 'sub_filters.bin'),
+    files = sorted(glob.glob(str(OUT_DIR / 'cnn_bank_*.bin'))) + [
         str(OUT_DIR / 'bandpass_fir.bin'),
         str(OUT_DIR / 'bandpass_anc.bin'),
     ]
@@ -297,17 +221,16 @@ batch_info = {
 write_json('batch_info.json', batch_info)
 print(f'  batch_id.bin: 0x{batch_crc:08x} ({len(batch_files)} files)')
 
-# ── 6. 全局配置 ──
+# ── 5. 全局配置 ──
 config = {
     'fs': 16000, 'E': E, 'S': S, 'C': C, 'K': K,
-    'filter_len': int(Wc_v.shape[2]),
     'pri_len': int(Pri.shape[2]), 'sec_len': int(Sec.shape[2]),
     'input_len': 16000, 'bp_len': int(len(bp_coeff)),
     'bp_anc_len': 256,
-    'dsp_delay': 16, 'fade_len': 1600, 'sc_dim': S * C,
-    # CNN 模式: direct_weight (回归 S*C 维, tanh) / scene (分类 K 维, softmax)
-    'cnn_mode': 'direct_weight' if IS_DW else 'scene',
-    'cnn_activation': 'tanh' if IS_DW else 'softmax',
+    'dsp_delay': 16, 'fade_len': 1600,
+    # CNN 模式: SFANC 分类 (argmax 硬选库槽, 无激活)
+    'cnn_mode': CNN_MODE,
+    'cnn_activation': CNN_ACT,
     'n_cnn_out': K,
 }
 write_json('scenezone_config.json', config)
