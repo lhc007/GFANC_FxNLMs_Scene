@@ -40,12 +40,13 @@ CNN_CKPT_DW  = PY_PROJ / 'models' / 'MIMO_M5_DirectWeight_Real.pth'
 CNN_CKPT_SCE = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
 CNN_CKPT_BANK = PY_PROJ / 'models' / 'MIMO_M5_Scene_Bank.pth'
 if BANK_MODE:
-    # SFANC 分类 CNN (Phase 3): K=N=4, 硬标签 CrossEntropy 训练
+    # SFANC 分类 CNN (Phase 3): K=N 通用类, 硬标签 CrossEntropy 训练.
+    # K 从 ckpt linear weight 推导 (无语义 scene_definitions_bank.json).
     CNN_MODEL = CNN_CKPT_BANK
     CNN_BASE  = 'cnn_bank'          # 权重集前缀 → data/cnn_bank_*.bin
     CNN_MODE  = 'classification'    # argmax 硬选库槽
     CNN_ACT   = 'none'              # 分类: logits 直接 argmax, 无 tanh/softmax
-    SCENE_DEF = PY_PROJ / 'models' / 'scene_definitions_bank.json'
+    SCENE_DEF = None
     INFO_NAME = 'cnn_bank_info.json'
     if not CNN_MODEL.exists():
         raise SystemExit(f'ERROR: --bank 需要 {CNN_MODEL.name} (先跑 '
@@ -62,7 +63,7 @@ else:
 # 子滤波器 (.mat)
 SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat'
 
-# 场景定义 (centroids) — bank 模式在上面已设 scene_definitions_bank.json, 勿覆盖
+# 场景定义 (centroids) — 仅非 bank 模式 (场景分类 backward compat) 需要
 if not BANK_MODE:
     SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
 
@@ -97,17 +98,22 @@ if IS_DW:
     K = n_out
     print(f'CNN mode: direct_weight (回归头 {K}=S*C 维, tanh 激活)')
 else:
-    # 场景/库分类: K 从 scene_definitions_{real|bank}.json 读取
-    with open(SCENE_DEF, encoding='utf-8') as f:
-        scene_doc = json.load(f)
-    K = scene_doc.get('n_scenes') or len(scene_doc.get('scenes', []))
-    if n_out != K:
-        raise SystemExit(
-            f'ERROR: K mismatch — {SCENE_DEF.name} has {K} classes, '
-            f'but {CNN_MODEL.name} linear layer expects {n_out}. '
-            f'Check your SCENE_DEF / CNN_MODEL paths.'
-        )
-    print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
+    if BANK_MODE:
+        # 通用 N 类: K 直接从 ckpt 输出维推导 (槽序 == 库槽序, 无语义 JSON)
+        K = n_out
+        print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
+    else:
+        # 场景分类 (backward compat): K 从 scene_definitions_real.json 读取
+        with open(SCENE_DEF, encoding='utf-8') as f:
+            scene_doc = json.load(f)
+        K = scene_doc.get('n_scenes') or len(scene_doc.get('scenes', []))
+        if n_out != K:
+            raise SystemExit(
+                f'ERROR: K mismatch — {SCENE_DEF.name} has {K} classes, '
+                f'but {CNN_MODEL.name} linear layer expects {n_out}. '
+                f'Check your SCENE_DEF / CNN_MODEL paths.'
+            )
+        print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
 print(f'CNN checkpoint 输出 {n_out} 维 OK ({CNN_BASE}_*.bin)')
 
 def write_bin(name, arr):
@@ -201,8 +207,8 @@ cnn_info = {
     'activation': CNN_ACT,
 }
 if BANK_MODE:
-    # 库分类: 类名表 (== 库槽序, 与 C scene_bank_names 对齐) 进 info, 供工具检视
-    cnn_info['classes'] = scene_doc['classes']
+    # 库分类: 无语义类名 — 槽 k 即滤波器 k (类序 == 库槽序)
+    cnn_info['classes'] = [f'filter_{k}' for k in range(K)]
 write_json(INFO_NAME, cnn_info)
 print(f'  {INFO_NAME} saved')
 

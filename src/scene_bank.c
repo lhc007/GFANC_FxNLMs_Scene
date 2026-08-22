@@ -40,7 +40,8 @@ int scene_bank_load(const char *path, int S, int L, scene_bank_t *bank)
     if (flen != SCENE_BANK_HEADER_SIZE + (long)n_slots * (long)slot_len * (long)sizeof(float)) {
         fclose(f); return -1;   /* 文件截断/多段 */
     }
-    rewind(f);
+    /* 跳过 16B 头再读数据 — 原 rewind() 把头部字节读成前 4 个 float (tap0-3 污染) */
+    if (fseek(f, SCENE_BANK_HEADER_SIZE, SEEK_SET) != 0) { fclose(f); return -1; }
 
     float *data = (float *)malloc((size_t)n_slots * slot_len * sizeof(float));
     if (!data) { fclose(f); return -1; }
@@ -78,18 +79,46 @@ int scene_bank_save_slot(const char *path, int S, int L, int k, const float *wc)
     long offset;
 
     if (probe_existing(path, &n_slots, &slot_len) == 0) {
-        /* 已存在: 校验槽长, 槽 k 必须 < n_slots */
+        /* 已存在: 校验槽长 */
         if ((int)slot_len != S * L) return -1;
-        if (k < 0 || (uint32_t)k >= n_slots) return -1;
-        offset = SCENE_BANK_HEADER_SIZE + (long)k * (long)slot_len * (long)sizeof(float);
-        FILE *f = fopen(path, "r+b");
-        if (!f) return -1;
-        if (fseek(f, offset, SEEK_SET) != 0) { fclose(f); return -1; }
-        if (fwrite(wc, sizeof(float), (size_t)slot_len, f) != (size_t)slot_len) {
-            fclose(f); return -1;
+        if (k < 0) return -1;
+        if ((uint32_t)k < n_slots) {
+            /* 槽 k 已存在: 直接覆写 */
+            offset = SCENE_BANK_HEADER_SIZE + (long)k * (long)slot_len * (long)sizeof(float);
+            FILE *f = fopen(path, "r+b");
+            if (!f) return -1;
+            if (fseek(f, offset, SEEK_SET) != 0) { fclose(f); return -1; }
+            if (fwrite(wc, sizeof(float), (size_t)slot_len, f) != (size_t)slot_len) {
+                fclose(f); return -1;
+            }
+            fclose(f);
+            return 0;
         }
-        fclose(f);
-        return 0;
+        /* 槽 k >= n_slots: 扩展库 (保留旧槽, 新槽置零, 写 wc 到槽 k) — Phase 3c 多槽标定 */
+        uint32_t total = (uint32_t)(k + 1);
+        float *data = (float *)calloc((size_t)total * S * L, sizeof(float));
+        if (!data) return -1;
+        FILE *fr = fopen(path, "rb");
+        if (!fr) { free(data); return -1; }
+        int rdok = fseek(fr, SCENE_BANK_HEADER_SIZE, SEEK_SET) == 0
+                && fread(data, sizeof(float), (size_t)n_slots * S * L, fr)
+                   == (size_t)n_slots * S * L;
+        fclose(fr);
+        if (!rdok) { free(data); return -1; }
+        memcpy(data + (size_t)k * S * L, wc, (size_t)S * L * sizeof(float));
+        FILE *gw = fopen(path, "wb");
+        if (!gw) { free(data); return -1; }
+        unsigned char hdr[SCENE_BANK_HEADER_SIZE];
+        wr_u32(hdr, SCENE_BANK_MAGIC);
+        wr_u32(hdr + 4, SCENE_BANK_VERSION);
+        wr_u32(hdr + 8, total);
+        wr_u32(hdr + 12, (uint32_t)(S * L));
+        int ok = fwrite(hdr, 1, SCENE_BANK_HEADER_SIZE, gw) == SCENE_BANK_HEADER_SIZE
+              && fwrite(data, sizeof(float), (size_t)total * S * L, gw)
+                 == (size_t)total * S * L;
+        fclose(gw);
+        free(data);
+        return ok ? 0 : -1;
     }
 
     /* 新建: 头 + k 槽写 wc, 其余槽置零 */
@@ -141,16 +170,4 @@ const float *scene_bank_slot(const scene_bank_t *bank, int k)
 {
     if (!bank || !bank->data || k < 0 || (uint32_t)k >= bank->n_slots) return NULL;
     return bank->data + (size_t)k * bank->slot_len;
-}
-
-/* 类名表 (诊断): 槽序 == CNN 标签 == scene_definitions_bank.json classes.
- * 单一事实源: 改类序必须同步改 JSON/训练/此处三处. */
-static const char *const s_class_names[SCENE_BANK_CLASS_COUNT] = {
-    "road", "children", "construction", "railway"
-};
-
-const char *scene_bank_class_name(int k)
-{
-    if (k < 0 || k >= SCENE_BANK_CLASS_COUNT) return "?";
-    return s_class_names[k];
 }

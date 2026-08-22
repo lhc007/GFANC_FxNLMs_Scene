@@ -5,12 +5,12 @@
  *    数据:   n_slots × (slot_len float32)  // slot_len = S*L (本系统 2*1024=2048)
  *
  *  C 端 N (库槽数) 由 (n_floats)/(S*L) 推导, 无需 JSON 解析.
- *  data/wc_bank_info.json 仅人/工具可读 (类名/增益记录), C 端不依赖.
+ *  data/wc_bank_info.json 仅人/工具可读 (源噪声/增益记录), C 端不依赖.
  *
  *  对齐校验: 加载期必须满足 n_slots == CNN K (分类输出维), 不符 FATAL —
- *  硬选库的类顺序 = CNN 标签 = C 名表三处必须一致.
+ *  硬选库的槽序 = CNN 标签 (filter_idx), 无语义类名.
  *
- *  绝对增益 (Phase 3 标定定稿): 库槽 = 就地 FxLMS 收敛的成品 Wc 原样写入,
+ *  绝对增益 (Phase 3 标定定稿): 库槽 = 离线/就地 FxLMS 收敛的成品 Wc 原样写入,
  *  含完整绝对振幅+相位, 不做 RMS 归一化 — 这是"开环可降噪"与现状
  *  "~0.01 几乎无声" 的根本区别 (研究结论 §1).
  */
@@ -45,12 +45,5 @@ void scene_bank_free(scene_bank_t *bank);
 
 /* 槽 k 指针 (越界返回 NULL). */
 const float *scene_bank_slot(const scene_bank_t *bank, int k);
-
-/* ── 类名表 (Phase 3, 诊断用) ──
- * 槽序 == CNN 标签 == 此表三处必须与 SceneZone_Scene/models/
- * scene_definitions_bank.json 的 classes 一致 (硬选库对齐校验 #6).
- * 越界返回 "?". */
-#define SCENE_BANK_CLASS_COUNT 4
-const char *scene_bank_class_name(int k);
 
 #endif

@@ -1,8 +1,0 @@
-{
-  "n_scenes": 4,
-  "mode": "classification",
-  "classes": ["road", "children", "construction", "railway"],
-  "source": "Real_world_Dataset categories (Index_real_Training_data.csv)",
-  "creation_date": "2026-08-22",
-  "note": "单一事实源: 类序 == 库槽序 (wc_bank.bin slot k == 训练硬标签 k == C 类名表 scene_bank_names[k]). 改类序需三处同步."
-}

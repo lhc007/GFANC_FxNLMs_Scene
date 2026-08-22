@@ -670,8 +670,8 @@ int main(int argc, char **argv)
                     memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
                     fade_cnt = cfg.fade_len;
                     snprintf(action, sizeof(action), "C%d->%d", open_class, c);
-                    printf("  [BANK] 分类 %d→%d (%s, slot %d, fade %d)\n",
-                           open_class, c, scene_bank_class_name(c), c, cfg.fade_len);
+                    printf("  [BANK] 分类 %d→%d (filter %d, slot %d, fade %d)\n",
+                           open_class, c, c, c, cfg.fade_len);
                     open_class = c;
                 }
             }

@@ -274,7 +274,10 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_BANK_FILE"))) {
         snprintf(cfg->bank_file, sizeof(cfg->bank_file), "%s", s);
     }
-    if ((s = getenv("GFANC_CAL_INDEX"))) cfg->cal_scene_index = atoi(s);
+    if ((s = getenv("GFANC_CAL_INDEX"))) {
+        cfg->cal_scene_index = atoi(s);
+        if (cfg->cal_scene_index < 0) cfg->cal_scene_index = 0;   /* 负值钳到槽 0 */
+    }
     if ((s = getenv("GFANC_BANK_SIM"))) {
         cfg->bank_sim = atoi(s) != 0 ? 1 : 0;
     }

@@ -1,6 +1,8 @@
 # SceneZone ANC — 主动降噪系统 (ANC)
 
-> **版本**: v1.9 (2026-08-11) | **分支**: gfanc-direct-weight | 完整变更史见 [变更记录](docs/变更记录_CHANGELOG.md)
+> **版本**: v2.0 (2026-08-22) | **分支**: plan-c-dual-mode | 完整变更史见 [变更记录](docs/变更记录_CHANGELOG.md)
+>
+> **v2.0 架构 = SFANC 硬选库（Phase 1-3 已完成）**：误差麦只在**标定**用，部署态**无误差麦纯开环**。标定/离线收敛后存 N 条全频段成品滤波器到库 `data/wc_bank.bin`（**绝对增益烘焙**，不做 RMS 归一化）；部署态 = 1Hz CNN 分类（`cnn_bank`，K=N）argmax 硬选库槽 → 防抖 → crossfade 切换。详见下方「双模式」。
 
 ## 这是什么？
 
@@ -48,10 +50,11 @@
 |-----------|---------|
 | 从头训练 + 实时降噪（默认） | 阶段 0 → 1 → 2 → 3 → 4 全流程 |
 | 先用现成模型跑通（可选捷径） | 阶段 0 → 1 → 3 → 4（跳过训练 2；主路径测量可省） |
+| **部署态硬选库（SFANC 无误差麦开环）** | 阶段 0 → 1 → 2 → 3 → 4（部署训练核心 = 2-⑧：N 条代表噪声生成库槽 + 打标签训分类 CNN；回归 CNN 线 2-⓪→2-③ 也全从零重训——部署运行时硬加载其产物、导出依赖它） |
 
 **为什么先测声学路径再训练？** 子滤波器生成（阶段 2-①）和打标签（阶段 2-②）都以 `secondary_path.npy` 和 `primary_path.npy` 为输入，所以**阶段 1 测声学路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（训练用不到，阶段 1 里一起测完）。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到阶段 2-⑦ 重导一次让新测 Ŝ 生效。
 
-**核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
+**核心概念**：参考麦拾取噪声 → CNN 判定噪声类型 → 生成 30 维子带增益 → 构造反噪声 FIR（Wc）→ 扬声器播放抵消，误差麦反馈给 FxLMS 自适应调整。**v2.0（SFANC 硬选库）**：误差麦只在**标定/训练**时用——部署态没有误差麦，靠「N 条全频段成品滤波器库（离线 FxLMS 收敛或实机标定）+ CNN 分类 argmax 硬选」开环降噪（详见下方「双模式」）。凡是"声音怎么在空气里走"的参数（扬声器→误差麦 Ŝ、扬声器→参考麦反馈、环路延迟）**取决于摆放几何，换了位置必须重测**。
 
 **校准时注意**：增益旋钮调到 **SIG 常亮、CLIP 不亮**，且**校准和运行时必须用同一位置**（路径系数嵌入了模拟增益）。探针响度用 `GFANC_CAL_NOISE` 调（默认 0.9）：削波就调小（如 0.4），SNR 不足就调大。ERLE < 8dB 的弱耦合路径会被自动置零（属正常保护）。文件缺失时反馈抵消自动禁用，不影响降噪但可能啸叫。
 
@@ -59,20 +62,18 @@
 
 需要 `libportaudio64bit-asio.dll` 在同目录（项目自带）；编译也可用 `make` / `make realtime`（Makefile 已含全部模块）。换硬件或换摆放后从零到实时运行的完整清单见 [换硬件检查单](#换硬件检查单)。
 
-> **想试场景切换（OCG 聚类闸门）？** 默认**关闭**（`GFANC_OCG=0`，稳定性最佳，日常开窗降噪用默认即可）。想验证"换噪声类型自动切换反相"时再开：
+> **想试场景切换（OCG 聚类闸门）？** 默认**关闭**（`GFANC_OCG=0`，稳定性最佳，日常开窗降噪用默认即可）。这是**标定态（adapt）**的自适应调参，部署态（fixed）不经过 OCG（走 CNN 分类硬选库槽）。想验证"换噪声类型自动切换反相"时再开：
 > - **PowerShell**：`$env:GFANC_OCG="1"; ./scenezone_realtime.exe`（关掉：重开终端即可，或 `Remove-Item Env:GFANC_OCG`）
 > - **Git Bash / WSL**：`GFANC_OCG=1 ./scenezone_realtime.exe`
 > ⚠️ OCG 会在检测到新噪声类型时重置 Wc 以跟随，纯音深对消下可能引入抖动（实测证伪后默认关，见 [CHANGELOG](docs/变更记录_CHANGELOG.md)）——验证用，不是默认稳定配置。
 
 #### 怎么验证真的有效
 
-**用 250Hz 纯音验证，别用宽带噪音**。系统受环路延迟限制，只能对消窄带/周期成分——纯音最能反映真实对消能力：
+**两种验证口径，别混**：
+- **标定态（adapt，有误差麦）**：用 250Hz 纯音验证。系统受环路延迟限制，只能对消窄带/周期成分——纯音最能反映链路健康：放 250Hz 纯音 → 终端表格 **NR 应到 10dB 以上**，误差麦电平明显下降，拿开噪声源再放回确认跟随。
+- **部署态（fixed，无误差麦，日常运行）**：**没有 NR 指标**（n/a）。验证靠两点：①放某类噪声，看每秒 `[BANK]` 类日志选的类对不对；②人耳听降噪有没有变安静。别用纯音——部署态播的是标定好的固定滤波器，纯音只测标定态链路。
 
-1. 手机/电脑放一段 **250Hz 纯音**，作为参考麦的噪声源
-2. 看终端每秒一行的表格：**NR 应到 10dB 以上**，误差麦电平应明显下降
-3. 拿开噪声源再放回，确认降噪跟随
-
-> ⚠️ 别用马路噪音/宽带 WAV 验证"真实降噪"——宽带随机噪声物理上消不了（预览预算为负），纯音才见真章。降噪数字只在**误差麦位置**有效（静音区 ≈ 声波波长/10），人耳远离误差麦时效果下降。
+> ⚠️ 别用马路噪音/宽带 WAV 验证标定态"真实降噪"——宽带随机噪声物理上消不了（预览预算为负），纯音才见真章。降噪数字只在**误差麦位置**有效（静音区 ≈ 声波波长/10），人耳远离误差麦时效果下降。
 
 关键操作要点：
 
@@ -96,12 +97,14 @@
 | 2 | **测环路延迟（首次 / 换声卡·缓冲必测）** | 阶段 1-④ → `sec_bulk_delay.bin`（运行时自动补偿） |
 | 3 | 测反馈路径（防啸叫） | 阶段 1-⑤ → `feedback_path_0/1.bin` |
 | 4 | 编译实时版 | 阶段 3-① |
-| 5 | 运行 + 纯音验证 | 阶段 4-①（250Hz 纯音 NR ≥ 10dB、零 RESET） |
+| 5 | 运行 + 纯音验证 | 默认（标定态）跑 `.\scenezone_realtime.exe` + 250Hz 纯音 NR ≥ 10dB（部署态见阶段 4，无 NR 指标） |
 
 ### 换硬件时**不需要**重做的
 
 - **CNN 模型、子滤波器、权重导出**（`export_bin.py`）——除非你换的硬件改变了训练数据分布（一般不会）
 - **主路径（Pri）测量**——实时版**不加载**主路径；仅**训练打标签（阶段 2-②）、离线评估 `main.exe` 算 NR_true** 需要（`export/measure_primary.py`，见阶段 1-③）。若重训则需先重测
+
+> ⚠️ **换摆放/换设备后，走部署态（fixed）需重标定填库**：SFANC 库槽是就地收敛成品（绝对增益嵌进了系数），换位置/几何后物理 P/S 解变了，开环降噪会静默下降。重跑一次标定（`GFANC_CAL_INDEX=k` 覆盖对应槽）即可恢复，分类 CNN（`cnn_bank`）**不用重训**——它是"谱形→类别"映射，跨环境可复用。
 
 ## 运行示例
 
@@ -164,9 +167,9 @@ Done.
 |------|------|--------|--------|
 | 🎯 准备 0 | 下载项目 + 装 Python 依赖 | 必做 | 首次 |
 | 🎯 声学路径测量 1 | 编译校准程序 + 测次级路径/主路径/环路延迟/反馈路径 | 必做 | 首次 / 换硬件 / 换摆放 |
-| 🎯 训练数据 2 | 子滤波器 → 打标签 → 训练 CNN → 导出 `data/*.bin` | 必做（本文档面向从头训练） | 首次 / 换模型 |
+| 🎯 训练 2 | 子滤波器 → 打标签 → 训练 CNN → 导出 `data/*.bin` | 必做（本文档面向从头训练） | 首次 / 换模型 |
 | 🎯 编译 3 | 编译实时版/离线版 | 必做 | 首次 |
-| 🎯 系统运行 4 | 实时运行 + 纯音验证 | 必做 | 每次 |
+| 🎯 部署运行 4 | SFANC 硬选库部署（无误差麦开环） | 必做 | 每次 |
 
 ### 🎯 准备（阶段 0 — 必做，只做一次）
 
@@ -182,8 +185,12 @@ pip install numpy scipy pandas torch torchaudio
 > ⚠️ **四种声学路径一次测完**。其中**次级路径 Ŝ 和主路径 Pri 是训练输入**（子滤波器生成 2-①、打标签 2-②、导出 2-⑦ 都用），**环路延迟、反馈路径是运行部署项**（与训练无关，但同属"测量"、共用同一套硬件布置，一起测完最顺）。前置条件：硬件接好、摆放就位（参考麦朝噪声源、误差麦+扬声器朝听音区）、增益旋钮 SIG 常亮 CLIP 不亮。
 
 ```bash
+# 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）—— 先编译，后面 1-④/1-⑤ 要调用
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
+gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
+
 # 1-② 测次级路径 Ŝ（扬声器→误差麦，Farina 指数扫频法，SNR 最高、免疫时钟滑移）
-#     训练 + 运行共用输入，必须先测、先于任何训练
+#     [从零必测] 训练 + 运行共用输入，必须先测、先于任何训练（2-①/2-②/2-⑦/2-⑧ 全都要它）
 #     脚本用相对路径找 Primary and Secondary Path/，需从 SceneZone_Scene 目录运行
 cd SceneZone_Scene
 python ../export/measure_secondary.py --interactive   # 首次：配置声卡设备
@@ -191,18 +198,13 @@ python ../export/measure_secondary.py                 # 日常测量（--duratio
 cd ..
 #    → 覆盖 SceneZone_Scene/Primary and Secondary Path/secondary_path.npy
 
-# 1-③ 测主路径 Pri（参考麦→误差麦）— 仅重训/离线评估需要
-#     [重要] 把扬声器从窗框拆下、搬到室外噪声源位置再接 (source-channel 对应其声卡输出通道)
-#     训练打标签/子滤波器用它; 运行时不用; 跳过训练可省 (离线评估 NR_true 也要它)
+# 1-③ 测主路径 Pri（参考麦→误差麦）— 训练打标签/离线评估 NR_true 用
+#     [从零建议测] 把扬声器从窗框拆下、搬到室外噪声源位置再接 (source-channel 对应其声卡输出通道)
+#     实时运行不用它; 只想跑通现成模型可省
 cd SceneZone_Scene
 python ../export/measure_primary.py --source-channel 0 --duration 8 --repetitions 4
 cd ..
 #    → 覆盖 SceneZone_Scene/Primary and Secondary Path/primary_path.npy
-
-# 1-① 编译两个校准程序（测环路延迟/反馈路径用，只需一次）
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
-gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
-
 
 # 1-④ 测环路延迟（首次 / 换声卡或 GFANC_BUFFER 后必测）
 ./calibrate_secondary.exe
@@ -214,69 +216,38 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 #    → data/feedback_path_0.bin / data/feedback_path_1.bin
 ```
 
-### 🎯 训练数据（阶段 2 — 必做，面向从头训练）
+### 🎯 训练（阶段 2 — 必做，从零全量重训）
 
-> 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（子滤波器、合成数据生成/打标签、导出全都要）。只跑现成模型（跳过本阶段）时用仓库自带的那两份 .npy，但那是别人环境的测量值——**从头训练务必在阶段 1 实测**。
->
-> **当前部署模型 = 纯合成训练**（2-② 生成合成数据 → 2-③ `Train_validate.py` 纯合成训练，**没有真实数据微调**）。真实微调（2-④/2-⑤）是**可选**路径，当前流程没用。
->
-> ⚠️ **判别力未达标（2026-08-14 实测）**：纯合成 valid cos=0.9754，但真实判别力 **35.1%**（排 mixed 55.4%），未到 ≥70%、与基线 35.8% 持平。根因：合成 4 族谱形在**倍频程位置**上变化，真实噪声全低频主导、差别在**低频内部滚降/峰位/谐波**，两条判别轴正交、映射不迁移。**下一步 = 低频写实化重造合成数据（能量集中 50-400Hz）**，待验证。
+> 输入依赖：阶段 1 测好的 `secondary_path.npy` + `primary_path.npy`（2-①/2-②/2-⑦/2-⑧ 全都要）。**按顺序一条路走到底**：
+> - **回归 CNN 线（2-⓪ → 2-③）**：30 维子带增益，服务标定 warm-start / 离线评估 / 兜底。部署硬选不用它，但部署运行时硬加载它的产物（`sub_filters.bin`/`bandpass_fir.bin`）且导出也依赖它的 `.pth`——**全从零必须重训**。
+> - **部署核心（2-⑧）**：离线生成硬选库 + 分类 CNN（K=N argmax 选槽），部署必做。
 
 ```bash
-# 2-⓪ 生成 CNN 输入带通 bandpass_fir.mat —— 固定部署常量，仓库已自带（50-1500Hz），从零训练无需重跑
-#     仅当降噪范围变更时重新生成（改 f_low/f_high 只重跑本步；脚本路径已用频率无关名，不用再改）：
+# 2-⓪ 生成带通 bandpass_fir.mat（CNN 输入 + 导出 bandpass_fir.bin 同源，50-1500Hz）
+#     改降噪范围时改 --f-low/--f-high 重跑本步即可
 python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
-#    → models/bandpass_fir.mat（训练 CNN 输入 + 导出 bandpass_fir.bin 共用同一份系数）
+#    → SceneZone_Scene/models/bandpass_fir.mat
 
-# 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带）
-#    输入: Primary and Secondary Path/{primary,secondary}_path.npy（Pri 扰动 + Ŝ 滤波参考, MIMO FxNLMS 训练必需）
+# 2-① 生成子滤波器基（宽带 FxNLMS 主滤波器 → sqrt-Hann DFT 拆 15 子带，输入 = 阶段1 实测 Pri/Sec）
 cd SceneZone_Scene
 python training/control_filters/Pre_training_broadband_and_decompose.py
-#    → models/MIMO_Pretrained_Control_filters_broadband.mat
-#      仅子滤波器基变更时重跑（声学路径/分解参数更换后）
+#    → SceneZone_Scene/models/MIMO_Pretrained_Control_filters_broadband.mat
 
-# 2-② 生成合成训练数据 + LMS 打标签 —— 当前训练数据**全部来自这里**（从零生成，独立数据集）
-#    ① 生成 4 类谱形 1s WAV：窄带 / 宽带 / 1-f^α 谱倾斜 / 谐波，覆盖 50-1500Hz 全子带空间
-#       → D:\Dataset\Synthetic_Dataset\{Training,Validate,Testing}_data\synth_*.wav（60000/7500/7500）
+# 2-② 生成合成训练数据 + LMS 打标签（最重的一步，约 5.5h）
+#    ① 生成 4 类谱形 1s WAV（窄带/宽带/1-f^α 谱倾斜/谐波）→ D:\Dataset\Synthetic_Dataset\...
 python training/labeling/generate_synthetic.py
-#       --n-train/--n-val/--n-test 自定义规模；--probe-only --n-probe 300 只跑谱形覆盖检查
-#    ② LMS 打标签 = 合成 WAV 过实测声学路径（Pri/Sec）→ FxNLMS 拟合最优子带增益 gain_0..29
-#       → Index_synth_{Training,Validate,Testing}_data.csv + Gains_synth_*.npy
-#         （LMS_MU=0.001, LMS_REPET=3，打标签 ~5.5h）
+#    ② 过实测声学路径 FxLMS 拟合最优子带增益 gain_0..29 → 标签 CSV
 python training/labeling/label_wavs.py --wav-dir D:\Dataset\Synthetic_Dataset --tag synth
-#    为什么要生成：真实 4 类噪声全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方
-#      （判别力 35.8% vs 输入谱 75%）；合成多样谱形逼 CNN 学"输入谱→增益"映射（治输入失聪）
+#    → Index_synth_{Training,Validate,Testing}_data.csv + Gains_synth_*.npy
+#    为什么要合成：真实噪声全低频主导、谱形太接近，CNN 从零训练会坍缩到同一低频处方；
+#    合成多样谱形逼它学"输入谱→增益"映射
 
-# 2-③ 纯合成训练直接权重 CNN —— 当前部署模型走的就这条路
+# 2-③ 训练回归 CNN（30 维子带增益）
+#    部署硬选不用它（部署加载 cnn_bank）；但它服务标定 warm-start / 离线评估 / 兜底，
+#    且导出基础产物（sub_filters/bandpass/路径）需要它的 .pth —— 全从零必须训
 python training/network/Train_validate.py
-#    读 D:\Dataset\Synthetic_Dataset\Index_synth_{Training,Validate}_data.csv（脚本默认即此路径）
-#    → models/MIMO_M5_DirectWeight_Real.pth（export 自动加载；名字带 Real，但就是纯合成训练的产物）
+#    → SceneZone_Scene/models/MIMO_M5_DirectWeight_Real.pth（export 自动加载）
 
-# ────────────────────────────────────────────────────────────────────
-# 可选：真实数据微调（当前部署模型没用，纯合成已够好；要走才需要 2-④/2-⑤）
-
-# 2-④ 真实噪声切割 + LMS 打标签（可选，仅走 2-⑤ 真实微调时需要；与 2-② **并用**，不是替代）
-#    ① 切割 + 首建分层拆分：cut_config.json 状态机（把待切文件名从 cut 移到 uncut 后重跑；
-#       首建自动按 0.8/0.1/0.1 拆 Train/Val/Test，连续块防同录音相邻片段泄漏）
-#       --max-per-category N：每类最多保留 N 段（类别平衡，默认不限）
-python training/labeling/cut_real_noise.py
-#    ② 真实噪声过同一 LMS 管线标 gain_0..29
-#       → 覆盖 Index_real_{Training,Validate,Testing}_data.csv + Gains_real_*.npy
-#         （增益用与部署一致的 broadband 子滤波器基拟合）
-python training/labeling/label_wavs.py --wav-dir D:\Dataset\Real_world_Dataset --tag real
-
-# 2-⑤ 真实数据微调（可选，跟在 2-③ 之后）：加载 2-③ 纯合成产物 → 真实数据低 LR 微调
-#     （LR_FT=0.003，防把合成学到的多样光谱映射又坍缩回真实低频处方）
-python training/network/finetune_real.py
-#    → models/MIMO_M5_DirectWeight_Real.pth（就地覆盖；export 自动加载）
-#      默认加载同路径的 2-③ 纯合成产物作起点 — 保留原产物需先备份，或：
-#      --pretrain-pth <path> 换起始检查点；--out <path> 输出到别处再手动改名
-
-# 2-⑥ 评估（可选）
-python training/network/evaluate.py
-python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
-#      基线对照：--model models/MIMO_M5_DirectWeight_Real_baseline_35pct.pth（应复现 ≈35.8%）
-# ──────────────────────────────────────────────────────────────────── 
 
 # 2-⑦ 导出 C 二进制（CNN 权重 + 子滤波器 + 声学路径 + 带通 + 批次指纹）
 #     阶段 1 新测的 secondary_path.npy 在此写入 data/secondary_path.bin
@@ -286,63 +257,100 @@ python export/export_bin.py
 #    默认自动查找同级目录的 SceneZone_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\SceneZone_Scene
 ```
 
+**2-⑧ 离线生成硬选库 + 分类 CNN（走部署硬选库必做；只跑固定单滤波器时可跳过）**
+部署态按噪声类型硬选库槽，需要 N 条全频段成品滤波器 + 一个 N 类分类器。滤波器**离线生成**（SFANC-Window / MIMO-SFANC 同款，无逐场景实机标定、无语义场景名）：**N 段代表噪声 → 逐段离线 FxLMS（经实测 Pri/Sec 路径）收敛 → 一条成品 = 库槽 k**；标签 = 每段噪声对 N 条候选滤波器算残差功率取 argmin（MIMO-SFANC 法）。若只需单一静态滤波器（N=1 库），跳过本节，部署自动回退静态槽。
+
+> 📌 **`--filters` 的文件是你自己准备的噪声录音——脚本不生成、仓库不附带**（`f_road.wav` 只是占位名）。这条命令是"**吃噪声、吐滤波器**"：喂一段你部署时想消掉的噪声 → 收敛出专门消它的那条成品滤波器 → 写一个库槽。**想消什么噪声就喂什么**——正式用前拿目标窗户/房间录的真实噪声喂，比示例样本更贴合部署环境。
+> 📌 **与 SFANC-Window 官方做法一致**（README 原话："7 broadband noises with different frequency ranges are used as primary noises to obtain the corresponding pre-trained control filters"；换环境时"obtain the corresponding pre-trained control filters in the new acoustic paths, the trained CNN can remain unchanged"）。**滤波器只需要 N 段代表噪声，不要上万条**——每条滤波器的未知数只有 S×L=2048 个系数，60s×16k≈96 万样本足以解出最优解（这是优化拟合，不是监督学习）；大语料（SFANC-Window 用 8 万条合成噪声）给的是**分类 CNN 判别器**学"谱形→槽号"，对应下边 ③。
+
+```bash
+# ⓪ 准备输入音频（脚本不生成任何音频——全是你自己的）:
+#     --filters  每段 = 一类你要在部署时消掉的噪声录音（手机/录音笔录目标窗户的真实噪声; 可先用 Noise Examples/ 现成样本试跑）
+#     --wav-dir  任意噪声语料目录（打分打标签用, 分类 CNN 的训练输入; 可用 Noise Examples/ 或 D:\Dataset 下现成噪声）
+# ① 离线生成库（N 段代表噪声 → data/wc_bank.bin, N 槽）—— f_*.wav = 你自己的噪声录音路径
+#    N 段建议覆盖你要对抗的噪声形态（马路/风扇/人声/…），一段 = 一条成品滤波器
+python export/generate_bank.py --filters f_road.wav f_fan.wav f_voice.wav -o data/wc_bank.bin
+#    马上能试: 用仓库自带的真实噪声样本（Noise Examples/ 里就是各形态噪声录音, 文件带空格要加引号）
+python export/generate_bank.py --filters "Noise Examples/road_noise_0-34.wav" "Noise Examples/Helicopter.wav" "Noise Examples/Handheld drill.wav" -o data/wc_bank.bin
+# ② 打分打标签（对任意噪声语料目录逐段 1s 算残差 argmin → 分类 CNN 训练标签；需先有库）
+python export/generate_bank.py --labels --wav-dir D:\你的噪声语料目录 -o data/wc_bank.bin
+#    （同一命令 A+B 一起跑: --filters ... --labels --wav-dir ...，先生成再打分，见 generate_bank.py 用法）
+# ③ 训练 N 类分类器（CrossEntropy + 硬标签 + WeightedRandomSampler + early-stop）
+#    大语料在这里——判别器要多而杂的噪声样本学会"这段谱形该选第 k 条滤波器"
+#    ⚠️ 必须显式传 --train/--valid 指向仓库根 data/（脚本默认找 SceneZone_Scene/data/，会找不到 ② 的 CSV）
+python SceneZone_Scene/training/network/train_real_bank_cnn.py \
+  --train data/bank_labels_train.csv --valid data/bank_labels_valid.csv
+#    → SceneZone_Scene/models/MIMO_M5_Scene_Bank.pth (K=N 从标签推导, 无语义类名)
+# ④ 导出分类权重集（只写 cnn_bank_*.bin，回归集 cnn_*.bin 不动；K 从 ckpt 推导）
+python export/export_bin.py --bank                       # → data/cnn_bank_*.bin + cnn_bank_info.json (mode=classification)
+```
+> ⚠️ 重计算（离线 FxLMS 收敛 + 打分）较耗时，脚本打印进度；60s 收敛 ≈ 15s/滤波器。**绝对增益已烘焙进库槽**（非归一化）——部署前用 `main.exe GFANC_OPEN_LOOP` 验证 NR_true，若整库幅度整体偏差用 `--gain-scale` 缩放重生成。
+
 ### 🎯 编译（阶段 3 — 必做）
 
 ```bash
-# 3-① 编译实时版
-gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o scenezone_realtime.exe
+# 3-① 编译实时版（含 scene_bank.c SFANC 库 I/O；也可直接用 make realtime）
+gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c src/sec_online.c src/pa_loader.c -lm -lole32 -o scenezone_realtime.exe
 
-# 3-② 编译离线评估版（可选 — 处理 WAV 算 NR_true，见"离线验证"）
-gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
+# 3-② 编译离线评估版（可选 — 处理 WAV 算 NR_true / GFANC_OPEN_LOOP 硬选验证，见"离线验证"）
+gcc -O2 -Iinclude main.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o main.exe
 ```
 
-### 🎯 系统运行（阶段 4 — 必做，每次）
+### 🎯 部署运行（阶段 4 — 必做，每次）
 
-```bash
-# 4-① 运行实时版 + 纯音验证
-#   ↓ 下面是【备忘】：按需复制单行，不是一次性脚本 ↓
+> 库已在 2-⑧ ① 生成好（`data/wc_bank.bin`）。日常运行就一条命令——**部署态 = 无误差麦纯开环**（µ=0、无梯度链；1Hz 分类 CNN argmax → 防抖 → crossfade 选库槽）。
 
-# 最简：默认直接跑（step 自动缩放 ~2.1e-7，cos 闸门切场景）
-.\scenezone_realtime.exe
-#    设备号如 23；放 250Hz 纯音，NR 应 ≥10dB
-
-# 双模式（方案C, 2026-08-21; 详细见下方「双模式」）：
-#   fixed = 开环 µ=0 无误差麦。首次用 fixed 前先标定一次（全自动，零环境变量）：
-Remove-Item Env:GFANC_ANC_MODE, Env:GFANC_WC_TARGET -ErrorAction SilentlyContinue
-.\scenezone_realtime.exe      # ① 标定（需误差麦）: 放稳态宽带噪声 → 什么都不用管
-#                               日志自动出现 "[SAVE] 标定完成! ... wc_fixed.bin 已自动保存" 即存好，Ctrl+C 退出
-$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe   # ② 部署: 开环, 自动加载标定, 误差麦拔不拔都行
-Remove-Item Env:GFANC_ANC_MODE -ErrorAction SilentlyContinue   # 回默认闭环(adapt)
-
-# 常用参数（每行独立，按需设；撤销 = Remove-Item Env:XXX）
-$env:GFANC_SEC_FILE="data/secondary_path.bin"   # 次级路径（默认已是它）
-$env:GFANC_SEC_MU='0'                            # 关在线 Ŝ（推荐）
-$env:GFANC_STEP='1e-6'                            # 步长：1e-6 降噪更深（日常推荐）；不设=自动缩放
-# 场景切换二选一（别同时设）：
-$env:GFANC_MODE='continuous'   # A. 关 RESET，FxLMS 自己爬（~1s 收敛，待验证）
-$env:GFANC_OCG='1'              # B. OCG 簇闸门（仅 reset 模式生效）
-$env:GFANC_OCG_HOLD='1'         #    HOLD：1=立即切 / 3=防抖（默认 3）
-$env:GFANC_WC_COLD='0.3'        # 交接衰减 30% 起步（=1 回满幅）
-Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction SilentlyContinue   # 一键回默认
-
-# 4-② 运行离线评估版（可选 — 处理一段噪声录音，见"运行示例"）
-./main.exe "Noise Examples/road_noise_0-34.wav"
-
-./main.exe "Noise Examples/road_noise-15.wav"
+```powershell
+$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe
+#   启动日志应显示 "MODE = DEPLOY + 库 data/wc_bank.bin (N 槽)"（缺库自动回退 wc_fixed.bin / CNN 生成式）
+#   每秒打 [BANK] 类日志, 如 "分类 0→1 (filter 1, slot 1, fade 1600)"
+#   验证: 放某类噪声 → [BANK] 类日志选的类对 + 人耳听降噪（部署态无 NR 指标, 见下注）
+Remove-Item Env:GFANC_ANC_MODE -ErrorAction SilentlyContinue   # 跑完回默认（标定态）
 ```
 
-> ⚠️ **换摆放后**：重做阶段 1-②（次级路径）+ 1-⑤（反馈路径）+ 阶段 4（运行验证）；1-④（环路延迟）仅换声卡或 `GFANC_BUFFER` 时重做；1-③（主路径）和训练（阶段 2）不随摆放变化——不重训时 CNN 预设 Wc 与现场 Ŝ 的偏差靠 FxLMS 自适应纠正；换了摆放后效果明显变差，可重走 阶段 1 → 2 → 3 → 4 重训（含重测主路径）。
+> ⚠️ **部署态没有 NR 指标**（无误差麦，NR 显示 n/a）——验证靠两点：①`[BANK]` 类日志选的类对不对；②人耳听降噪有没有变安静。NR/纯音验证（250Hz 纯音 NR ≥ 10dB）只适用于**标定态**（adapt，有误差麦）——它是"标定/自适应链路健康"的验证，不是部署态验收。
+
+> ⚠️ **换摆放后**：重做阶段 1-②（次级路径）+ 1-⑤（反馈路径）+ **重新填库**（2-⑧ ① 重跑 `generate_bank.py`）；1-④（环路延迟）仅换声卡或 `GFANC_BUFFER` 时重做；1-③（主路径）和训练（阶段 2）不随摆放变化——分类 CNN（`cnn_bank`）不用重训（"谱形→类别"映射跨环境复用）。
+
+### 可选步骤（部署不需要，按需再看）
+
+> 走完上面 **阶段 0 → 4 就部署完成**。下面三项只在特定场景需要，用不上就不用看。
+
+- **实机标定填库（备选填库方式，需误差麦）**：2-⑧ ① 离线生成在实机效果不理想 / 换摆放后想就地精修某槽时用。放某噪声 → 闭环收敛自动 `[SAVE]` 存槽 k（槽序 == 分类 CNN 标签 filter_idx）：
+  ```powershell
+  Remove-Item Env:GFANC_ANC_MODE, Env:GFANC_CAL_INDEX, Env:GFANC_WC_TARGET -ErrorAction SilentlyContinue
+  $env:GFANC_CAL_INDEX='0'; .\scenezone_realtime.exe   # 放噪声形态 0, 收敛后 Ctrl+C
+  $env:GFANC_CAL_INDEX='1'; .\scenezone_realtime.exe   # 换噪声形态 1, 收敛后 Ctrl+C（库自动扩到 2 槽）
+  Remove-Item Env:GFANC_CAL_INDEX -ErrorAction SilentlyContinue
+  ```
+  前置：阶段 1 声学路径已测（尤其 1-② 次级路径 + 1-⑤ 反馈路径）；增益旋钮 SIG 常亮 CLIP 不亮，且标定与部署用同一旋钮位置；标定信号用稳态宽带噪声（白噪/粉噪/风扇/马路真实噪声）——**不要扫频、不要单音**。
+
+- **离线评估**（处理一段噪声录音算 NR_true / `GFANC_OPEN_LOOP` 硬选验证，见"离线验证"）：
+  ```bash
+  ./main.exe "Noise Examples/road_noise_0-34.wav"
+  ./main.exe "Noise Examples/road_noise-15.wav"
+  ```
+
+- **回归 CNN 评估（2-⑥）**：
+  ```bash
+  cd SceneZone_Scene
+  python training/network/evaluate.py
+  python training/network/verify_discrimination.py --model models/MIMO_M5_DirectWeight_Real.pth
+  cd ..
+  ```
 
 ## 训练管线（直接权重 CNN）
 
-> 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 2（训练数据）** 的 2-⑦ 步，导出为 C 二进制。
+> 💡 本节是**训练/更换自己的模型**。训练完成后回到上文 **完整命令流 · 阶段 2（训练）** 的 2-⑦ 步，导出为 C 二进制。
 
 直接权重架构：CNN 对 1 秒带通噪声回归 **30 维子带增益**（2 扬声器 × 15 子带），`Wc = Σ 增益 × 子滤波器` 构造启动滤波器，交给 FxNLMS 自适应。训练全在 Python 项目 [SceneZone_Scene](../SceneZone_Scene) 内完成，产物经 `export/export_bin.py` 导出为 C 可用的 `.bin`。
+
+> 💡 **v2.0 有两套 CNN，独立训练/导出**：本节的**回归 CNN**（30 维子带增益，标定 warm-start + 离线评估用）；另有 **SFANC 分类 CNN**（`cnn_bank`，K=N 类 argmax 硬选库槽，部署态决策层用，训练见上文 **2-⑧**）。两者权重前缀不同（`cnn_` vs `cnn_bank_`），C 端按前缀加载，互不影响。
 
 ### 数据与标签
 
 - 数据源（主）：`D:\Dataset\Synthetic_Dataset` —— 阶段 2-② `generate_synthetic.py` **从零生成** + `label_wavs.py --tag synth` 打标签的合成噪声（60000/7500/7500），**当前部署模型只用它训练**（commit：合成全量重训 cos=0.9706）
-- 数据源（可选）：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）—— 仅走 2-④/2-⑤ 真实微调时用
+- 数据源（可选）：`D:\Dataset\Real_world_Dataset`（真实居民区室外噪声，road / children / construction / railway 各 ~25%）—— 仅走可选真实微调（下方 `finetune_real.py`）时用
 - 子滤波器基：`models/MIMO_Pretrained_Control_filters_broadband.mat` —— 宽带 FxNLMS 主滤波器 + sqrt-Hann DFT 分解为 15 个功率互补子带；**标注、导出、C 运行时共用同一基**
 - 标签：`gain_0..gain_29`（LMS 最优化子带增益，带符号 [-7, +7.3]）—— 合成/真实走**同一套 LMS 管线**（`label_wavs.py --tag {synth,real}`，唯一实现），用**实测声学路径 + 子滤波器基**拟合，正是直接权重 CNN 的回归目标
 - **为什么必须生成合成数据**：真实 4 类全低频主导、谱形接近，CNN 从零训练坍缩到同一低频处方（判别力 35.8% vs 输入谱可分 75%）。合成 4 族多样谱形（窄带/宽带/1-f^α/谐波，50-1500Hz 全子带覆盖）逼 CNN 必须用输入学「谱形→增益」映射（治输入失聪）——**不是"增强真实数据"，是从零生成的独立数据集**。⚠️ 但这版 4 族谱形在**倍频程位置**上变化，与真实噪声「低频内部结构」的判别轴正交，实测判别力仍 35.1% 未达标——需改「低频写实化」谱形（能量集中 50-400Hz、变滚降/峰位/谐波），见上方阶段 2 ⚠️ 注
@@ -350,16 +358,16 @@ Remove-Item Env:GFANC_STEP, Env:GFANC_LEAK, Env:GFANC_SEC_MU -ErrorAction Silent
 
 ### 命令顺序
 
-训练/更换模型的完整命令见上文 **完整命令流 · 阶段 2（训练数据）**。本节补充训练特有的细节：
+训练/更换模型的完整命令见上文 **完整命令流 · 阶段 2（训练）**。本节补充训练特有的细节：
 
 ### 说明
 
 - **何时重跑 CNN 输入带通（2-⓪）**：降噪范围变更时。`python export/gen_bandpass_fir.py --f-low 50 --f-high 1500` 重生成 `models/bandpass_fir.mat`（文件名与频率无关，改范围不连带改脚本路径）。**降噪范围四处必须一致**：`bandpass_fir.mat`（CNN 输入）＝ `Pre_training` 的 `f_low` ＝ `export_bin.py` 的 `bandpass_anc` ＝ `generate_synthetic.py` 的 `BAND_LO`。
 - **何时重跑子滤波器（第 1 步）**：声学路径、分解参数或部署基变更时。`Pre_training_broadband_and_decompose.py` 的 `USE_LOG_SPACING` 须保持 `False`（均匀间距，与部署/导出一致）。
-- **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-④ 打标签自动加载 broadband.mat，无需另改）。
+- **何时重跑合成数据（第 2 步）**：子滤波器更换后，或标注基与部署不一致时。标注必须用与部署（`export/export_bin.py`）**相同的子滤波器基**（broadband）——2-① 生成基时 `USE_LOG_SPACING` 须为 `False`（2-②/2-⑤ 打标签自动加载 broadband.mat，无需另改）。
 - **导出模式切换**：`export_bin.py` 检测到 `MIMO_M5_DirectWeight_Real.pth` 存在 → 直接权重模式（`cnn_info.json`/`scenezone_config.json` 标 `mode=direct_weight`、`activation=tanh`）；不存在则回退旧场景分类器（K 维 softmax，向后兼容）。
 - **超参**：`Train_validate.py` 顶部 `LR`（默认 0.01，MIMO 原配置），loss 发散可降到 0.001。
-- **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线 = 2-⑤ `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入；实测 **35.1% 未达标 ≥70%**（根因/下一步见上方阶段 2 ⚠️ 注）
+- **数据管线（主流程，一功能一文件）**：`generate_synthetic.py` 生成 → `label_wavs.py --tag synth` 打标签 → `Train_validate.py` 训练（MIMO 旧 `band_*` 场景标签语义与直接权重不同，**不能直接混用**——合成/真实样本全走 `label_wavs.py` 标成 `gain_*`）。**当前部署 = 2-② 合成 → 2-③ `Train_validate.py` 纯合成训练**，没有真实微调。可选路线（不在上方阶段 2 主线，属本节可选）= `finetune_real.py` 真实数据微调：加载 2-③ 纯合成产物，低 LR 微调适配真实统计量、防坍缩回低频处方（纯合成训练本身已用多样谱形逼 CNN 学「输入谱→增益」映射）。判别力 `verify_discrimination.py` 按原始最近均值协议(148 逐秒窗口/6 类)量 CNN 是否真的用输入；实测 **35.1% 未达标 ≥70%**（根因/下一步见上方阶段 2 ⚠️ 注）
 
 ## 项目结构
 
@@ -375,17 +383,19 @@ SceneZone-ANC/
 ├── include/               头文件（API 定义）
 │   ├── scenezone_types.h      基础类型（FIR 滤波器）
 │   ├── fir_filter.h       FIR 滤波器
-│   ├── scene_controller.h CNN 直接权重 Wc 生产者
-│   ├── fxnlms_mimo.h      自适应降噪算法（离线+实时双路径）
+│   ├── scene_controller.h CNN Wc 生产者 (回归 30 维 / 分类 argmax 选库)
+│   ├── scene_bank.h       SFANC 硬选库 I/O（wc_bank.bin 读写）
+│   ├── fxnlms_mimo.h      自适应降噪算法（离线+实时双路径 + 开环纯前向）
 │   ├── howling_detect.h   啸叫检测 + IIR 陷波
 │   ├── binary_loader.h    模型加载器
 │   └── pa_loader.h        PortAudio DLL 共享加载层
 │
 ├── src/                   源代码（实现）
 │   ├── fir_filter.c       FIR 滤波器（双段循环, 零取模）
-│   ├── scene_controller.c CNN 直接权重 Wc 构造 (tanh 增益)
-│   ├── fxnlms_mimo.c      自适应降噪核心（离线仿真+实时双路径）
-│   ├── cnn_m5_forward.c   神经网络推理（静态缓冲）
+│   ├── scene_controller.c CNN Wc 构造 (回归 tanh 增益) + 分类防抖选类
+│   ├── scene_bank.c       SFANC 硬选库 I/O（库头校验 / 存槽 / 整库写）
+│   ├── fxnlms_mimo.c      自适应降噪核心（离线仿真+实时双路径 + 开环前向 fxnlms_forward_rt_open）
+│   ├── cnn_m5_forward.c   神经网络推理（静态缓冲; cnn_init_base 按前缀加载回归/分类集）
 │   ├── howling_detect.c   啸叫 DFT 检测 + IIR 陷波（逐扬声器独立状态）
 │   ├── binary_loader.c    从文件加载模型参数
 │   ├── pa_loader.c        PortAudio 运行时 DLL 加载
@@ -393,6 +403,9 @@ SceneZone-ANC/
 │
 ├── data/                  模型参数文件（运行时加载）
 │   ├── *.bin              二进制权重（滤波器系数、神经网络权重）
+│   ├── cnn_*.bin          回归 CNN 权重集（标定 warm-start, K=30）
+│   ├── cnn_bank_*.bin     分类 CNN 权重集（部署 argmax 硬选, K=N）
+│   ├── wc_bank.bin        SFANC 硬选库（N 条全频段成品滤波器, 16B GFNC 头 + N×(S×L) float32）
 │   └── ...
 │
 ├── docs/                  文档
@@ -400,13 +413,18 @@ SceneZone-ANC/
 │   ├── micphone.md        麦克风数据手册
 │   └── 2026-07-28_硬件调试记录.md  UMC404HD 面板操作指引 + 调试记录
 │
+├── tools/                 运维/调试工具
+│   └── mkbank.c           建库工具（from-sub N: 从子滤波器段合成 N 槽测试库）
+│
 └── export/                工具脚本（Python → C 格式转换）
-    └── export_bin.py      导出为 .bin 文件
+    └── export_bin.py      导出为 .bin 文件（--bank 只导分类集 cnn_bank_*.bin）
 ```
 
 ## 系统架构
 
 系统由两个"环路"组成，协同工作：
+
+> 🧭 **本节描述的是标定/自适应路径**（adapt 模式，误差麦在场）。**部署态（fixed）走 SFANC 硬选库**：慢速环路由「分类 CNN argmax → 防抖 → 选库槽」替代回归，前馈环路 = 库槽成品 Wc 纯前向（无梯度链），详见上方「双模式」。
 
 ### 慢速环路（每秒执行一次）— "大脑"
 
@@ -591,7 +609,7 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 误差麦克风 (E) | 3 | 放在降噪目标位置 |
 | 扬声器 (S) | 2 | 播放反噪声 |
 | 子滤波器 (C) | 15 | 预训练滤波器, 直接权重混合 (Wc 基) |
-| CNN 输出维 (K) | 30 (=S×C, 运行时从 linear_weight 推导) | 直接权重回归: 2 扬声器 × 15 子带增益 (v1.6; 旧场景分类 K=3 已移除) |
+| CNN 输出维 (K) | 回归 CNN: 30 (=S×C, 从 linear_weight 推导) / 分类 CNN: N (=库槽数, 从 ckpt 推导) | v2.0 两套 CNN 并存: 回归集 `cnn_*.bin`(标定 warm-start, tanh) + 分类集 `cnn_bank_*.bin`(部署 argmax 硬选, 无激活), 按权重前缀 `cnn_`/`cnn_bank_` 区分, 导出/加载互不影响 |
 | 滤波器长度 (L) | 1024 tap | 控制滤波器 Wc, 频域分辨率 ~15.6Hz |
 | CNN 带通 / ANC 带通 | 1024 / 64 tap | 直接权重用 1024(分辨率), FxLMS 用 64(群延迟 2ms) |
 | 带通频率 | 50-1500 Hz | ANC 有效频率范围 |
@@ -601,7 +619,12 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | 泄漏因子 | 5e-7 (基准, 自适应; env: GFANC_LEAK) | Wc 正则化 (2026-08-05 降档 5e-6→5e-7: 弱信号下 Wc 能长起来) |
 | 输出限幅 | ±1.0 | DAC 满幅保护 + NaN/Inf 防护 |
 | 模式 | reset=默认 / continuous (env: GFANC_MODE=reset\|continuous) | reset: cos(anchor,cur)<0.6 → 重置 Wc; continuous: 仅首秒 INIT, 永不重置 (v1.5 去场景层) |
-| ANC 运行模式 | adapt=默认闭环 / fixed=开环µ=0 (env: GFANC_ANC_MODE=adapt\|fixed) | 方案C 双模式 (2026-08-21): fixed=无误差麦, 自动加载 data/wc_fixed.bin (闭环 Ctrl+C 自动保存的标定滤波器), 无文件则退回 CNN 生成式; 详见下节「双模式」 |
+| ANC 运行模式 | adapt=标定闭环 / fixed=部署开环 (env: GFANC_ANC_MODE=adapt\|fixed) | 方案C 双模式 (2026-08-22): fixed=无误差麦 SFANC 硬选, 优先加载 data/wc_bank.bin 整库 + CNN 分类 argmax 选槽, 无库回退 data/wc_fixed.bin, 再无则 CNN 生成式; 详见下节「双模式」 |
+| SFANC 库文件 | `data/wc_bank.bin` (env: GFANC_BANK_FILE) | 16B 头 {magic "GFNC", version, n_slots, slot_len=S×L} + N×(S×L) float32 成品滤波器; 槽序 == 分类 CNN 标签 filter_idx |
+| 库槽数 N | 由文件推导 (n_floats/S×L) | 加载期校验 N == 分类 CNN K; 库槽 = 离线/实机 FxLMS 收敛成品 (绝对增益烘焙, 非归一化) |
+| 分类防抖 | 2 帧 (env: GFANC_BANK_HOLD) | 候选类连续命中 N 帧才切换, 防噪声抖动误切 (Phase 2) |
+| 标定写槽 | 0 (env: GFANC_CAL_INDEX) | 闭环收敛自动保存写到库槽 k; 每槽标定一次填一槽, 或离线生成 (generate_bank.py) |
+| 库轮换模拟 | 关 (env: GFANC_BANK_SIM=1 开, GFANC_BANK_SIM_SEC=3) | 部署态定时轮换库槽 (绕过 CNN), 验证切换无爆音 (实机/离线调试用) |
 | Reset 触发 | 默认 cos(anchor,cur)<0.6 (env: GFANC_RESET_THRESH) | 场景真正切换才重置; 0.6 是实机纯音深对消验证值 (0.8 在深对消时误杀健康 Wc, 见 CHANGELOG) |
 | OCG 聚类闸门 | 默认关 (env: GFANC_OCG=0) | v1.7 引入 (ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置; **2026-08-10 实机证伪后默认关** — 纯音深对消下增益双模震荡致簇 0↔1↔2 翻转, 每~1000cb RESET (开≈18dB vs 关 27.5dB); 代码保留, 待簇判据更鲁棒后评估; 开启命令见上文快速开始「想试场景切换」框 |
 | 聚类半径 τ | 0.8 (env: GFANC_OCG_TAU) | cos(g', centroid) < τ → 新建簇 (P0-1 解耦, 不再复用 GFANC_RESET_THRESH) |
@@ -627,27 +650,48 @@ HW:  f=850Hz peak=18.2dB notches=1 [NOTCH]   ← 检测到 850Hz 啸叫, 已陷�
 | CNN 推理 | ~8ms/次 @1Hz | 静态缓冲, 无动态分配 |
 | 回调预算 | ~30-45% (SIMD ~5-10%) | 已优化: 双段循环零取模, 含安全边际 |
 
-### 双模式（闭环 / 开环 µ=0）— 方案C, 2026-08-21
+### 双模式（标定 / 部署）— SFANC 硬选库, 2026-08-22
 
 设计文档: [docs/无误差麦方案_与SFANC对照_路线分析.md](docs/无误差麦方案_与SFANC对照_路线分析.md)
 
+**架构（v2.0, Phase 1-3）**：误差麦只在**标定**用。标定态 = 现有闭环 FxLMS + 误差麦；部署态 = **纯开环**（µ=0、无误差麦、无梯度链、不加载误差通道），靠「N 条全频段成品滤波器库 + CNN 分类 argmax 硬选」降噪——这是"窗户开口 ANC + 部署无误差麦"的 canonical 形态（与 SFANC-Window / MIMO-SFANC 同构；运行时 FxLMS 因硬依赖误差麦而出局）。
+
 | 模式 | 命令 | 行为 |
 |------|------|------|
-| adapt（默认） | `.\scenezone_realtime.exe` | 闭环 FxLMS + 误差麦 + 在线 Ŝ（现状行为）；**Wc 收敛稳定后自动保存标定滤波器**（运行中自动存 `data/wc_fixed.bin`，不用盯日志/掐 Ctrl+C） |
-| fixed（开环） | `$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe` | 开环 µ=0 无误差麦；**启动自动加载** `data/wc_fixed.bin`（CNN 不覆盖）；无文件则退回 CNN 生成式 |
+| **标定**（adapt，默认） | `.\scenezone_realtime.exe` | 闭环 FxLMS + 误差麦 + 在线 Ŝ；**Wc 收敛稳定后自动保存** `data/wc_fixed.bin` + 写库 `data/wc_bank.bin` 槽 `GFANC_CAL_INDEX`（不用盯日志/掐 Ctrl+C） |
+| **部署**（fixed） | `$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe` | 开环 µ=0 无误差麦。**优先加载 SFANC 库 `data/wc_bank.bin` 整库** → 1Hz CNN（`cnn_bank`，K=N 分类）argmax → 防抖 2 帧 → 类变则 crossfade（100ms）到库槽；无库回退 `data/wc_fixed.bin` 静态槽；再无 → CNN 生成式（弱降噪） |
 
-**标定流程（只需一次，全自动，零环境变量）**：
+**标定流程（单滤波器全自动，零环境变量）**：
 1. 插上误差麦，跑闭环：`.\scenezone_realtime.exe`（建议 `$env:GFANC_MODE='continuous'` 防 RESET 打断收敛，标完 `Remove-Item Env:GFANC_MODE`），放**稳态宽带噪声**（白噪/粉噪，或风扇·空调·马路等真实噪声都行）
-2. **什么都不用管** —— 滤波器收敛后日志自动出现 `[SAVE] 标定完成! ... data/wc_fixed.bin 已自动保存` 即存好，之后 `Ctrl+C` 退出
+2. **什么都不用管** —— 滤波器收敛后日志自动出现 `[SAVE] 标定完成! ... data/wc_fixed.bin 已自动保存 (bank 槽0 OK)` 即存好，之后 `Ctrl+C` 退出
 3. 之后随时切开环：`$env:GFANC_ANC_MODE='fixed'; .\scenezone_realtime.exe`（误差麦拔不拔都行）
+
+**多槽填库（SFANC 硬选库，Phase 3）**——给部署态分类选库填充 N 个槽（离线生成或逐槽实机标定，二选一；无语义场景名）：
+```powershell
+# A. 离线生成（推荐）— 阶段 2-⑧ ①: 每条代表噪声 → 一条成品 → 一个槽
+#    f_*.wav 是你自己录的噪声（想消什么就喂什么），脚本不生成这些文件
+python export/generate_bank.py --filters "你的噪声1.wav" "你的噪声2.wav" "你的噪声3.wav" -o data/wc_bank.bin
+
+# B. 逐槽实机标定（可选）: 放某噪声形态 k → 收敛自动存槽 k（槽名 = 你放的噪声形态）
+$env:GFANC_CAL_INDEX='0'; .\scenezone_realtime.exe    # 收敛后 [SAVE]，Ctrl+C
+$env:GFANC_CAL_INDEX='1'; .\scenezone_realtime.exe    # 换噪声形态, 存槽 1
+# ... 槽 k=0..N-1 逐个标定
+Remove-Item Env:GFANC_CAL_INDEX   # 清环境变量
+```
+> **槽序 == 分类 CNN 标签 filter_idx == `cnn_bank_info.json` classes**（`filter_0..filter_{N-1}`，无场景名）。槽 k 对应 = 生成它的那段噪声（`generate_bank.py` 的 `--filters` 顺序或实机标定时放的噪声形态）。部署加载期校验 `N(库) == K(CNN)`，不符告警并把 argmax 钳到 N-1。
+
+> 💡 **槽位 = 滤波器，无场景层**：槽 k 是一条全频段成品滤波器（`scene_bank_slot` 返回 `data + k×slot_len`，每条 = S×L 个 float）。SFANC-Window / MIMO-SFANC 的 "CNN 在 N 条固定滤波器里选" 与这里**完全同构**，区别只在条目来源：他们离线训练合成/实验室噪声得成品，你离线 FxLMS 收敛（或实机标定）得成品——**无语义场景，槽 k 就是"第 k 条滤波器"**。**N>1 才有"选"**：部署加载后只有 `bank_n_slots>1` 才走分类选槽（[main_realtime.c:1478](main_realtime.c#L1478)），N=1 时决策层被跳过、永远停在槽 0 = 静态单滤波器。所以**没填满库之前它只是个不挑的静态滤波器**——生成/标定填满 N 槽后，分类 CNN 才真正开始按噪声类型换滤波器。
+
+**分类选库决策层（部署态慢循环，1Hz）**：带通噪声 → `cnn_bank` 分类 CNN（K=N logits，无激活）→ argmax → 候选类需连续 `GFANC_BANK_HOLD`（默认 2）帧命中才切换（防噪声抖动误切）→ 类变则 `wc_old`=当前播放、`wc_cur`=库槽 c、启动 crossfade（delayless，防爆音）。弱信号/CNN 失败保持当前类不换槽。库槽 Wc 为**离线/实机收敛成品（绝对增益烘焙）**，开环有效降噪的命门。
 
 > **标定信号用稳态噪声，不要用扫频，也别用单音**：固定滤波器要的是覆盖全频段的 -P/S。扫频频率在动，最优滤波器跟着动，Wc 永远稳不下来——存出来的是"扫到那个频率时"的窄带滤波器，固定模式下只能消那一个频段，宽带降噪听不出来（这正是"怎么测都不行"的常见原因）。单音同理（只消单频）。稳态宽带噪声让 Wc 收敛到全频段固定滤波器，固定模式才能宽带降噪。音量适中防啸叫（反馈抵消需先跑 `calibrate_feedback.exe`）。
 
-> 为什么需要这一步：fixed 开环没有误差麦反馈，反噪声振幅只能由标定滤波器携带。闭环收敛的 Wc 带本设备绝对振幅+相位（SFANC 的滤波器就是就地 FxLMS 训出来的成品）；CNN 生成式 Wc 是归一化形状（RMS≈0.01，"几乎无声"），开环直接用只有 ~1/10 振幅，听不出降噪。改动摆放/换设备后重跑一次标定即可。
+> **绝对增益烘焙（开环降噪命门）**：库槽保存的是**就地 FxLMS 收敛的成品 Wc 原样**（完整绝对振幅+相位，**绝不 RMS 归一化**）——这是 SFANC/MIMO-SFANC 离线收敛成品的形态，开环才真正可闻降噪；CNN 生成式 Wc 是归一化形状（RMS≈0.01，"几乎无声"），开环直接用只有 ~1/10 振幅。改动摆放/换设备后重跑一次标定即可。
 
-fixed 模式行为要点:
+部署态行为要点:
 - 误差麦: err_meas 置 0（无误差麦语义）, NR 显示 n/a
-- Wc 变更点全部 gate: 静音/peak 的 Wc 衰减、peak halve、冷启动 30% 软化均跳过（固定滤波器不被瞬态削减）
+- 决策层: 1Hz CNN argmax → 防抖 → 类变 crossfade；`GFANC_BANK_SIM=1` 定时轮换类（绕过 CNN），验证切换无爆音
+- Wc 变更点全部 gate: 静音/peak 的 Wc 衰减、peak halve、冷启动 30% 软化均跳过（库槽成品不被瞬态削减）
 - 输出安全保留: NaN 看门狗 + 软限幅 + cold-start ramp
 - 发散检测跳过（无梯度不可能发散）
 
@@ -691,12 +735,13 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 
 | 文件 | 功能 |
 |------|------|
-| `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick_rt` + 64tap ANC 带通 (与实时同信号链) |
-| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, **Reset/Continuous 双模式派发** (去场景层), Ŝ 环路延迟自动补偿 |
-| `src/scene_controller.c` | CNN 直接权重 Wc 生产者 (v1.6): minmax → CNN 30 维回归 → `tanh` 增益 → `Wc=Σ gain×sub` → RMS 标定 + 取反 |
-| `src/ocg.c` + `include/ocg.h` | OCG 多质心聚类闸门 (v1.7, ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置 — 抑制簇内抖动/慢漂移导致的反复重置 |
-| `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) |
-| `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏) |
+| `main.c` | 离线降噪: WAV 输入/输出, `fxnlms_tick_rt` + 64tap ANC 带通 (与实时同信号链); `GFANC_OPEN_LOOP=1` 开环硬选验证 (库槽纯前向), `GFANC_FORCE_CLASS` 强制选槽量化错选代价, `GFANC_BANK_SIM` 轮换类验证切换 |
+| `main_realtime.c` | 实时降噪: ASIO 音频, `fxnlms_tick_rt` 实时路径, Reset/Continuous 双模式派发 (去场景层), Ŝ 环路延迟自动补偿; **标定/部署双模式** (部署 = SFANC 硬选: 整库加载 + CNN argmax 防抖选槽 + crossfade) |
+| `src/scene_controller.c` | 回归: minmax → CNN 30 维回归 → `tanh` 增益 → `Wc=Σ gain×sub` → RMS 标定 + 取反; 分类: `scene_ctrl_classify` argmax + `bank_hold_frames` 防抖 (v2.0) |
+| `src/scene_bank.c` + `include/scene_bank.h` | SFANC 硬选库 I/O (Phase 1): `scene_bank_load`/`save_slot`/`write_all` + 16B GFNC 头校验 |
+| `src/ocg.c` + `include/ocg.h` | OCG 多质心聚类闸门 (v1.7, ICASSP 2026): 增益向量在线聚类, 簇索引变化才重置 — 抑制簇内抖动/慢漂移导致的反复重置 (仅标定态) |
+| `src/fxnlms_mimo.c` | FxNLMS 自适应 (离线+实时双路径, anti-windup, 自适应 leak) + `fxnlms_init_forward`/`fxnlms_forward_rt_open` 开环纯前向 (部署, xd=NULL) |
+| `src/cnn_m5_forward.c` | M5 CNN 前向推理 (实例化, 向后兼容单例宏); `cnn_init_base` 按权重前缀加载回归 `cnn` / 分类 `cnn_bank` 两套权重 |
 | `src/fir_filter.c` | FIR 滤波器 (gfanc_delay_t 双精度累加) |
 | `src/howling_detect.c` | DFT 频谱峰值检测 + IIR 双二阶陷波 (逐扬声器独立状态) |
 | `src/sec_online.c` | 在线 Ŝ NLMS 辨识 (零探测噪声, 原地更新 sec_coeffs) |
@@ -730,6 +775,25 @@ C 实现已超越原始 Python 参考（新增实时 ASIO 音频栈、啸叫检�
 > 三个文件均**稳定为正且无随时间衰减**。旧 R-58 的 +16.3/+15.2/−8.4 是 es 二次乘 G 的口径 bug（`es∝G²` → NR_true 偏移 ±20·log10(G)：G=0.27 虚高 +11.4dB、G=2.72 压低 -8.7dB + tanh 饱和梯度死亡）——R-58-10 去掉二次 G 后为真实值。road_noise-15 不是数据问题：µ=0 同数据开环即可对消，弱文件在 auto-gain 下曾因 G² 饱和学不动，修复后 G 无关、与强文件同样收敛。**离线 G 只是仿真工作点，与硬件旋钮无关；`GFANC_MIC_GAIN=1` 仍可看 G=1 口径**。
 
 > ⚠️ 离线默认 `GFANC_EMBED_DELAY_MS=0`（R-58-8：训练世界无此延迟，3ms 加在 Ŝ 上 → anti 相位错位 48 样本 → 正反馈发散）。基线净预览 ≈ −1.9ms（64tap ANC 带通群延迟 1.97ms > 初级路径提前量 0.69ms）——随机宽带对消受限，只能消窄带/低频；纯宽带 road_noise 加多大预览都封顶 ~0.8dB（相干/空间墙，2 扬声器/3 误差麦几何）。实时受 PC 控制路径延迟限制更重（净预览 ≈ −9ms；详见 [窗户ANC可行性](docs/窗户ANC可行性-因果限制_实测_方案.md)）。**实时实测（2026-08-03 bench，误差麦位置、相对安静）NR 平均 ~13dB**，多数秒 7-18dB；窗户安装态重测 Ŝ 后待进一步验证。NR 读数仅对误差麦位置有效（静音区 ≈ λ/10），人耳远离误差麦时降噪下降。
+
+### 离线 SFANC 硬选验证（Phase 3b）
+
+部署态决策层（CNN 分类 argmax → 选库槽）可直接在离线版上验证，与实时同构：
+
+```bash
+# 开环硬选: 加载 data/wc_bank.bin 整库, 1Hz 分类 CNN argmax → 防抖 → 选槽 crossfade
+./main.exe "Noise Examples/road_noise_0-34.wav"   # 设 $env:GFANC_OPEN_LOOP='1'
+#   日志逐秒打印 "[BANK] 分类 Ck→Cm (class, slot, fade)" 类名/槽号
+
+# 强制选槽: 量化"选错库槽"代价 (开环错选=反相更差)
+$env:GFANC_FORCE_CLASS='2'; $env:GFANC_OPEN_LOOP='1'; ./main.exe "Noise Examples/road_noise_0-34.wav"
+
+# 轮换类: 每 GFANC_BANK_SIM_SEC 秒轮换一槽, 验证切换无爆音
+$env:GFANC_BANK_SIM='1'; $env:GFANC_OPEN_LOOP='1'; ./main.exe "Noise Examples/road_noise_0-34.wav"
+Remove-Item Env:GFANC_OPEN_LOOP, Env:GFANC_FORCE_CLASS, Env:GFANC_BANK_SIM -ErrorAction SilentlyContinue
+```
+
+> ⚠️ 离线 NR_true 需要误差麦模型（Pri），仅能验证**选类正确 + 切换无爆音**；真实开环降噪量以实机部署为准（NR 显示 n/a）。`GFANC_OPEN_LOOP` 需要 `data/wc_bank.bin`（或回退 `data/wc_fixed.bin`），否则报错退出。
 
 ## 常见问题
 

@@ -892,16 +892,16 @@ static void check_wc_stable_autosave(rt_ctx_t *ctx) {
         if (f) {
             fwrite(ctx->wc_snapshot, sizeof(float), S * L, f);
             fclose(f);
-            /* Phase 1: 收敛成品同步写库槽 0 (N=1 库, 绝对增益原样).
-               Phase 3 加 GFANC_CAL_INDEX 选槽. 标定=就地 FxLMS 收敛成品,
-               绝不 RMS 归一化 (研究结论: 归一化是开环无声根因). */
-            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, 0, ctx->wc_snapshot);
+            /* Phase 1: 收敛成品同步写库槽 cfg.cal_scene_index (绝对增益原样).
+               Phase 3c: GFANC_CAL_INDEX=k 选槽 — 每类噪声标定一次填一槽.
+               标定=就地 FxLMS 收敛成品, 绝不 RMS 归一化 (研究结论: 归一化是开环无声根因). */
+            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, cfg.cal_scene_index, ctx->wc_snapshot);
             ctx->wc_autosaved = 1;
             ctx->snapshot_capable = 1;   /* Ctrl+C 兜底也认 */
             printf("\n[SAVE] 标定完成! Wc 已收敛 (Δ<%.0f%%/秒 持续 %ds, RMS=%.4f ≥ %.1f×初值)\n"
-                   "       data/wc_fixed.bin 已自动保存 (bank 槽0 %s) — 之后 deploy 模式直接加载, 可 Ctrl+C 退出\n",
+                   "       data/wc_fixed.bin 已自动保存 (bank 槽%d %s) — 之后 deploy 模式直接加载, 可 Ctrl+C 退出\n",
                    WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR,
-                   bank_ok == 0 ? "OK" : "FAIL");
+                   cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
         } else {
             fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
             ctx->wc_stable_sec = 0;
@@ -1704,12 +1704,12 @@ int main(void) {
         if (f) {
             fwrite(ctx->fx.wc, sizeof(float), S * L, f);
             fclose(f);
-            /* Phase 1: 兜底保存也同步写库槽 0 (绝对增益原样, 不 RMS 归一化) */
-            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, 0, ctx->fx.wc);
+            /* Phase 1: 兜底保存也同步写库槽 cfg.cal_scene_index (绝对增益原样, 不 RMS 归一化) */
+            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, cfg.cal_scene_index, ctx->fx.wc);
             printf("[SAVE] 已保存标定滤波器 data/wc_fixed.bin (%d float, %d B) — "
-                   "下次 deploy 模式自动加载 (bank 槽0 %s)\n",
+                   "下次 deploy 模式自动加载 (bank 槽%d %s)\n",
                    S * L, (int)(S * L * (int)sizeof(float)),
-                   bank_ok == 0 ? "OK" : "FAIL");
+                   cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
         } else {
             fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
         }
