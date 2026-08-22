@@ -22,6 +22,10 @@ typedef struct {
 
 int  fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
                  float step_size, float leak);  /* 返回0=成功, -1=OOM */
+/* ── 开环纯前向实例 (deploy 无误差麦): 只分配 wc + x_hist, xd=NULL (省 E*S*L bytes).
+   仅能用 fxnlms_forward_rt_open / fxnlms_set_wc / fxnlms_free;
+   闭环函数 (tick_rt/forward_rt/get_anti_est) 访问 xd==NULL 会崩, 不得调用. */
+int  fxnlms_init_forward(fxnlms_mimo_t *fx, int S, int L);
 /* R-58-9: 归一化模式开关 — 离线仿真调 1 (sum), 实时默认 0 (mean+cap, 保持硬件标定行为) */
 void fxnlms_set_norm(fxnlms_mimo_t *fx, int sum_norm);
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc);
@@ -47,6 +51,15 @@ void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                     const float *err_meas, float *anti_out);
 void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
                        const float *err_meas, float *anti_out);
+
+/* ── 开环纯前向 (deploy 无误差麦): anti = Wc ⊗ x_hist, 不写 xd、不读 err_meas.
+   init_forward 创建的实例专用; 也兼容完整 init 实例 (只省 xd 写开销).
+   Fx/err_meas 实参省略 — 部署形态物理上无这两条链. */
+void fxnlms_forward_rt_open(fxnlms_mimo_t *fx, float x_ref, float *anti_out);
+
+/* anti = Wc ⊗ x_hist (R-47 双段环形访问) — forward_rt / forward_rt_open 共享内核.
+   写 x_hist + 读 wc. 外部无需调用, 仅 forward_rt_open 与 forward_rt 内部使用. */
+void fxnlms_anti_compute(fxnlms_mimo_t *fx, float x_ref, float *anti_out);
 
 /** 计算 anti_est[e] = Σ_s,k Wc[s,k] * Xd[e,s,k] (Ŝ域抗噪估计)
  *  使用双段线性访问. 调用时机: fxnlms_tick_rt / fxnlms_forward_rt 返回后. */

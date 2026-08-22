@@ -26,6 +26,7 @@
 #include "scene_manager.h"
 #include "ocg.h"
 #include "fxnlms_mimo.h"
+#include "scene_bank.h"
 
 /* ══════════════════════════════════════════════════════════
    类型
@@ -526,27 +527,69 @@ int main(int argc, char **argv)
         0.28f, 0.15f, 0.09f, 0.07f, 0.04f, -0.04f, 0.40f
     };
 
+    /* ── 方案C deploy 离线等价: GFANC_OPEN_LOOP=1 开环硬选验证 ──
+       加载 SFANC 库槽 (GFANC_FORCE_CLASS 强制槽, 默认 0), 固定 Wc 纯前向
+       (forward_rt_open, 无梯度/无 CNN 覆盖) — 与 main_realtime deploy 分支同一形态.
+       误差麦信号仍合成 (Pri+Ŝ) 用于 NR_true 度量 (离线可测), 但不驱动任何更新.
+       GFANC_FORCE_CLASS=k 用于量化"选错库槽"代价 (开环错选=反相更差). */
+    int open_loop = getenv("GFANC_OPEN_LOOP") ? atoi(getenv("GFANC_OPEN_LOOP")) : 0;
+    int force_class = getenv("GFANC_FORCE_CLASS") ? atoi(getenv("GFANC_FORCE_CLASS")) : 0;
+    float *open_wc = NULL;
+    if (open_loop) {
+        scene_bank_t bank;
+        int loaded = 0;
+        if (scene_bank_load("data/wc_bank.bin", S, L, &bank) == 0) {
+            const float *slot = scene_bank_slot(&bank, force_class);
+            if (slot) {
+                open_wc = (float *)malloc((size_t)S * L * sizeof(float));
+                if (open_wc) { memcpy(open_wc, slot, (size_t)S * L * sizeof(float)); loaded = 1; }
+                printf("  OPEN_LOOP: wc_bank.bin slot %d (%u 槽)\n", force_class, bank.n_slots);
+            }
+            scene_bank_free(&bank);
+        }
+        if (!loaded) {
+            int wc_len = bin_load_float("data/wc_fixed.bin", &open_wc);
+            if (wc_len == S * L) {
+                loaded = 1;
+                printf("  OPEN_LOOP: 回退 data/wc_fixed.bin (N=1)\n");
+            } else {
+                if (open_wc) { bin_free(open_wc); open_wc = NULL; }
+            }
+        }
+        if (!loaded) {
+            fprintf(stderr, "ERROR: GFANC_OPEN_LOOP 需要 data/wc_bank.bin 或 data/wc_fixed.bin\n");
+            fxnlms_free(&fx); scene_ctrl_free(&sc); return 1;
+        }
+        fxnlms_set_wc(&fx, open_wc);
+        printf("  OPEN_LOOP: 固定库槽 Wc, 纯前向无梯度 (deploy 离线等价, CNN 不参与)\n");
+    }
+
     for (int sec = 0; sec < n_sec; sec++) {
         int start = sec * chunk, len = (start + chunk <= N) ? chunk : (N - start);
         if (len <= 0) break;
 
-        /* 4a. CNN 直接权重 Wc 构造 (每秒) */
+        /* 4a. CNN 直接权重 Wc 构造 (每秒) — open_loop 跳过: 固定库槽 Wc, CNN 不参与 */
         float gains[SC_DW_MAX];
         int K = sc.K;
-        if (len == chunk)
+        if (open_loop) {
+            memset(gains, 0, K * sizeof(float));   /* 诊断 top 显示 0 */
+            memcpy(sc.prev_gains, gains, K * sizeof(float));
+        } else if (len == chunk) {
             scene_ctrl_process(&sc, ref_filt_all + start, wc_cur, gains);
-        else {
+        } else {
             memcpy(gains, sc.prev_gains, K * sizeof(float));
         }
-        if (cnn_fixed) {
+        if (cnn_fixed && !open_loop) {
             /* A/B: 覆盖为固定增益 → Wc 恒定, 只剩 FxLMS 逐样本自适应 */
             memcpy(gains, fixed_gains, K * sizeof(float));
             scene_ctrl_construct_wc(&sc, gains, wc_cur);
         }
 
-        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) */
+        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) — open_loop 整块跳过 (无切换) */
         char action[20] = "-";
-        if (first_sec) {
+        if (open_loop) {
+            /* 开环: 固定库槽 Wc 恒播, 无 INIT/RESET/CNN — fxnlms_set_wc 已在上方预载 */
+        } else if (first_sec) {
             /* 首秒 INIT: CNN Wc → FxNLMS 初始化 (两模式一致) */
             memcpy(anchor_gains, gains, K * sizeof(float));
             ocg_reset(&ocg, gains);  /* OCG: 首个增益建立簇 0 */
@@ -583,8 +626,8 @@ int main(int argc, char **argv)
             float ref_filt = ref_anc_all[idx];   /* BUG-6: 64tap ANC 带通 (匹配实时) */
             acc_ref += ref_filt_all[idx] * ref_filt_all[idx];  /* 1024tap CNN 带通 (匹配实时 ref_rms 显示) */
 
-            /* CrossFader */
-            if (fade_cnt > 0) {
+            /* CrossFader — open_loop 无切换 (fade_cnt 恒 0), 跳过 */
+            if (!open_loop && fade_cnt > 0) {
                 float a = (float)fade_cnt / cfg.fade_len;
                 for (int i = 0; i < S * L; i++)
                     fx.wc[i] = a * wc_old[i] + (1.0f - a) * wc_cur[i];
@@ -592,23 +635,27 @@ int main(int argc, char **argv)
                 if (fade_cnt == 0) memcpy(fx.wc, wc_cur, S * L * sizeof(float));
             }
 
-            /* Fx = Ŝ ⊗ ref_filt */
+            /* anti_spk = Wc ⊗ x_hist (纯前向, 不写 xd/不读 err_meas).
+               open_loop: 物理无梯度链 — Fx 计算/合成误差都只为度量, 不驱动更新.
+               闭环: Fx = Ŝ ⊗ ref_filt 驱动梯度. */
             float Fx_arr[E * S];
-            for (int e = 0; e < E; e++)
-                for (int s = 0; s < S; s++)
-                    Fx_arr[e * S + s] = fir_tick(&sec_firs[e * S + s], ref_filt);
-            /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复时间衰减根因).
-               每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
-            for (int e = 0; e < E; e++)
-                for (int s = 0; s < S; s++)
-                    Fx_arr[e * S + s] = fir_tick(&bp_fx[e * S + s], Fx_arr[e * S + s]);
-
-            /* anti_spk = Wc ⊗ x_hist, err_meas = dis + anti_est (合成误差驱动梯度) */
             float anti_spk[S];
-            if (fade_cnt == 0)
-                fxnlms_tick_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
-            else
-                fxnlms_forward_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
+            if (open_loop) {
+                fxnlms_forward_rt_open(&fx, ref_filt, anti_spk);
+            } else {
+                for (int e = 0; e < E; e++)
+                    for (int s = 0; s < S; s++)
+                        Fx_arr[e * S + s] = fir_tick(&sec_firs[e * S + s], ref_filt);
+                /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复时间衰减根因).
+                   每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
+                for (int e = 0; e < E; e++)
+                    for (int s = 0; s < S; s++)
+                        Fx_arr[e * S + s] = fir_tick(&bp_fx[e * S + s], Fx_arr[e * S + s]);
+                if (fade_cnt == 0)
+                    fxnlms_tick_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
+                else
+                    fxnlms_forward_rt(&fx, ref_filt, Fx_arr, err_meas, anti_spk);
+            }
 
             for (int s = 0; s < S; s++) {
                 if (!isfinite(anti_spk[s])) anti_spk[s] = 0.0f;
@@ -747,6 +794,7 @@ int main(int argc, char **argv)
     bin_free(sec_path); if (pri_path_used != pri_path) free(pri_path_used); bin_free(pri_path); bin_free(sub_filters);
     bin_free(bp_coeff);
     if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
+    if (open_wc) free(open_wc);              /* GFANC_OPEN_LOOP 库槽副本 */
     printf("Done.\n");
     return 0;
 }

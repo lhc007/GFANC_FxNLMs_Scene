@@ -20,6 +20,7 @@
 #include "scene_manager.h"
 #include "ocg.h"
 #include "fxnlms_mimo.h"
+#include "scene_bank.h"
 #include "howling_detect.h"
 #include "sec_online.h"
 
@@ -331,16 +332,19 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             InterlockedDecrement(&ctx->fade_cnt);
         }
 
-        /* R-13: Fx = Ŝ ⊗ ref_anc (256tap 带通, 群延迟 8ms) */
+        /* R-13: Fx = Ŝ ⊗ ref_anc (256tap 带通, 群延迟 8ms) — 仅闭环标定需要.
+           方案C deploy 开环物理无梯度链, Fx 计算整体跳过 (forward_rt_open 不需要 Fx). */
         float Fx_arr[E*S];
-        for (int e = 0; e < E; e++)
-            for (int s = 0; s < S; s++)
-                Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_anc);
-        /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复实时梯度相位失配, 同离线根因).
-           每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
-        for (int e = 0; e < E; e++)
-            for (int s = 0; s < S; s++)
-                Fx_arr[e*S+s] = fir_tick(&ctx->bp_fx[e*S+s], Fx_arr[e*S+s]);
+        if (!anc_fixed()) {
+            for (int e = 0; e < E; e++)
+                for (int s = 0; s < S; s++)
+                    Fx_arr[e*S+s] = fir_tick(&ctx->sec_firs[e*S+s], ref_anc);
+            /* R-58-10: Fx 过 bp_anc, 与 err_meas 梯度对齐 (修复实时梯度相位失配, 同离线根因).
+               每条 (e,s) 路径独立 FIR, 避免扬声器间延迟线交叉污染. */
+            for (int e = 0; e < E; e++)
+                for (int s = 0; s < S; s++)
+                    Fx_arr[e*S+s] = fir_tick(&ctx->bp_fx[e*S+s], Fx_arr[e*S+s]);
+        }
 
         /* 扰动 = bp(mic) × 预增益 (含软限幅) — 实测误差, 直接驱动梯度.
            方案C fixed 开环: 无误差麦 → err_meas 置 0. 梯度已被派发绕过,
@@ -379,12 +383,12 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
            BUG-3: cold_hold 冷启动**硬限幅段**(前1s, cold_hold>FS_ANC)冻结梯度 —
            输出被钳到 ±0.12 时若继续用 err 驱动 Wc, 强噪声下 Wc 开环增长;
            软释放段(后1s, cap 0.12→1.0)梯度活跃, Wc 在输出受界内自适应收敛. */
-        /* 方案C fixed 开环: 恒走 forward_rt — 无梯度/无Wc变更/无在线Ŝ.
-           Wc 仅由 CNN 每秒经 shadow 交接更新 (生成式 SFANC). 静音/peak 的 Wc
-           衰减跳过 (固定滤波器不该被瞬态削减); 输出安全由 NaN 看门狗 + 软限幅
-           + cold-start ramp 兜底. */
+        /* 方案C fixed 开环 (deploy): 恒走 forward_rt_open — 纯前向 anti=Wc⊗x_hist,
+           物理无梯度链 (不写 xd、不读 err_meas). Wc 由启动加载库槽 (或 CNN 生成式)
+           经 shadow 交接更新. 静音/peak 的 Wc 衰减跳过 (固定滤波器不该被瞬态削减);
+           输出安全由 NaN 看门狗 + 软限幅 + cold-start ramp 兜底. */
         if (anc_fixed()) {
-            fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
+            fxnlms_forward_rt_open(&ctx->fx, ref_anc, anti_spk);
         } else if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
             || ctx->quiet_active
             || ctx->cold_hold > FS_ANC
@@ -504,7 +508,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
            替代 R-55 的连续 250 样本窗口: 连续窗口 + int 溢出 LCG 产生负偏移时
            整帧不采样 (NR 恒 0), 且窗口落在局部收敛区时误差功率失真.
            每帧 250 个样本均匀分布, 与 1s 边界无系统对齐, 相位每帧随机化. */
-        if (((ctx->acc_cnt + ctx->anti_est_offset) & 63) == 0) {
+        if (!anc_fixed() && ((ctx->acc_cnt + ctx->anti_est_offset) & 63) == 0) {
             float anti_est[E]; memset(anti_est, 0, sizeof(anti_est));
             int xp = ctx->fx.xd_ptr;
             int seg1 = (xp == 0) ? L - 1 : xp - 1;
@@ -874,14 +878,20 @@ static void check_wc_stable_autosave(rt_ctx_t *ctx) {
 
     if (ctx->wc_stable_sec >= WC_STABLE_SECS) {
         FILE *f = fopen("data/wc_fixed.bin", "wb");
+        int bank_ok = -1;
         if (f) {
             fwrite(ctx->wc_snapshot, sizeof(float), S * L, f);
             fclose(f);
+            /* Phase 1: 收敛成品同步写库槽 0 (N=1 库, 绝对增益原样).
+               Phase 3 加 GFANC_CAL_INDEX 选槽. 标定=就地 FxLMS 收敛成品,
+               绝不 RMS 归一化 (研究结论: 归一化是开环无声根因). */
+            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, 0, ctx->wc_snapshot);
             ctx->wc_autosaved = 1;
             ctx->snapshot_capable = 1;   /* Ctrl+C 兜底也认 */
             printf("\n[SAVE] 标定完成! Wc 已收敛 (Δ<%.0f%%/秒 持续 %ds, RMS=%.4f ≥ %.1f×初值)\n"
-                   "       data/wc_fixed.bin 已自动保存 — 之后 fixed 模式直接加载, 可 Ctrl+C 退出\n",
-                   WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR);
+                   "       data/wc_fixed.bin 已自动保存 (bank 槽0 %s) — 之后 deploy 模式直接加载, 可 Ctrl+C 退出\n",
+                   WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR,
+                   bank_ok == 0 ? "OK" : "FAIL");
         } else {
             fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
             ctx->wc_stable_sec = 0;
@@ -1295,30 +1305,55 @@ int main(void) {
         ctx->sc.wc_rms_target = wc_target;
     }
     howling_init(&ctx->hw, HOWLING_ENABLED);
-    if (fxnlms_init(&ctx->fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
-        fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
-    }
-
-    /* ── 方案C 双模式 banner + fixed 静态滤波器自动加载 ── */
     if (anc_fixed()) {
-        /* 全自动标定: fixed 启动自动加载 data/wc_fixed.bin (S*L float) → wc_cur,
-           由 INIT shadow 交接播放; 加载后 scene_ctrl_process 跳过, CNN 不覆盖.
-           无文件 → 退回 CNN 生成式 (降噪弱, 提示先跑一次闭环). */
-        float *wc_fixed = NULL;
-        int wc_len = bin_load_float("data/wc_fixed.bin", &wc_fixed);
-        if (wc_len == S * L) {
-            memcpy(ctx->wc_cur, wc_fixed, S * L * sizeof(float));
-            memcpy(ctx->wc_old, wc_fixed, S * L * sizeof(float)); /* 过渡起点 = 同一固定滤波器 */
-            bin_free(wc_fixed);
-            ctx->fixed_wc_loaded = 1;
-            printf("  MODE = FIXED + 静态标定滤波器 data/wc_fixed.bin (%d float, CNN 不覆盖)\n", S * L);
-        } else {
-            if (wc_fixed) bin_free(wc_fixed);
-            printf("  MODE = FIXED (开环 µ=0, 无误差麦, CNN 生成式 — 未找到 data/wc_fixed.bin, "
-                   "降噪弱; 请先跑一次闭环: .\\scenezone_realtime.exe 听效果后 Ctrl+C 自动保存)\n");
+        /* 方案C deploy: 开环纯前向实例 — xd=NULL (省 E*S*L bytes), 无梯度链.
+           fxnlms_forward_rt_open / set_wc / free 可用; 闭环函数不得调用 (会解引用 NULL xd). */
+        if (fxnlms_init_forward(&ctx->fx, S, L) != 0) {
+            fprintf(stderr, "ERROR: fxnlms_init_forward OOM\n"); ret = 1; goto cleanup;
         }
     } else {
-        printf("  MODE = ADAPT (闭环 FxLMS + 误差麦; 收敛后 Ctrl+C 自动保存标定滤波器)\n");
+        if (fxnlms_init(&ctx->fx, E, S, L, cfg.step_size, cfg.leak) != 0) {
+            fprintf(stderr, "ERROR: fxnlms_init OOM\n"); ret = 1; goto cleanup;
+        }
+    }
+
+    /* ── 方案C 双模式 banner + deploy 滤波器库自动加载 ── */
+    if (anc_fixed()) {
+        /* deploy (开环无误差麦): 优先加载 SFANC 库 data/wc_bank.bin 槽 0 → wc_cur.
+           Phase 1 为 N=1 回归 (槽 0 = 唯一成品); Phase 2 决策层按分类选槽.
+           加载后 scene_ctrl_process 跳过, CNN 不覆盖 (fixed_wc_loaded).
+           无库 → 回退旧 data/wc_fixed.bin (N=1 对照); 再无 → CNN 生成式 (弱降噪). */
+        int loaded = 0;
+        scene_bank_t bank;
+        if (scene_bank_load("data/wc_bank.bin", S, L, &bank) == 0) {
+            const float *slot0 = scene_bank_slot(&bank, 0);
+            if (slot0) {
+                memcpy(ctx->wc_cur, slot0, S * L * sizeof(float));
+                memcpy(ctx->wc_old, slot0, S * L * sizeof(float)); /* 过渡起点 = 同一成品 */
+                loaded = 1;
+                ctx->fixed_wc_loaded = 1;
+                printf("  MODE = DEPLOY + 库 data/wc_bank.bin slot0 (%u 槽, CNN 不覆盖)\n",
+                       bank.n_slots);
+            }
+            scene_bank_free(&bank);
+        }
+        if (!loaded) {
+            float *wc_fixed = NULL;
+            int wc_len = bin_load_float("data/wc_fixed.bin", &wc_fixed);
+            if (wc_len == S * L) {
+                memcpy(ctx->wc_cur, wc_fixed, S * L * sizeof(float));
+                memcpy(ctx->wc_old, wc_fixed, S * L * sizeof(float)); /* 过渡起点 = 同一固定滤波器 */
+                bin_free(wc_fixed);
+                ctx->fixed_wc_loaded = 1;
+                printf("  MODE = DEPLOY + 静态标定滤波器 data/wc_fixed.bin (%d float, CNN 不覆盖)\n", S * L);
+            } else {
+                if (wc_fixed) bin_free(wc_fixed);
+                printf("  MODE = DEPLOY (开环 µ=0, 无误差麦, CNN 生成式 — 未找到 data/wc_bank.bin / data/wc_fixed.bin, "
+                       "降噪弱; 请先跑一次闭环标定: 听效果收敛后 Ctrl+C 自动保存)\n");
+            }
+        }
+    } else {
+        printf("  MODE = CALIBRATE (闭环 FxLMS + 误差麦; 收敛后 Ctrl+C 自动保存标定滤波器)\n");
     }
 
     /* 缓冲 */
@@ -1597,11 +1632,16 @@ int main(void) {
         printf("[SAVE] 标定滤波器已在运行中自动保存 (data/wc_fixed.bin), 无需重复保存\n");
     } else if (ret == 0 && !anc_fixed() && ctx->snapshot_capable) {
         FILE *f = fopen("data/wc_fixed.bin", "wb");
+        int bank_ok = -1;
         if (f) {
             fwrite(ctx->fx.wc, sizeof(float), S * L, f);
             fclose(f);
+            /* Phase 1: 兜底保存也同步写库槽 0 (绝对增益原样, 不 RMS 归一化) */
+            bank_ok = scene_bank_save_slot("data/wc_bank.bin", S, L, 0, ctx->fx.wc);
             printf("[SAVE] 已保存标定滤波器 data/wc_fixed.bin (%d float, %d B) — "
-                   "下次 fixed 模式自动加载\n", S * L, (int)(S * L * (int)sizeof(float)));
+                   "下次 deploy 模式自动加载 (bank 槽0 %s)\n",
+                   S * L, (int)(S * L * (int)sizeof(float)),
+                   bank_ok == 0 ? "OK" : "FAIL");
         } else {
             fprintf(stderr, "[SAVE] 写 data/wc_fixed.bin 失败 (目录不存在?)\n");
         }

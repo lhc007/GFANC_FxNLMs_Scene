@@ -19,7 +19,7 @@ CFLAGS_RT = -O2 -Iinclude -D_WIN32_WINNT=0x0601
 LDFLAGS  = -lm
 LDFLAGS_RT = -lm -lole32
 
-MODULES = src/scene_controller.c src/fxnlms_mimo.c \
+MODULES = src/scene_controller.c src/fxnlms_mimo.c src/scene_bank.c \
           src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c \
           src/howling_detect.c src/ocg.c
 RT_MODULES = src/sec_online.c src/pa_loader.c   # 仅实时版需要 (与 README 编译命令一致)

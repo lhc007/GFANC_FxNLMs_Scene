@@ -36,6 +36,27 @@ int fxnlms_init(fxnlms_mimo_t *fx, int E, int S, int L,
     return 0;
 }
 
+/* ── 开环纯前向实例 (deploy 无误差麦): 只分配 wc + x_hist, xd=NULL.
+   省 E*S*L bytes (8S/8E/L512 = 128KB); 仅 forward_rt_open 可用. ── */
+int fxnlms_init_forward(fxnlms_mimo_t *fx, int S, int L)
+{
+    fx->E = 0; fx->S = S; fx->L = L;   /* E=0: 无误差麦, 闭环函数不可用 */
+    fx->step_size = 0; fx->leak = 0;
+    fx->sum_norm = 0;
+    fx->wc     = (float *)calloc(S * L, sizeof(float));
+    fx->xd     = NULL;                 /* 开环无梯度链 */
+    fx->x_hist = (float *)calloc(L,    sizeof(float));
+    fx->xd_ptr = 0; fx->x_hist_ptr = 0;
+    fx->freeze_lms = 0;
+    fx->err_env = fx->err_base = 1e-4f;
+    if (!fx->wc || !fx->x_hist) {
+        free(fx->wc); free(fx->x_hist);
+        fx->wc = NULL; fx->x_hist = NULL;
+        return -1;
+    }
+    return 0;
+}
+
 void fxnlms_set_wc(fxnlms_mimo_t *fx, const float *wc)
     { memcpy(fx->wc, wc, fx->S * fx->L * sizeof(float)); }
 
@@ -164,13 +185,30 @@ void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
     int S = fx->S, L = fx->L;
 
     xd_roll_write(fx, Fx);
+    fxnlms_anti_compute(fx, x_ref, anti_out);
+
+    (void)err_meas;
+}
+
+/* ── 开环纯前向 (deploy 无误差麦): anti = Wc ⊗ x_hist.
+   不写 xd (无梯度链), 不读 err_meas — 部署形态物理上无这两条链.
+   init_forward 创建的轻量实例 (xd==NULL) 专用, 也兼容完整 init 实例. */
+void fxnlms_forward_rt_open(fxnlms_mimo_t *fx, float x_ref, float *anti_out)
+{
+    fxnlms_anti_compute(fx, x_ref, anti_out);
+}
+
+/* R-47: anti = Wc ⊗ x_hist — 双段环形访问, 从最新到最旧.
+   x_hist_push 写 x_hist[old_ptr] 后 ptr 指向下一个写入位 (最旧样本).
+   最新样本 = (ptr-1+L)%L, wc[0] 对齐最新, wc[1] 对齐次新, ...
+   旧代码从 ptr 开始读 (最旧), wc[0] 对齐最旧样本 — 时间反转 bug,
+   导致 Wc 被梯度训练在一个时间方向但输出应用在相反方向. */
+void fxnlms_anti_compute(fxnlms_mimo_t *fx, float x_ref, float *anti_out)
+{
+    int S = fx->S, L = fx->L;
+
     x_hist_push(fx, x_ref);
 
-    /* R-47: anti = Wc ⊗ x_hist — 双段环形访问, 从最新到最旧.
-       x_hist_push 写 x_hist[old_ptr] 后 ptr 指向下一个写入位 (最旧样本).
-       最新样本 = (ptr-1+L)%L, wc[0] 对齐最新, wc[1] 对齐次新, ...
-       旧代码从 ptr 开始读 (最旧), wc[0] 对齐最旧样本 — 时间反转 bug,
-       导致 Wc 被梯度训练在一个时间方向但输出应用在相反方向. */
     int newest = (fx->x_hist_ptr == 0) ? L - 1 : fx->x_hist_ptr - 1;
     for (int s = 0; s < S; s++) { anti_out[s] = 0;
         float *wc_s = fx->wc + s * L;
@@ -180,8 +218,6 @@ void fxnlms_forward_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
         for (int idx = L - 1; idx > newest; idx--, k++)
             anti_out[s] += wc_s[k] * fx->x_hist[idx];
     }
-
-    (void)err_meas;
 }
 
 void fxnlms_tick_rt(fxnlms_mimo_t *fx, float x_ref, const float *Fx,
