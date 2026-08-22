@@ -1,10 +1,10 @@
-/** SceneController — CNN 直接权重 Wc 构造 (去场景层).
+/** SceneController — CNN 决策层 (去场景层 + SFANC 硬选库).
  *
  * 对应 Python: gfanc/SceneController.py (直接权重回归版, 参考 MIMO_GFANC
  *   Main_GFANC_FxNLMS_Reset.ipynb 的 soft 权重 Wc 构造).
  *
- * 每秒一次: 1s 带通噪声 → minmax → CNN (K=S*C=30 维) → tanh 增益 →
- *   Wc[s,l] = Σ_c gain[s,c]·sub[c,s,l] → RMS 标定到 wc_rms_target + 取反.
+ * 每秒一次: 1s 带通噪声 → minmax → CNN → (calibrate) tanh 增益 → Wc 构造
+ *   或 (deploy) argmax → 类索引 → 调用方选库槽.
  *
  * K (CNN 输出维) 从 cnn_linear_weight.bin 大小自动推导 (cnn_m5_forward.c).
  */
@@ -34,6 +34,12 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
     sc->gain_smooth_switch = 0.85f;
     sc->norm_denom_valid = 0;        /* 输入归一化 EMA 稳定标定 (2026-08-10) */
     sc->norm_ema_alpha   = 0.1f;
+    /* SFANC 分类选库 (Phase 2) 初始状态: 未接入库, 无选定类, 防抖计数清零 */
+    sc->bank_n           = 0;
+    sc->sel_class        = 0;
+    sc->cand_class       = -1;       /* 无候选 */
+    sc->cand_cnt         = 0;
+    sc->bank_hold_frames = 2;        /* GFANC_BANK_HOLD 默认 */
 
     /* stub RMS: 所有子滤波器等权求和 → RMS.
        R-24: 静态临时缓冲 (init 期一次性使用, ≤32KB) */
@@ -62,6 +68,22 @@ void scene_ctrl_set_gain_smoothing(scene_ctrl_t *sc, float beta, float switch_co
 {
     sc->gain_smooth_beta   = (beta >= 0.0f && beta <= 1.0f) ? beta : 0.5f;
     sc->gain_smooth_switch = switch_cos;
+}
+
+void scene_ctrl_set_bank(scene_ctrl_t *sc, int n_slots)
+{
+    sc->bank_n = (n_slots > 0) ? n_slots : 0;
+    /* 库接入时重置决策状态: 从类 0 起步, 防抖从新起点计数 */
+    if (sc->bank_n > 0) {
+        sc->sel_class  = 0;
+        sc->cand_class = -1;
+        sc->cand_cnt   = 0;
+    }
+}
+
+void scene_ctrl_set_bank_hold(scene_ctrl_t *sc, int hold_frames)
+{
+    sc->bank_hold_frames = (hold_frames > 0) ? hold_frames : 2;
 }
 
 /** 直接权重 Wc 构造: wc[s*L+l] = Σ_c gains[s*C+c] · sub[(c*S+s)*L+l].
@@ -99,12 +121,12 @@ void scene_ctrl_construct_wc(const scene_ctrl_t *sc, const float *gains, float *
     }
 }
 
-int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
-                       float *wc_out, float *gains_out)
+/* 共享前置: minmax → EMA denom 稳定 → 归一化 → CNN 前向 → logits.
+ * 返回 0=logits 有效, 1=弱信号 (logits 未填, 调用方保持当前状态),
+ *      -1=CNN 失败 (logits 未填, 调用方保持当前状态).
+ * R-24: 静态 cnn_in 缓冲, 单调用者 (主线程), 无重入风险. */
+static int scene_ctrl_norm_forward(scene_ctrl_t *sc, const float *audio, float *logits)
 {
-    int S = SC_S, C = SC_C, L = sc->L, SC = S * C;
-    int K = sc->K;
-
     /* minmaxscaler (阈值 1e-6 防止静默信号过度放大 → CNN 输入爆炸) */
     float mx = audio[0], mn = audio[0];
     for (int i = 1; i < 16000; i++) {
@@ -113,21 +135,9 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     }
     float denom = mx - mn;
 
-    /* 信号太弱 (<1%满幅峰峰值) → 不值得回归, 保持上一秒增益 */
-    if (denom <= 0.01f) {
-        if (sc->prev_gains_valid) {
-            memcpy(gains_out, sc->prev_gains, SC * sizeof(float));
-            scene_ctrl_construct_wc(sc, gains_out, wc_out);
-            return 0;
-        }
-        /* 无历史 → 零增益 (FxNLMS 从零自适应收敛) */
-        memset(gains_out, 0, SC * sizeof(float));
-        memset(wc_out, 0, S * L * sizeof(float));
-        return 0;
-    }
+    /* 信号太弱 (<1%满幅峰峰值) → 不值得决策, 保持当前状态 */
+    if (denom <= 0.01f) return 1;
 
-    /* R-24: CNN 输入缓冲改为静态 (消除每秒 64KB malloc/free).
-       单调用者 (主线程), 无重入风险. */
     /* EMA 稳定标定 (2026-08-10): 每秒独立 denom 逐秒漂移 → CNN 输入逐秒抖
        (实机抖动根因). 平滑基准慢速跟随, 归一化用平滑值; 弱信号保底 (上面
        denom<=0.01 return) 仍用 raw denom, 静音帧不污染基准. */
@@ -144,12 +154,22 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     float *cnn_in = cnn_in_buf;
     for (int i = 0; i < 16000; i++) cnn_in[i] = audio[i] / use_denom;
 
+    if (cnn_m5_forward(cnn_in, logits) != 0) return -1;
+    return 0;
+}
+
+int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
+                       float *wc_out, float *gains_out)
+{
+    int S = SC_S, C = SC_C, L = sc->L, SC = S * C;
+    int K = sc->K;
+
     /* CNN 前向 → 30 维原始 logits */
     float logits[SC_DW_MAX];
-    int cnn_ret = cnn_m5_forward(cnn_in, logits);
-
-    if (cnn_ret != 0) {
-        /* CNN 推理失败 (malloc 失败等), 保持上一帧增益 */
+    int rc = scene_ctrl_norm_forward(sc, audio, logits);
+    if (rc != 0) {
+        /* 弱信号 (1) 或 CNN 失败 (-1): 保持上一秒增益 (若有), 否则零增益
+           (FxNLMS 从零自适应收敛) */
         if (sc->prev_gains_valid) {
             memcpy(gains_out, sc->prev_gains, SC * sizeof(float));
             scene_ctrl_construct_wc(sc, gains_out, wc_out);
@@ -198,4 +218,46 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
     (void)K;
 
     return argmax;
+}
+
+/* SFANC 分类决策 (deploy): audio_1s → minmax → CNN → argmax → 防抖 → 更新 sel_class.
+ * 返回当前选定类索引 (0..K-1). logits_out[K] 可空 (诊断用).
+ * 弱信号/CNN 失败 → 保持 sel_class.
+ * 防抖 (GFANC_BANK_HOLD): 候选类需连续 bank_hold_frames 帧命中才切换 —
+ * 抑制单帧 logits 抖动 (实机 CNN 稳定后 cos>0.95, 但偶发误分类帧会造成
+ * 开环误选 → 反相更差, 计划风险 #1). 类真变 (多帧稳定) 才换库槽. */
+int scene_ctrl_classify(scene_ctrl_t *sc, const float *audio_1s, float *logits_out)
+{
+    int K = sc->K;
+    if (K < 1) return sc->sel_class;
+
+    /* 共享前向 → logits (弱信号/CNN 失败保持当前类) */
+    float logits[SC_DW_MAX];
+    if (logits_out) memset(logits_out, 0, K * sizeof(float));
+    if (scene_ctrl_norm_forward(sc, audio_1s, logits) != 0) {
+        if (logits_out) memcpy(logits_out, logits, K * sizeof(float)); /* 全零 */
+        return sc->sel_class;
+    }
+
+    int c = cnn_m5_argmax(logits, K);
+    if (logits_out) memcpy(logits_out, logits, K * sizeof(float));
+
+    if (sc->bank_n < 1) {           /* 未接入库: 决策层不工作, 仅返回 argmax */
+        sc->sel_class = c;
+        return c;
+    }
+    if (c >= sc->bank_n) c = sc->bank_n - 1;   /* 防御: argmax 越库槽上限 */
+
+    /* 防抖: 候选类连续命中 */
+    if (c == sc->cand_class) {
+        sc->cand_cnt++;
+    } else {
+        sc->cand_class = c;
+        sc->cand_cnt   = 1;
+    }
+    if (sc->cand_cnt >= sc->bank_hold_frames) {
+        sc->sel_class = c;          /* 防抖通过 → 提交类切换 */
+        sc->cand_cnt  = 0;
+    }
+    return sc->sel_class;
 }

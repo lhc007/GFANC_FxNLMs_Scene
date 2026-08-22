@@ -157,6 +157,12 @@ typedef struct {
     int    converged_frames;      /* 连续正常帧数 (判断已收敛) */
     int    snapshot_capable;      /* 方案C: adapt 曾收敛 (自动保存标定滤波器判据: NR 或 Wc 稳定) */
     int    fixed_wc_loaded;       /* 方案C: fixed 启动已加载 data/wc_fixed.bin (静态, CNN 不覆盖) */
+
+    /* SFANC 硬选库决策层 (Phase 2 deploy): 整库常驻内存, 慢循环分类→选槽→crossfade */
+    float *wc_bank;               /* 整个库 [n_slots*S*L] (deploy 选槽用) */
+    uint32_t bank_n_slots;        /* 库槽数 N */
+    int    deploy_class;          /* 当前播放的库槽索引 */
+    int    sim_tick;              /* GFANC_BANK_SIM 轮换计数 (秒) */
     /* 方案C 标定 (Wc 稳定性自动保存): FxLMS 把 Wc 从 CNN 初值长到工作振幅后,
        每秒相对变化 <5%, 连续 3 秒即判收敛 → 运行中自动保存, 不用掐 Ctrl+C. */
     float  wc_prev_sec[S*L];      /* 上一秒 Wc 快照 (稳定性对比) */
@@ -1319,21 +1325,38 @@ int main(void) {
 
     /* ── 方案C 双模式 banner + deploy 滤波器库自动加载 ── */
     if (anc_fixed()) {
-        /* deploy (开环无误差麦): 优先加载 SFANC 库 data/wc_bank.bin 槽 0 → wc_cur.
-           Phase 1 为 N=1 回归 (槽 0 = 唯一成品); Phase 2 决策层按分类选槽.
-           加载后 scene_ctrl_process 跳过, CNN 不覆盖 (fixed_wc_loaded).
+        /* deploy (开环无误差麦): 优先加载 SFANC 库 data/wc_bank.bin → 整库常驻内存.
+           Phase 2 决策层: 慢循环 CNN argmax → 防抖 → 选槽 c → crossfade.
+           GFANC_BANK_SIM=1: 定时轮换类验证切换无爆音 (不依赖 CNN).
            无库 → 回退旧 data/wc_fixed.bin (N=1 对照); 再无 → CNN 生成式 (弱降噪). */
         int loaded = 0;
         scene_bank_t bank;
-        if (scene_bank_load("data/wc_bank.bin", S, L, &bank) == 0) {
-            const float *slot0 = scene_bank_slot(&bank, 0);
-            if (slot0) {
-                memcpy(ctx->wc_cur, slot0, S * L * sizeof(float));
-                memcpy(ctx->wc_old, slot0, S * L * sizeof(float)); /* 过渡起点 = 同一成品 */
-                loaded = 1;
-                ctx->fixed_wc_loaded = 1;
-                printf("  MODE = DEPLOY + 库 data/wc_bank.bin slot0 (%u 槽, CNN 不覆盖)\n",
-                       bank.n_slots);
+        if (scene_bank_load(cfg.bank_file, S, L, &bank) == 0) {
+            if (bank.n_slots >= 1 && bank.slot_len == (uint32_t)(S * L)) {
+                /* 整库拷贝到 ctx (选槽需随机访问) */
+                ctx->wc_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
+                if (ctx->wc_bank) {
+                    memcpy(ctx->wc_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
+                    ctx->bank_n_slots = bank.n_slots;
+                    ctx->deploy_class  = 0;
+                    ctx->sim_tick      = 0;
+                    memcpy(ctx->wc_cur, ctx->wc_bank, S * L * sizeof(float));      /* 槽 0 起步 */
+                    memcpy(ctx->wc_old, ctx->wc_bank, S * L * sizeof(float));      /* 过渡起点 = 同槽 */
+                    scene_ctrl_set_bank(&ctx->sc, (int)bank.n_slots);             /* 决策层接入库 */
+                    scene_ctrl_set_bank_hold(&ctx->sc, cfg.bank_hold_frames);
+                    loaded = 1;
+                    ctx->fixed_wc_loaded = 1;
+                    printf("  MODE = DEPLOY + 库 %s (%u 槽, slot_len=%u)", cfg.bank_file,
+                           bank.n_slots, bank.slot_len);
+                    if (cfg.bank_sim)
+                        printf(" GFANC_BANK_SIM 轮换 %ds/类\n", cfg.bank_sim_sec);
+                    else
+                        printf(" 分类选库 (K=%d, 防抖 %d帧)\n", ctx->sc.K, cfg.bank_hold_frames);
+                    if (bank.n_slots != (uint32_t)ctx->sc.K && !cfg.bank_sim)
+                        fprintf(stderr, "[WARN] 库 N=%u != CNN K=%d — 分类 CNN 未重训对齐, "
+                                "决策层将 argmax 越界钳到 N-1 (Phase 3 重训后移除警告)\n",
+                                bank.n_slots, ctx->sc.K);
+                }
             }
             scene_bank_free(&bank);
         }
@@ -1424,10 +1447,37 @@ int main(void) {
 
         /* CrossFader期间跳过CNN: 回调正在读wc_cur做混合, 不能覆盖 */
         if (anc_fixed() && ctx->fixed_wc_loaded) {
-            /* 方案C fixed+静态: 固定标定滤波器 — CNN 不产 Wc, 增益恒 0
-               (reset/OCG/cos 全休眠). wc_cur 由启动加载的 wc_fixed.bin 填充,
-               INIT 的 shadow 交接把它推给回调. */
-            new_scene = 0;
+            /* ── SFANC 硬选库决策层 (Phase 2 deploy) ──
+               类源: GFANC_BANK_SIM 定时轮换 (验证切换无爆音), 或 CNN argmax → 防抖.
+               类变 → wc_old=当前播放, wc_cur=库槽[c], fade_cnt (delayless crossfade).
+               固定库槽 Wc 为离线收敛成品 (绝对增益烘焙, 无 RMS 归一化) — 开环有效降噪命门. */
+            int c = ctx->deploy_class;
+            if (!ctx->first_sec && ctx->fade_cnt == 0) {   /* 首秒 INIT 提交槽0; crossfade 期间跳过决策 */
+                if (cfg.bank_sim && ctx->bank_n_slots > 1) {
+                    /* SIM: 每 bank_sim_sec 秒轮换到下一槽 (0,1,2,...), 绕过 CNN */
+                    c = (ctx->sim_tick / cfg.bank_sim_sec) % (int)ctx->bank_n_slots;
+                    ctx->sim_tick++;
+                } else if (ctx->bank_n_slots > 1) {
+                    /* 真实分类: CNN argmax + 防抖 (scene_ctrl_classify 内部完成) */
+                    c = scene_ctrl_classify(&ctx->sc, ctx->cnn_buf[ready], NULL);
+                    if (c < 0) c = 0;
+                    if (c >= (int)ctx->bank_n_slots) c = (int)ctx->bank_n_slots - 1;  /* 钳位 */
+                }
+            }
+            if (c != ctx->deploy_class) {
+                /* 类切换: 过渡起点=当前播放 (wc_snapshot 回调逐帧写), 目标=库槽 c */
+                memcpy(ctx->wc_old, ctx->wc_snapshot, S * L * sizeof(float));
+                memcpy(ctx->wc_cur, ctx->wc_bank + (size_t)c * S * L, S * L * sizeof(float));
+                InterlockedExchange(&ctx->fade_cnt, cfg.fade_len);   /* crossfade 平滑过渡 */
+                printf("  [BANK] class %d → %d (slot %d, fade %d%s)\n",
+                       ctx->deploy_class, c, c, cfg.fade_len,
+                       cfg.bank_sim ? " SIM" : "");
+                if (ctx->log_file)
+                    fprintf(ctx->log_file, "# EVENT: bank class %d->%d%s\n",
+                            ctx->deploy_class, c, cfg.bank_sim ? " sim" : "");
+                ctx->deploy_class = c;
+            }
+            new_scene = ctx->deploy_class;
             for (int i = 0; i < K; i++) gains[i] = 0.0f;
         } else if (ctx->fade_cnt > 0) {
             memcpy(gains, ctx->sc.prev_gains, K * sizeof(float));
@@ -1664,6 +1714,7 @@ cleanup:
         free(ctx->sec_coeffs);
         if (cfg.sec_online_mu > 0) sec_online_free(&ctx->sec_on);
         for (int s = 0; s < S; s++) free(ctx->fb_fir[s].delay_line);
+        free(ctx->wc_bank);          /* SFANC 库 (deploy 整库常驻) */
         fxnlms_free(&ctx->fx);
         free(ctx->ref_buf); free(ctx->anti_buf); free(ctx->err_buf);
         free(ctx);

@@ -64,6 +64,20 @@ int cnn_forward(cnn_instance_t *cnn, const float *audio, float *logits);
 /** 查询场景数 K. */
 static inline int cnn_get_K(const cnn_instance_t *cnn) { return cnn->K; }
 
+/** SFANC 硬选: 返回 logits[K] 最大值索引 (分类决策, argmax 类标签).
+ *  K<=0 返回 0; logits 含 NaN 时该槽不会成为 argmax (NaN 比较恒 false).
+ *  注: 当前回归 CNN (K=30) 的 argmax 无分类语义 — Phase 3 重训 K=N 分类 CNN 后才有意义. */
+static inline int cnn_m5_argmax(const float *logits, int K)
+{
+    int best = 0;
+    if (K > 0) {
+        float bv = logits[0];
+        for (int i = 1; i < K; i++)
+            if (logits[i] > bv) { bv = logits[i]; best = i; }
+    }
+    return best;
+}
+
 /** 释放所有权重和激活缓冲. 支持 init→free→init 热循环 (OTA/热切换). */
 void cnn_free(cnn_instance_t *cnn);
 

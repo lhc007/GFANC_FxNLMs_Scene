@@ -531,19 +531,39 @@ int main(int argc, char **argv)
        加载 SFANC 库槽 (GFANC_FORCE_CLASS 强制槽, 默认 0), 固定 Wc 纯前向
        (forward_rt_open, 无梯度/无 CNN 覆盖) — 与 main_realtime deploy 分支同一形态.
        误差麦信号仍合成 (Pri+Ŝ) 用于 NR_true 度量 (离线可测), 但不驱动任何更新.
-       GFANC_FORCE_CLASS=k 用于量化"选错库槽"代价 (开环错选=反相更差). */
+       GFANC_FORCE_CLASS=k 用于量化"选错库槽"代价 (开环错选=反相更差).
+       GFANC_BANK_SIM=1: 定时轮换类 (每 GFANC_BANK_SIM_SEC 秒), 验证切换无爆音 —
+       与 main_realtime 决策层 SIM 路径同构, 但加载整个库做轮换. */
     int open_loop = getenv("GFANC_OPEN_LOOP") ? atoi(getenv("GFANC_OPEN_LOOP")) : 0;
     int force_class = getenv("GFANC_FORCE_CLASS") ? atoi(getenv("GFANC_FORCE_CLASS")) : 0;
-    float *open_wc = NULL;
+    int bank_sim = getenv("GFANC_BANK_SIM") ? atoi(getenv("GFANC_BANK_SIM")) : 0;
+    int bank_sim_sec = getenv("GFANC_BANK_SIM_SEC") ? atoi(getenv("GFANC_BANK_SIM_SEC")) : 3;
+    float *open_wc = NULL;          /* 单槽 Wc (GFANC_FORCE_CLASS 或 N=1 静态) */
+    float *open_bank = NULL;        /* 整库 [N*S*L] (bank_sim 轮换用) */
+    int open_bank_n = 0;
+    int open_class = 0;             /* SIM 当前轮换到的库槽索引 */
     if (open_loop) {
         scene_bank_t bank;
         int loaded = 0;
-        if (scene_bank_load("data/wc_bank.bin", S, L, &bank) == 0) {
-            const float *slot = scene_bank_slot(&bank, force_class);
-            if (slot) {
-                open_wc = (float *)malloc((size_t)S * L * sizeof(float));
-                if (open_wc) { memcpy(open_wc, slot, (size_t)S * L * sizeof(float)); loaded = 1; }
-                printf("  OPEN_LOOP: wc_bank.bin slot %d (%u 槽)\n", force_class, bank.n_slots);
+        if (scene_bank_load(cfg.bank_file, S, L, &bank) == 0) {
+            if (bank_sim && bank.n_slots >= 2) {
+                /* SIM 轮换: 整库拷入 (需随机访问槽) */
+                open_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
+                if (open_bank) {
+                    memcpy(open_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
+                    open_bank_n = (int)bank.n_slots;
+                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
+                    if (open_wc) { memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float)); loaded = 1; }
+                    printf("  OPEN_LOOP + SIM: 整库 %u 槽, 每 %d s 轮换类 (验证切换无爆音)\n",
+                           bank.n_slots, bank_sim_sec);
+                }
+            } else {
+                const float *slot = scene_bank_slot(&bank, force_class);
+                if (slot) {
+                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
+                    if (open_wc) { memcpy(open_wc, slot, (size_t)S * L * sizeof(float)); loaded = 1; }
+                    printf("  OPEN_LOOP: wc_bank.bin slot %d (%u 槽)\n", force_class, bank.n_slots);
+                }
             }
             scene_bank_free(&bank);
         }
@@ -585,10 +605,26 @@ int main(int argc, char **argv)
             scene_ctrl_construct_wc(&sc, gains, wc_cur);
         }
 
-        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) — open_loop 整块跳过 (无切换) */
+        /* 4b. 去场景层双模式 (INIT / RESET, 匹配实时版) — open_loop 整块跳过 (无切换),
+           仅 GFANC_BANK_SIM 例外: 定时轮换类验证切换无爆音 (与 main_realtime SIM 同构). */
         char action[20] = "-";
         if (open_loop) {
-            /* 开环: 固定库槽 Wc 恒播, 无 INIT/RESET/CNN — fxnlms_set_wc 已在上方预载 */
+            /* SIM 轮换: 每 bank_sim_sec 秒换下一个库槽, 换槽时启动 delayless crossfade
+               (wc_old=当前 fx.wc → wc_cur=新槽), 与实时决策层换类同一机制.
+               fade 进行中 (fade_cnt>0) 不打断 — 轮换间隔 >> fade_len, 正常不会重叠. */
+            if (bank_sim && open_bank_n >= 2 && sec > 0) {
+                int c = (sec / bank_sim_sec) % open_bank_n;
+                if (c != open_class) {
+                    memcpy(wc_old, fx.wc, S * L * sizeof(float));
+                    memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
+                    fade_cnt = cfg.fade_len;
+                    snprintf(action, sizeof(action), "SIM%d->%d", open_class, c);
+                    printf("  [BANK] SIM 类 %d → %d (slot %d, fade %d)\n",
+                           open_class, c, c, cfg.fade_len);
+                    open_class = c;
+                }
+            }
+            /* 静态开环 (非 SIM): 固定库槽 Wc 恒播, 无 INIT/RESET/CNN — fxnlms_set_wc 已预载 */
         } else if (first_sec) {
             /* 首秒 INIT: CNN Wc → FxNLMS 初始化 (两模式一致) */
             memcpy(anchor_gains, gains, K * sizeof(float));
@@ -626,8 +662,9 @@ int main(int argc, char **argv)
             float ref_filt = ref_anc_all[idx];   /* BUG-6: 64tap ANC 带通 (匹配实时) */
             acc_ref += ref_filt_all[idx] * ref_filt_all[idx];  /* 1024tap CNN 带通 (匹配实时 ref_rms 显示) */
 
-            /* CrossFader — open_loop 无切换 (fade_cnt 恒 0), 跳过 */
-            if (!open_loop && fade_cnt > 0) {
+            /* CrossFader — 闭环 RESET 与 open_loop SIM 轮换共用 (fade_cnt>0 才激活).
+               静态 open_loop (非 SIM) fade_cnt 恒 0, 跳过, 无开销. */
+            if (fade_cnt > 0) {
                 float a = (float)fade_cnt / cfg.fade_len;
                 for (int i = 0; i < S * L; i++)
                     fx.wc[i] = a * wc_old[i] + (1.0f - a) * wc_cur[i];
@@ -795,6 +832,7 @@ int main(int argc, char **argv)
     bin_free(bp_coeff);
     if (bp_anc_ok) bin_free(bp_anc_coeff);   /* BUG-6: bandpass_anc.bin 独立所有权 */
     if (open_wc) free(open_wc);              /* GFANC_OPEN_LOOP 库槽副本 */
+    if (open_bank) free(open_bank);          /* GFANC_BANK_SIM 整库副本 */
     printf("Done.\n");
     return 0;
 }

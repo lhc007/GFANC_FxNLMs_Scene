@@ -123,6 +123,16 @@ typedef struct {
     float gain_smooth_beta;    /* EMA 平滑系数 (env: GFANC_GAIN_SMOOTH, 默认 0.5; 1=关闭平滑) */
     float gain_smooth_switch;  /* 旁路阈值: 帧间增益 cos 低于此视为场景切换, β 强制 1 (默认 0.85) */
 
+    /* SFANC 硬选库决策层 (Phase 2, 计划见 docs/无误差麦方案_与SFANC对照_路线分析.md):
+       分类 CNN argmax → 防抖 → 选库槽 c → crossfade. */
+    int   bank_hold_frames;    /* 分类防抖帧数 (env: GFANC_BANK_HOLD, 默认 2): 候选类连续命中
+                                   2 帧才切换, 抑制单帧 logits 抖动 (开环误选=反相更差) */
+    char  bank_file[64];       /* 库文件路径 (env: GFANC_BANK_FILE, 默认 "data/wc_bank.bin") */
+    int   cal_scene_index;     /* 标定写库槽索引 k (env: GFANC_CAL_INDEX, 默认 0) */
+    int   bank_sim;            /* GFANC_BANK_SIM=1: 定时轮换类 (每 bank_sim_sec 秒), 验证
+                                   切换无爆音 — 不依赖 CNN 分类 (Phase 2 决策层验证用) */
+    int   bank_sim_sec;        /* SIM 轮换间隔秒 (env: GFANC_BANK_SIM_SEC, 默认 3) */
+
     /* 环境安静检测 (P0-5, 治"噪声消失后反相声残留/嗡嗡声") 阶段③ 判据 (2026-08-11):
        唯一可靠信号 = 参考麦塌底 (ref<quiet_ref_max = 无真实噪声进参考麦). 深对消/
        1000Hz 天花板时 ref 都停在 0.048, 只有噪声真停才塌到 0.040. anti 仍在输出
@@ -199,6 +209,9 @@ typedef struct {
                            翻转) → 实机验证 GFANC_OCG=1 后再翻转默认开. */ \
     0.5f, 0.85f,        /* gain_smooth_beta, gain_smooth_switch (P0-2 CNN 增益自适应平滑).
                            帧间 cos<0.85(真场景切换)→β=1 立即跟随; 抖动→β=0.5 慢速平滑 */ \
+    2, "data/wc_bank.bin", 0, 0, 3, /* bank_hold_frames(2), bank_file, cal_scene_index(0),
+                           bank_sim(0), bank_sim_sec(3).
+                           SFANC 硬选库决策层 (Phase 2): 分类防抖 + 库路径 + 标定槽索引 */ \
     0.02f, 8.0f, 3, 1.5f, 0.042f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
                            quiet_hold, quiet_exit, quiet_ref_max, quiet_err_ref,
                            quiet_err_max(弃用), quiet_err_exit, quiet_ref_memory.
@@ -257,6 +270,15 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_OCG_CLUSTERS"))) cfg->ocg_max_clusters = atoi(s);
     if ((s = getenv("GFANC_OCG_HOLD")))     cfg->ocg_hold    = atoi(s);
     if ((s = getenv("GFANC_GAIN_SMOOTH"))) cfg->gain_smooth_beta = (float)atof(s);
+    if ((s = getenv("GFANC_BANK_HOLD")))  cfg->bank_hold_frames = atoi(s);
+    if ((s = getenv("GFANC_BANK_FILE"))) {
+        snprintf(cfg->bank_file, sizeof(cfg->bank_file), "%s", s);
+    }
+    if ((s = getenv("GFANC_CAL_INDEX"))) cfg->cal_scene_index = atoi(s);
+    if ((s = getenv("GFANC_BANK_SIM"))) {
+        cfg->bank_sim = atoi(s) != 0 ? 1 : 0;
+    }
+    if ((s = getenv("GFANC_BANK_SIM_SEC"))) cfg->bank_sim_sec = atoi(s);
     if ((s = getenv("GFANC_QUIET_ANTI"))) cfg->quiet_anti_rms = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_NR")))   cfg->quiet_nr_db    = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_HOLD"))) cfg->quiet_hold     = atoi(s);
