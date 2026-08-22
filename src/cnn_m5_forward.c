@@ -47,41 +47,41 @@ typedef cnn_model_t       model_t;
 /* C2: 全局单例 — 向后兼容宏 (cnn_m5_*) 使用的实例 */
 cnn_instance_t _gfanc_cnn_singleton;
 
-/* ── 加载 ── */
-static int load_conv(const char *tag, conv_layer_t *c, int oc, int ic, int k, int s, int p) {
+/* ── 加载 (base = 权重集前缀: "cnn"=回归(K=30, calibrate), "cnn_bank"=分类(K=N, deploy)) ── */
+static int load_conv(const char *base, const char *tag, conv_layer_t *c, int oc, int ic, int k, int s, int p) {
     c->out_ch = oc; c->in_ch = ic; c->ksize = k; c->stride = s; c->pad = p;
     char path[256];
-    snprintf(path, sizeof(path), "data/cnn_%s_weight.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_weight.bin", base, tag);
     int n = bin_load_float(path, &c->weight);
     if (n < 0) { fprintf(stderr, "  FAIL load %s\n", path); return -1; }
-    snprintf(path, sizeof(path), "data/cnn_%s_bias.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_bias.bin", base, tag);
     n = bin_load_float(path, &c->bias);
     if (n < 0) { fprintf(stderr, "  FAIL load %s\n", path); return -1; }
     return 0;
 }
 
-static int load_bn(const char *tag, bn_layer_t *b, int ch) {
+static int load_bn(const char *base, const char *tag, bn_layer_t *b, int ch) {
     b->ch = ch;
     char path[256];
-    snprintf(path, sizeof(path), "data/cnn_%s_gamma.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_gamma.bin", base, tag);
     if (bin_load_float(path, &b->gamma) < 0) return -1;
-    snprintf(path, sizeof(path), "data/cnn_%s_beta.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_beta.bin", base, tag);
     if (bin_load_float(path, &b->beta) < 0) return -1;
-    snprintf(path, sizeof(path), "data/cnn_%s_mean.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_mean.bin", base, tag);
     if (bin_load_float(path, &b->mean) < 0) return -1;
-    snprintf(path, sizeof(path), "data/cnn_%s_var.bin", tag);
+    snprintf(path, sizeof(path), "data/%s_%s_var.bin", base, tag);
     if (bin_load_float(path, &b->var) < 0) return -1;
     return 0;
 }
 
-int cnn_init(cnn_instance_t *cnn)
+int cnn_init_base(cnn_instance_t *cnn, const char *base)
 {
     memset(cnn, 0, sizeof(*cnn));
     model_t *m = &cnn->model;
 
     /* Stem */
-    if (load_conv("stem_conv", &m->stem_conv, CH, 1, STEM_K, STEM_S, STEM_P)) return -1;
-    if (load_bn("stem_bn", &m->stem_bn, CH)) return -1;
+    if (load_conv(base, "stem_conv", &m->stem_conv, CH, 1, STEM_K, STEM_S, STEM_P)) return -1;
+    if (load_bn(base, "stem_bn", &m->stem_bn, CH)) return -1;
 
     /* 4 ResBlocks: res0, res1, res2, res3 */
     for (int i = 0; i < 4; i++) {
@@ -89,33 +89,41 @@ int cnn_init(cnn_instance_t *cnn)
         resblock_t *r = &m->res[i];
         r->in_ch = CH;
         /* R-35: 尝试加载 projection 权重 (in_ch≠out_ch 时需要, 当前64→64无投影) */
-        snprintf(tag, sizeof(tag), "data/cnn_res%d_proj_weight.bin", i);
+        snprintf(tag, sizeof(tag), "data/%s_res%d_proj_weight.bin", base, i);
         r->proj_weight = NULL;
         bin_load_float(tag, &r->proj_weight);  /* 文件不存在返回-1 → NULL, 正确降级 */
 
         snprintf(tag, sizeof(tag), "res%d_conv1", i);
-        if (load_conv(tag, &r->conv1, CH, CH, RES_K, RES_S, RES_P)) return -1;
+        if (load_conv(base, tag, &r->conv1, CH, CH, RES_K, RES_S, RES_P)) return -1;
         snprintf(tag, sizeof(tag), "res%d_bn1", i);
-        if (load_bn(tag, &r->bn1, CH)) return -1;
+        if (load_bn(base, tag, &r->bn1, CH)) return -1;
         snprintf(tag, sizeof(tag), "res%d_conv2", i);
-        if (load_conv(tag, &r->conv2, CH, CH, RES_K, RES_S, RES_P)) return -1;
+        if (load_conv(base, tag, &r->conv2, CH, CH, RES_K, RES_S, RES_P)) return -1;
         snprintf(tag, sizeof(tag), "res%d_bn2", i);
-        if (load_bn(tag, &r->bn2, CH)) return -1;
+        if (load_bn(base, tag, &r->bn2, CH)) return -1;
     }
 
     /* FC — K 从 linear_weight 文件大小推导: n = K*CH → K = n/CH */
-    int n_w = bin_load_float("data/cnn_linear_weight.bin", &m->fc_weight);
-    int n_b = bin_load_float("data/cnn_linear_bias.bin", &m->fc_bias);
+    char path[256];
+    snprintf(path, sizeof(path), "data/%s_linear_weight.bin", base);
+    int n_w = bin_load_float(path, &m->fc_weight);
+    snprintf(path, sizeof(path), "data/%s_linear_bias.bin", base);
+    int n_b = bin_load_float(path, &m->fc_bias);
     if (n_w < 0 || n_b < 0) return -1;
     cnn->K = n_w / CH;
     if (cnn->K < 1 || cnn->K > CNN_M5_OUT_MAX) {
-        fprintf(stderr, "  Invalid K=%d from linear_weight (%d floats) — expected 1..%d\n",
-                cnn->K, n_w, CNN_M5_OUT_MAX);
+        fprintf(stderr, "  Invalid K=%d from %s_linear_weight (%d floats) — expected 1..%d\n",
+                cnn->K, base, n_w, CNN_M5_OUT_MAX);
         return -1;
     }
     (void)n_b;
 
     return 0;
+}
+
+int cnn_init(cnn_instance_t *cnn)
+{
+    return cnn_init_base(cnn, "cnn");
 }
 
 static void free_conv(conv_layer_t *c)

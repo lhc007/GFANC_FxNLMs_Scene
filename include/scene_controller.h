@@ -23,6 +23,8 @@
 typedef struct {
     const float *sub_filters;   /* [C, S, L] 子滤波器基 (与标注/导出一致) */
     int    K;                   /* CNN 输出维 (运行时推导) */
+    int    classify_mode;       /* 1=分类 (deploy, K=N≠S*C): 走 scene_ctrl_classify;
+                                   0=回归 (calibrate, K==S*C): 走 scene_ctrl_process */
     int    L;                   /* filter_len (1024) */
     float  stub_rms;
     float  wc_rms_target;       /* 自动标定: Wc 构造目标 RMS (基于 Ŝ 物理衰减) */

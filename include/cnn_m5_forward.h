@@ -57,6 +57,11 @@ typedef struct {
  *  @return 0=成功, -1=文件缺失/格式错误 */
 int cnn_init(cnn_instance_t *cnn);
 
+/** 带权重集前缀加载 (Phase 3): base="cnn" → data/cnn_*.bin (回归 K=30, calibrate);
+ *  base="cnn_bank" → data/cnn_bank_*.bin (分类 K=N, deploy). K 由 linear_weight
+ *  大小推导. @return 0=成功, -1=失败 */
+int cnn_init_base(cnn_instance_t *cnn, const char *base);
+
 /** 前向推理: audio[16000] → logits[K].
  *  @return 0=成功, -1=推理失败 (OOM) */
 int cnn_forward(cnn_instance_t *cnn, const float *audio, float *logits);
@@ -83,6 +88,7 @@ void cnn_free(cnn_instance_t *cnn);
 
 /* ── 向后兼容: 保留旧函数名用于减少改动量 ── */
 #define cnn_m5_init()      cnn_init(&_gfanc_cnn_singleton)
+#define cnn_m5_init_base(b) cnn_init_base(&_gfanc_cnn_singleton, b)
 #define cnn_m5_forward(a,l) cnn_forward(&_gfanc_cnn_singleton, a, l)
 #define cnn_m5_get_K()     cnn_get_K(&_gfanc_cnn_singleton)
 #define cnn_m5_free()      cnn_free(&_gfanc_cnn_singleton)

@@ -194,6 +194,15 @@ static float path_peak_delay_ms(const float *coeff, int n, float fs)
     return (float)peak / fs * 1000.0f;
 }
 
+/* Phase 3: 文件存在探针 (deploy 分类 CNN 集选择用) */
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
 /* ══════════════════════════════════════════════════════════
    主函数
    ══════════════════════════════════════════════════════════ */
@@ -541,7 +550,8 @@ int main(int argc, char **argv)
     float *open_wc = NULL;          /* 单槽 Wc (GFANC_FORCE_CLASS 或 N=1 静态) */
     float *open_bank = NULL;        /* 整库 [N*S*L] (bank_sim 轮换用) */
     int open_bank_n = 0;
-    int open_class = 0;             /* SIM 当前轮换到的库槽索引 */
+    int open_class = 0;             /* 当前库槽索引 (SIM 轮换 或 分类选定) */
+    int open_classify = 0;          /* 1=真分类选库 (bank CNN argmax+防抖), 0=SIM/静态 */
     if (open_loop) {
         scene_bank_t bank;
         int loaded = 0;
@@ -556,6 +566,29 @@ int main(int argc, char **argv)
                     if (open_wc) { memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float)); loaded = 1; }
                     printf("  OPEN_LOOP + SIM: 整库 %u 槽, 每 %d s 轮换类 (验证切换无爆音)\n",
                            bank.n_slots, bank_sim_sec);
+                }
+            } else if (!bank_sim && bank.n_slots >= 2 && file_exists("data/cnn_bank_linear_weight.bin")) {
+                /* 真分类选库 (Phase 3): 整库 + SFANC 分类 CNN (cnn_bank_*, K=N).
+                   替换回归 CNN 单例为分类 CNN, scene_ctrl 重初始化为分类模式. */
+                open_bank = (float *)malloc(bank.n_slots * bank.slot_len * sizeof(float));
+                if (open_bank) {
+                    memcpy(open_bank, bank.data, bank.n_slots * bank.slot_len * sizeof(float));
+                    open_bank_n = (int)bank.n_slots;
+                    open_wc = (float *)malloc((size_t)S * L * sizeof(float));
+                    if (open_wc) { memcpy(open_wc, open_bank, (size_t)S * L * sizeof(float)); loaded = 1; }
+                    cnn_m5_free();
+                    if (cnn_m5_init_base("cnn_bank") == 0) {
+                        scene_ctrl_init(&sc, sub_filters, L);          /* classify_mode=1 */
+                        scene_ctrl_set_bank(&sc, open_bank_n);
+                        scene_ctrl_set_bank_hold(&sc, cfg.bank_hold_frames);
+                        open_classify = 1;
+                        printf("  OPEN_LOOP + 分类: 整库 %u 槽, SFANC CNN 分类选槽 "
+                               "(K=%d, 防抖 %d帧) — 每 s argmax→防抖→crossfade\n",
+                               bank.n_slots, sc.K, cfg.bank_hold_frames);
+                    } else {
+                        cnn_m5_init();  /* 回退回归 CNN */
+                        fprintf(stderr, "  [WARN] cnn_bank CNN 加载失败, 回退静态槽 0\n");
+                    }
                 }
             } else {
                 const float *slot = scene_bank_slot(&bank, force_class);
@@ -621,6 +654,24 @@ int main(int argc, char **argv)
                     snprintf(action, sizeof(action), "SIM%d->%d", open_class, c);
                     printf("  [BANK] SIM 类 %d → %d (slot %d, fade %d)\n",
                            open_class, c, c, cfg.fade_len);
+                    open_class = c;
+                }
+            }
+            /* 分类开环 (SFANC): 每秒 CNN argmax → 防抖选类 → 换槽启动 crossfade
+               (与实时部署决策层同构). 弱信号/CNN 失败 → scene_ctrl_classify 保持当前类,
+               不换槽. 仅整秒 (len==chunk) 分类 — 末尾不足 1s 片段跳过 (scene_ctrl
+               固定读 16000 样本, 超尾会 OOB; 与 4a 的 len==chunk 守卫一致). */
+            else if (open_classify && len == chunk) {
+                int c = scene_ctrl_classify(&sc, ref_filt_all + start, NULL);
+                if (c < 0) c = 0;
+                if (c >= open_bank_n) c = open_bank_n - 1;
+                if (c != open_class) {
+                    memcpy(wc_old, fx.wc, S * L * sizeof(float));
+                    memcpy(wc_cur, open_bank + (size_t)c * S * L, S * L * sizeof(float));
+                    fade_cnt = cfg.fade_len;
+                    snprintf(action, sizeof(action), "C%d->%d", open_class, c);
+                    printf("  [BANK] 分类 %d→%d (%s, slot %d, fade %d)\n",
+                           open_class, c, scene_bank_class_name(c), c, cfg.fade_len);
                     open_class = c;
                 }
             }

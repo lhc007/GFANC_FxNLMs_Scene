@@ -142,3 +142,15 @@ const float *scene_bank_slot(const scene_bank_t *bank, int k)
     if (!bank || !bank->data || k < 0 || (uint32_t)k >= bank->n_slots) return NULL;
     return bank->data + (size_t)k * bank->slot_len;
 }
+
+/* 类名表 (诊断): 槽序 == CNN 标签 == scene_definitions_bank.json classes.
+ * 单一事实源: 改类序必须同步改 JSON/训练/此处三处. */
+static const char *const s_class_names[SCENE_BANK_CLASS_COUNT] = {
+    "road", "children", "construction", "railway"
+};
+
+const char *scene_bank_class_name(int k)
+{
+    if (k < 0 || k >= SCENE_BANK_CLASS_COUNT) return "?";
+    return s_class_names[k];
+}

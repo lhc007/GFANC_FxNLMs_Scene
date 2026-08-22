@@ -20,11 +20,16 @@ int scene_ctrl_init(scene_ctrl_t *sc, const float *sub_filters, int filter_len)
 {
     int S = SC_S, C = SC_C;
     sc->K = cnn_m5_get_K();
-    if (sc->K != S * C) {
-        fprintf(stderr, "[ERROR] direct-weight CNN expects K=%d (=S%d×C%d) outputs, "
-                "got K=%d. Retrain with K=SC (see training/network/Train_validate.py).\n",
-                S * C, S, C, sc->K);
-        return -1;
+    /* 双模式 (Phase 3):
+       K==S*C (30) → 直接权重回归 (calibrate 暖启动, scene_ctrl_process);
+       K!=S*C (N=4) → SFANC 分类 (deploy, scene_ctrl_classify).
+       分类 CNN 的 K 与库槽数 N 对齐由调用方校验 (main_realtime WARN). */
+    sc->classify_mode = (sc->K != S * C) ? 1 : 0;
+    if (sc->classify_mode) {
+        printf("  scene_ctrl: 分类模式 (K=%d, SFANC 硬选库 — deploy)\n", sc->K);
+    } else {
+        printf("  scene_ctrl: 回归模式 (K=%d = S%d×C%d, 直接权重 — calibrate)\n",
+               sc->K, S, C);
     }
     sc->sub_filters = sub_filters;
     sc->L           = filter_len;
@@ -163,6 +168,14 @@ int scene_ctrl_process(scene_ctrl_t *sc, const float *audio,
 {
     int S = SC_S, C = SC_C, L = sc->L, SC = S * C;
     int K = sc->K;
+
+    /* 分类模式 (deploy, K=N≠S*C): 无回归 Wc 合成路径 — 调用方必须走
+       scene_ctrl_classify 选库槽. 防御: 输出零, 防 OOB (logits 只有 K<N 维). */
+    if (sc->classify_mode) {
+        memset(gains_out, 0, SC * sizeof(float));
+        memset(wc_out, 0, S * L * sizeof(float));
+        return 0;
+    }
 
     /* CNN 前向 → 30 维原始 logits */
     float logits[SC_DW_MAX];

@@ -24,6 +24,10 @@
 #include "howling_detect.h"
 #include "sec_online.h"
 
+/* Phase 3: deploy 分类 CNN 权重集前缀 (data/cnn_bank_*.bin, K=N=4, SFANC 硬选库).
+   calibrate 回归集 (data/cnn_*.bin, K=30) 保持不动. */
+#define DEPLOY_CNN_BASE "cnn_bank"
+
 /* ── ADV-F3: 回调 WCET 监控 (诊断). GFANC_WCET=1 开启 (默认关, 零开销).
    rdtsc 仅 x86/x64; 其他平台编译为恒 0, WCET 显示 0. ── */
 #if defined(_MSC_VER)
@@ -1044,11 +1048,25 @@ int main(void) {
             ret = 1; goto cleanup;
         }
     }
-    if (cnn_m5_init() != 0) {
-        fprintf(stderr, "FATAL: CNN init failed (missing/corrupt cnn_*.bin?)\n");
-        ret = 1; goto cleanup;
+    /* Phase 3: deploy 模式优先加载 SFANC 分类权重集 (cnn_bank_*, K=N=4);
+       缺失 (Phase 3 前) 或 calibrate 模式 → 回归集 (cnn_*, K=30). */
+    {
+        char bank_linear[128];
+        snprintf(bank_linear, sizeof(bank_linear), "data/%s_linear_weight.bin",
+                 DEPLOY_CNN_BASE);
+        int bank_cnn_avail = 0;
+        FILE *probe = fopen(bank_linear, "rb");
+        if (probe) { fclose(probe); bank_cnn_avail = 1; }
+        const char *cnn_base = "cnn";
+        if (anc_fixed() && bank_cnn_avail) cnn_base = DEPLOY_CNN_BASE;
+        if (cnn_m5_init_base(cnn_base) != 0) {
+            fprintf(stderr, "FATAL: CNN init failed (%s_*.bin missing/corrupt?)\n", cnn_base);
+            ret = 1; goto cleanup;
+        }
+        printf("  OK %s K=%d L=%d%s\n", cnn_base, cnn_m5_get_K(),
+               sub_len / (SC_C*SC_S),
+               (anc_fixed() && bank_cnn_avail) ? " [deploy 分类 CNN]" : "");
     }
-    printf("  OK K=%d L=%d\n", cnn_m5_get_K(), sub_len / (SC_C*SC_S));
 
     /* R-27: 批次指纹 — 检测 cnn/sub_filters/bandpass 是否跨批混配 (WARN, 不阻断) */
     bin_check_batch();

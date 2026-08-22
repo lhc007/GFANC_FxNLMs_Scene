@@ -7,7 +7,7 @@
 R-16-②: v2 格式添加 16B 头 {magic"GFNC", version, n_floats, crc32}.
 C 端 bin_load_float 自动检测 magic — 新格式校验, 旧格式直接加载.
 """
-import os, sys, json, struct, zlib, glob
+import os, sys, json, struct, zlib, glob, argparse
 import numpy as np
 import scipy.io as sio
 import torch
@@ -17,6 +17,13 @@ from pathlib import Path
 BIN_MAGIC   = b'GFNC'          # 4 bytes magic
 BIN_VERSION = 1                 # uint32 LE
 BIN_HDR_FMT = '<4sIII'          # magic(4s) + version(I) + n_floats(I) + crc32(I) = 16B
+
+# Phase 3: --bank 只导出 SFANC 分类 CNN 集 (cnn_bank_*.bin), 不动回归集 (cnn_*.bin)
+_AP = argparse.ArgumentParser(description='export_bin.py — 导出 C 端 .bin 权重')
+_AP.add_argument('--bank', action='store_true',
+                 help='只导出 SFANC 分类 CNN (MIMO_M5_Scene_Bank.pth → data/cnn_bank_*.bin), '
+                      '回归集/路径/带通不变')
+BANK_MODE = _AP.parse_args().bank
 
 # ═══════════════════════════════════════════════════════════════
 # 路径配置 — 优先使用 GFANC_PYTHON_PROJ 环境变量, 否则查找项目内
@@ -31,14 +38,33 @@ else:
 # CNN 模型 — 直接权重回归版优先, 否则回退到场景分类器 (backward compat)
 CNN_CKPT_DW  = PY_PROJ / 'models' / 'MIMO_M5_DirectWeight_Real.pth'
 CNN_CKPT_SCE = PY_PROJ / 'models' / 'MIMO_M5_Scene_Real.pth'
-CNN_MODEL = CNN_CKPT_DW if CNN_CKPT_DW.exists() else CNN_CKPT_SCE
-IS_DW = CNN_MODEL == CNN_CKPT_DW    # True=直接权重回归 (S*C=30 维), False=场景分类 (K 维)
+CNN_CKPT_BANK = PY_PROJ / 'models' / 'MIMO_M5_Scene_Bank.pth'
+if BANK_MODE:
+    # SFANC 分类 CNN (Phase 3): K=N=4, 硬标签 CrossEntropy 训练
+    CNN_MODEL = CNN_CKPT_BANK
+    CNN_BASE  = 'cnn_bank'          # 权重集前缀 → data/cnn_bank_*.bin
+    CNN_MODE  = 'classification'    # argmax 硬选库槽
+    CNN_ACT   = 'none'              # 分类: logits 直接 argmax, 无 tanh/softmax
+    SCENE_DEF = PY_PROJ / 'models' / 'scene_definitions_bank.json'
+    INFO_NAME = 'cnn_bank_info.json'
+    if not CNN_MODEL.exists():
+        raise SystemExit(f'ERROR: --bank 需要 {CNN_MODEL.name} (先跑 '
+                         f'training/network/train_real_bank_cnn.py)')
+    IS_DW = False
+else:
+    CNN_MODEL = CNN_CKPT_DW if CNN_CKPT_DW.exists() else CNN_CKPT_SCE
+    CNN_BASE  = 'cnn'
+    CNN_MODE  = 'direct_weight'
+    CNN_ACT   = 'tanh'
+    INFO_NAME = 'cnn_info.json'
+    IS_DW = CNN_MODEL == CNN_CKPT_DW    # True=直接权重回归 (S*C=30 维), False=场景分类 (K 维)
 
 # 子滤波器 (.mat)
 SUB_FILTER = PY_PROJ / 'models' / 'MIMO_Pretrained_Control_filters_broadband.mat'
 
-# 场景定义 (centroids)
-SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
+# 场景定义 (centroids) — bank 模式在上面已设 scene_definitions_bank.json, 勿覆盖
+if not BANK_MODE:
+    SCENE_DEF  = PY_PROJ / 'models' / 'scene_definitions_real.json'
 
 # 主/次声学路径 — R-58-6: 统一到真实硬件录制路径 (用户硬件 3E-2S-1R)!
 # 训练 (Pre_training_broadband_and_decompose.py) 必须同步用这两个文件,
@@ -57,7 +83,7 @@ OUT_DIR.mkdir(exist_ok=True)
 # 系统参数 (S/C/E 固定, K 从场景定义自动读取)
 S, C, E = 2, 15, 3   # S=扬声器, C=子滤波器数, E=误差麦克风数
 
-# ── CNN 输出维度: DW 模式 = S*C (直接权重), Scene 模式 = K (场景数) ──
+# ── CNN 输出维度: DW 模式 = S*C (直接权重), Scene/Bank 模式 = K (类数) ──
 ckpt = torch.load(str(CNN_MODEL), map_location='cpu', weights_only=True)
 n_out = ckpt['linear.weight'].shape[0]
 if IS_DW:
@@ -71,18 +97,18 @@ if IS_DW:
     K = n_out
     print(f'CNN mode: direct_weight (回归头 {K}=S*C 维, tanh 激活)')
 else:
-    # 场景分类: K 从 scene_definitions_real.json 读取
-    with open(SCENE_DEF) as f:
+    # 场景/库分类: K 从 scene_definitions_{real|bank}.json 读取
+    with open(SCENE_DEF, encoding='utf-8') as f:
         scene_doc = json.load(f)
-    K = len([k for k in scene_doc['scenes']])
+    K = scene_doc.get('n_scenes') or len(scene_doc.get('scenes', []))
     if n_out != K:
         raise SystemExit(
-            f'ERROR: K mismatch — {SCENE_DEF.name} has {K} scenes, '
+            f'ERROR: K mismatch — {SCENE_DEF.name} has {K} classes, '
             f'but {CNN_MODEL.name} linear layer expects {n_out}. '
             f'Check your SCENE_DEF / CNN_MODEL paths.'
         )
-    print(f'CNN mode: scene_classifier (K={K} 维, softmax 激活)')
-print(f'CNN checkpoint 输出 {n_out} 维 OK')
+    print(f'CNN mode: {CNN_MODE} (K={K} 维, activation={CNN_ACT})')
+print(f'CNN checkpoint 输出 {n_out} 维 OK ({CNN_BASE}_*.bin)')
 
 def write_bin(name, arr):
     """R-16-②: v2 格式 — 16B 头 + float32 payload."""
@@ -123,37 +149,37 @@ weight_map = {
 for tag, prefix in weight_map.items():
     if tag == 'stem':
         keys_map = {
-            f'cnn_{tag}_conv_weight': f'{prefix}.0.weight',
-            f'cnn_{tag}_conv_bias':   f'{prefix}.0.bias',
-            f'cnn_{tag}_bn_gamma':    f'{prefix}.1.weight',
-            f'cnn_{tag}_bn_beta':     f'{prefix}.1.bias',
-            f'cnn_{tag}_bn_mean':     f'{prefix}.1.running_mean',
-            f'cnn_{tag}_bn_var':      f'{prefix}.1.running_var',
+            f'{CNN_BASE}_{tag}_conv_weight': f'{prefix}.0.weight',
+            f'{CNN_BASE}_{tag}_conv_bias':   f'{prefix}.0.bias',
+            f'{CNN_BASE}_{tag}_bn_gamma':    f'{prefix}.1.weight',
+            f'{CNN_BASE}_{tag}_bn_beta':     f'{prefix}.1.bias',
+            f'{CNN_BASE}_{tag}_bn_mean':     f'{prefix}.1.running_mean',
+            f'{CNN_BASE}_{tag}_bn_var':      f'{prefix}.1.running_var',
         }
     elif tag == 'linear':
         keys_map = {
-            f'cnn_{tag}_weight': f'{prefix}.weight',
-            f'cnn_{tag}_bias':   f'{prefix}.bias',
+            f'{CNN_BASE}_{tag}_weight': f'{prefix}.weight',
+            f'{CNN_BASE}_{tag}_bias':   f'{prefix}.bias',
         }
     else:
         idx = int(tag[3])
         keys_map = {
-            f'cnn_{tag}_conv1_weight': f'{prefix}.res.0.weight',
-            f'cnn_{tag}_conv1_bias':   f'{prefix}.res.0.bias',
-            f'cnn_{tag}_bn1_gamma':    f'{prefix}.res.1.weight',
-            f'cnn_{tag}_bn1_beta':     f'{prefix}.res.1.bias',
-            f'cnn_{tag}_bn1_mean':     f'{prefix}.res.1.running_mean',
-            f'cnn_{tag}_bn1_var':      f'{prefix}.res.1.running_var',
-            f'cnn_{tag}_conv2_weight': f'{prefix}.res.3.weight',
-            f'cnn_{tag}_conv2_bias':   f'{prefix}.res.3.bias',
-            f'cnn_{tag}_bn2_gamma':    f'{prefix}.res.4.weight',
-            f'cnn_{tag}_bn2_beta':     f'{prefix}.res.4.bias',
-            f'cnn_{tag}_bn2_mean':     f'{prefix}.res.4.running_mean',
-            f'cnn_{tag}_bn2_var':      f'{prefix}.res.4.running_var',
+            f'{CNN_BASE}_{tag}_conv1_weight': f'{prefix}.res.0.weight',
+            f'{CNN_BASE}_{tag}_conv1_bias':   f'{prefix}.res.0.bias',
+            f'{CNN_BASE}_{tag}_bn1_gamma':    f'{prefix}.res.1.weight',
+            f'{CNN_BASE}_{tag}_bn1_beta':     f'{prefix}.res.1.bias',
+            f'{CNN_BASE}_{tag}_bn1_mean':     f'{prefix}.res.1.running_mean',
+            f'{CNN_BASE}_{tag}_bn1_var':      f'{prefix}.res.1.running_var',
+            f'{CNN_BASE}_{tag}_conv2_weight': f'{prefix}.res.3.weight',
+            f'{CNN_BASE}_{tag}_conv2_bias':   f'{prefix}.res.3.bias',
+            f'{CNN_BASE}_{tag}_bn2_gamma':    f'{prefix}.res.4.weight',
+            f'{CNN_BASE}_{tag}_bn2_beta':     f'{prefix}.res.4.bias',
+            f'{CNN_BASE}_{tag}_bn2_mean':     f'{prefix}.res.4.running_mean',
+            f'{CNN_BASE}_{tag}_bn2_var':      f'{prefix}.res.4.running_var',
         }
         proj_key = f'{prefix}.proj.weight'
         if proj_key in sd:
-            keys_map[f'cnn_{tag}_proj_weight'] = proj_key
+            keys_map[f'{CNN_BASE}_{tag}_proj_weight'] = proj_key
 
     for fname, key in keys_map.items():
         if key in sd:
@@ -170,12 +196,21 @@ cnn_info = {
     'pool_kernel': 4, 'pool_stride': 4,
     'fc_in': 64, 'fc_out': K,
     'bn_eps': 1e-5,
-    # C 端推理激活: direct_weight=tanh (回归头输出归一化增益), scene=softmax
-    'mode': 'direct_weight' if IS_DW else 'scene',
-    'activation': 'tanh' if IS_DW else 'softmax',
+    # C 端推理激活: direct_weight=tanh (回归头输出归一化增益), scene/bank=分类无激活
+    'mode': CNN_MODE,
+    'activation': CNN_ACT,
 }
-write_json('cnn_info.json', cnn_info)
-print(f'  cnn_info.json saved')
+if BANK_MODE:
+    # 库分类: 类名表 (== 库槽序, 与 C scene_bank_names 对齐) 进 info, 供工具检视
+    cnn_info['classes'] = scene_doc['classes']
+write_json(INFO_NAME, cnn_info)
+print(f'  {INFO_NAME} saved')
+
+# ── 1b. bank 模式: 只导出分类 CNN 集 (cnn_bank_*.bin), 不动回归集/路径/带通 ──
+if BANK_MODE:
+    print(f'\n--bank 完成: {CNN_BASE}_*.bin (K={K}, mode={CNN_MODE}) → {OUT_DIR}/')
+    print('  回归集 (cnn_*.bin) 未动, 供 calibrate 模式使用.')
+    sys.exit(0)
 
 # ── 2. 子滤波器 ──
 print('Exporting sub-filters...')

@@ -28,6 +28,9 @@ test/test_fir.exe
 # Local backups (模型/训练产物备份, 不入库)
 backup_*/
 
+# SFANC 训练预处理缓存 (prep_bank_cache.py 生成, 可再生成, ~2.3GB 不入库)
+SceneZone_Scene/models/bank_cache_*.npy
+
 # Claude Code (local)
 .claude/
 .agents/

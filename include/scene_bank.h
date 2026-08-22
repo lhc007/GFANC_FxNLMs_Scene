@@ -46,4 +46,11 @@ void scene_bank_free(scene_bank_t *bank);
 /* 槽 k 指针 (越界返回 NULL). */
 const float *scene_bank_slot(const scene_bank_t *bank, int k);
 
+/* ── 类名表 (Phase 3, 诊断用) ──
+ * 槽序 == CNN 标签 == 此表三处必须与 SceneZone_Scene/models/
+ * scene_definitions_bank.json 的 classes 一致 (硬选库对齐校验 #6).
+ * 越界返回 "?". */
+#define SCENE_BANK_CLASS_COUNT 4
+const char *scene_bank_class_name(int k);
+
 #endif
